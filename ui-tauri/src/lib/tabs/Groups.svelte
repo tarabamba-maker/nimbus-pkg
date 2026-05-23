@@ -402,7 +402,7 @@
       <div class="confirm-title">Merge «{merging}» into…</div>
       <select class="rename-input" bind:value={mergeTarget}>
         <option value="">— select target group —</option>
-        {#each groups.filter(g => g.name !== merging) as g}
+        {#each groups.filter(g => g.name !== merging).sort((a, b) => a.name.localeCompare(b.name)) as g}
           <option value={g.name}>{g.name}</option>
         {/each}
       </select>
