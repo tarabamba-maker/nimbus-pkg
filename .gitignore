@@ -1,0 +1,61 @@
+# Database & personal data
+sales.db
+
+# Image caches (regenerable via sync)
+img_cache/
+img_cache_match/
+img_cache_ms/
+
+# Browser profiles (contain auth cookies — never commit)
+chrome_profile/
+chrome_profile_*/
+getty_profile/
+grabber_profile/
+envato_profile/
+microstock_profile/
+*_profile/
+
+# Secrets
+.env
+.env.*
+recipes/_gemini_config.json
+extension/background.js
+
+# MS+ library (large, personal)
+ms_library.json
+
+# Session state (rebuilt automatically)
+recipes/_processed_dates.json
+recipes/_cross_stock_matches.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Logs
+app.log
+*.log
+debug/
+
+# Tauri build artifacts (multi-GB)
+ui-tauri/src-tauri/target/
+ui-tauri/.svelte-kit/
+ui-tauri/node_modules/
+ui-tauri/build/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Force-exclude all profile dirs (including hidden dot-files inside them)
+envato_profile/**
+envato_thumb_profile/**
+microstock_profile/**
+
+# Claude settings
+.claude/

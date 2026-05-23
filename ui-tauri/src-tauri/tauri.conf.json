@@ -1,0 +1,49 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Stock Automation",
+  "version": "2.0.9",
+  "identifier": "com.stockautomation.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Stock Automation",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self' http://localhost:8000 http://127.0.0.1:8000 blob: https://github.com https://*.githubusercontent.com; img-src 'self' data: blob: http://localhost:8000 http://127.0.0.1:8000 https:; media-src 'self' http://localhost:8000 http://127.0.0.1:8000; worker-src blob:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM1RUJENjI5RTA3ODJGMDcKUldRSEwzamdLZGJyTlYrdExiK0VnVGUxUlFSRVI4eWszME9UK2thWnpPZGVPcTl3aXFEdkc0TFAK",
+      "endpoints": [
+        "https://github.com/tarabamba-maker/nimbus-pkg/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}
