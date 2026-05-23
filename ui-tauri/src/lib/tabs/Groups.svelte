@@ -3,7 +3,7 @@
   import { onMount, untrack } from 'svelte';
   import { scale, fly } from 'svelte/transition';
   import { backOut } from 'svelte/easing';
-  import { RefreshCw, RotateCcw, Pencil, Trash2, Link, Plus, X, UserPlus } from 'lucide-svelte';
+  import { RefreshCw, RotateCcw, Pencil, Trash2, Link, Plus, X, UserPlus, Merge } from 'lucide-svelte';
   import PhotoPopup from '$lib/PhotoPopup.svelte';
   import { stockColors } from '$lib/stockColors.js';
   import {
@@ -54,6 +54,9 @@
   let renaming     = $state(/** @type {string|null} */ (null));
   let renameVal    = $state('');
   let confirmDel   = $state(/** @type {string|null} */ (null));
+  let merging      = $state(/** @type {string|null} */ (null));  // group name being merged FROM
+  let mergeTarget  = $state('');   // target group name to merge INTO
+  let mergeMsg     = $state('');
   let photoPopup   = $state(/** @type {any} */ (null));
 
   // Add-photo dialog state
@@ -171,6 +174,7 @@
   function handleKey(e) {
     if (e.key === 'Escape') {
       if (addPhotoOpen) { addPhotoOpen = false; addSearch = ''; addResults = []; return; }
+      if (merging) { merging = null; mergeTarget = ''; mergeMsg = ''; return; }
       if (modalMatchPending) { modalMatchPending = null; modalMatchStatus = ''; return; }
       if (modalGroup) { modalGroup = null; onGroupDeselect?.(); return; }
       renaming = null; confirmDel = null; photoPopup = null;
@@ -214,6 +218,23 @@
     if (r.status === 'ok') {
       renaming = null; renameVal = '';
       await load({ force: true }); onGroupsChange?.();
+    }
+  }
+
+  async function mergeGroup() {
+    const target = mergeTarget.trim();
+    if (!target || !merging || target === merging) return;
+    const r = await fetch(API_BASE + '/api/photo-groups/merge', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: merging, target }),
+    }).then(r => r.json());
+    if (r.status === 'ok') {
+      mergeMsg = `✅ Merged into "${target}" (${r.merged} photos)`;
+      setTimeout(() => { merging = null; mergeTarget = ''; mergeMsg = ''; }, 2000);
+      modalGroup = null;
+      await load({ force: true }); onGroupsChange?.();
+    } else {
+      mergeMsg = `❌ ${r.msg || 'Error'}`;
     }
   }
 
@@ -374,6 +395,26 @@
   </div>
 {/if}
 
+<!-- ─── Merge overlay ─── -->
+{#if merging}
+  <div class="modal-overlay" onclick={() => { merging = null; mergeTarget = ''; mergeMsg = ''; }} onkeydown={handleKey} role="dialog" tabindex="-1">
+    <div class="confirm-panel" transition:scale={{ duration: 300, start: 0.88, easing: backOut }} onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="presentation">
+      <div class="confirm-title">Merge «{merging}» into…</div>
+      <select class="rename-input" bind:value={mergeTarget}>
+        <option value="">— select target group —</option>
+        {#each groups.filter(g => g.name !== merging) as g}
+          <option value={g.name}>{g.name}</option>
+        {/each}
+      </select>
+      {#if mergeMsg}<div class="merge-msg">{mergeMsg}</div>{/if}
+      <div class="confirm-btns">
+        <button class="btn-cancel" onclick={() => { merging = null; mergeTarget = ''; mergeMsg = ''; }}>Cancel</button>
+        <button class="btn-ok" disabled={!mergeTarget} onclick={mergeGroup}>Merge</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <!-- ─── Rename overlay ─── -->
 {#if renaming}
   <div class="modal-overlay" onclick={() => renaming = null} onkeydown={handleKey} role="dialog" tabindex="-1">
@@ -401,6 +442,8 @@
         <span class="modal-count dim">{g.count} photos</span>
         <button class="icon-act" title="Rename"
           onclick={() => { renaming = g.name; renameVal = g.name; modalGroup = null; }}><Pencil size={13} strokeWidth={1.8} /></button>
+        <button class="icon-act" title="Merge into another group"
+          onclick={() => { merging = g.name; mergeTarget = ''; mergeMsg = ''; modalGroup = null; }}><Merge size={13} strokeWidth={1.8} /></button>
         <button class="icon-act danger" title="Delete group"
           onclick={() => { confirmDel = g.name; modalGroup = null; }}><Trash2 size={13} strokeWidth={1.8} /></button>
         <button class="close-btn" onclick={() => { modalGroup = null; modalMatchPending = null; modalMatchStatus = ''; onGroupDeselect?.(); }}><X size={15} strokeWidth={2} /></button>
@@ -663,6 +706,7 @@
     background: var(--bg3); border: 1px solid var(--glass-border); color: var(--label);
     border-radius: var(--radius-sm); padding:8px 10px; font-size:13px; width:100%;
   }
+  .merge-msg { font-size:12px; color: var(--accent); text-align:center; margin-top:2px; }
 
   .modal-panel {
     background: var(--glass2); backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);

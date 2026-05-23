@@ -1996,6 +1996,29 @@ def api_photo_groups_rename():
     save_groups(groups)
     return jsonify({"status": "ok"})
 
+@flask_app.route('/api/photo-groups/merge', methods=['POST'])
+def api_photo_groups_merge():
+    """Merges source group into target: moves all asset_ids from source → target, deletes source.
+    Body: {source: str, target: str}
+    Works only on user photo_groups.json entries (ms_library groups are read-only here).
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    source, target = data.get('source', '').strip(), data.get('target', '').strip()
+    if not source or not target:
+        return jsonify({'status': 'error', 'msg': 'missing source or target'}), 400
+    if source == target:
+        return jsonify({'status': 'error', 'msg': 'source == target'}), 400
+    groups = load_groups()
+    src_ids = groups.get(source, [])
+    tgt_ids = groups.get(target, [])
+    # Merge: add src ids to target (dedup)
+    merged = list(tgt_ids) + [a for a in src_ids if a not in tgt_ids]
+    groups[target] = merged
+    if source in groups:
+        del groups[source]
+    save_groups(groups)
+    return jsonify({'status': 'ok', 'merged': len(merged)})
+
 @flask_app.route('/api/ms-library/remove-from-group', methods=['POST'])
 def api_ms_remove_from_group():
     """Видаляє фото з ms_library групи: {filename}."""
