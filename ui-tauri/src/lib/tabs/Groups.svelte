@@ -343,13 +343,15 @@
       <div class="loader-inline">Loading…</div>
     {:else}
       {#each visibleGroups as g, i (g.name)}
-        <button class="group-card" in:fly={i < 15 ? { y: 14, duration: 180, delay: i * 16 } : { y: 0, duration: 0 }}
+        <div class="group-card" in:fly={i < 15 ? { y: 14, duration: 180, delay: i * 16 } : { y: 0, duration: 0 }}
+          role="button" tabindex="0"
           onclick={() => {
-            modalGroup = g;                       // show modal immediately with preview photos
+            modalGroup = g;
             modalMatchPending = null; modalMatchStatus = '';
             onGroupSelect?.(g);
-            ensureFullPhotos(g);                  // lazy-fetch full list in background
-          }}>
+            ensureFullPhotos(g);
+          }}
+          onkeydown={(e) => e.key === 'Enter' && (modalGroup = g, ensureFullPhotos(g))}>
           <div class="group-thumbs">
             {#each (g.photos || []).slice(0,3) as ph}
               <img src={thumbUrl(ph)} alt="" class="group-thumb"
@@ -370,7 +372,19 @@
               {/each}
             </div>
           </div>
-        </button>
+          <!-- Card actions (visible on hover) -->
+          <div class="card-actions">
+            <button class="card-act" title="Rename" onclick={(e) => { e.stopPropagation(); renaming = g.name; renameVal = g.name; }}>
+              <Pencil size={11} strokeWidth={2} />
+            </button>
+            <button class="card-act" title="Merge into another group" onclick={(e) => { e.stopPropagation(); merging = g.name; mergeTarget = ''; mergeMsg = ''; }}>
+              <Merge size={11} strokeWidth={2} />
+            </button>
+            <button class="card-act danger" title="Delete" onclick={(e) => { e.stopPropagation(); confirmDel = g.name; }}>
+              <Trash2 size={11} strokeWidth={2} />
+            </button>
+          </div>
+        </div>
       {/each}
       {#if filtered.length === 0}
         <div class="empty">No groups found</div>
@@ -442,8 +456,6 @@
         <span class="modal-count dim">{g.count} photos</span>
         <button class="icon-act" title="Rename"
           onclick={() => { renaming = g.name; renameVal = g.name; modalGroup = null; }}><Pencil size={13} strokeWidth={1.8} /></button>
-        <button class="icon-act" title="Merge into another group"
-          onclick={() => { merging = g.name; mergeTarget = ''; mergeMsg = ''; modalGroup = null; }}><Merge size={13} strokeWidth={1.8} /></button>
         <button class="icon-act danger" title="Delete group"
           onclick={() => { confirmDel = g.name; modalGroup = null; }}><Trash2 size={13} strokeWidth={1.8} /></button>
         <button class="close-btn" onclick={() => { modalGroup = null; modalMatchPending = null; modalMatchStatus = ''; onGroupDeselect?.(); }}><X size={15} strokeWidth={2} /></button>
@@ -653,11 +665,27 @@
     background: var(--glass); border: 1px solid var(--glass-border); border-radius: var(--radius);
     overflow:hidden; text-align:left; position:relative;
     width:180px; min-width:180px; max-width:180px;
-    flex-shrink:0; flex-grow:0; padding:0;
+    flex-shrink:0; flex-grow:0; padding:0; position:relative;
     transition: transform .18s, box-shadow .18s, border-color .18s; font:inherit; color:inherit;
     box-shadow: var(--shadow-sm), var(--glass-shine), var(--refract);
   }
   .group-card:hover { border-color: var(--accent); box-shadow: var(--shadow), var(--glass-shine), var(--refract); transform:translateY(-3px) scale(1.015); }
+  .group-card:hover .card-actions { opacity:1; }
+
+  .card-actions {
+    position:absolute; top:4px; right:4px;
+    display:flex; gap:3px;
+    opacity:0; transition:opacity .15s;
+  }
+  .card-act {
+    display:flex; align-items:center; justify-content:center;
+    width:22px; height:22px; border-radius: var(--radius-xs);
+    background: rgba(0,0,0,0.55); border: 1px solid rgba(255,255,255,0.1);
+    color: var(--label2); cursor:pointer; padding:0;
+    transition: background .12s, color .12s;
+  }
+  .card-act:hover { background: var(--accent); color:#fff; }
+  .card-act.danger:hover { background: var(--red, #ff3b30); color:#fff; }
   .group-thumbs { display:flex; gap:2px; height:60px; background: var(--bg); }
   .group-thumb  { flex:1; object-fit:cover; background: var(--bg3); }
   .group-thumb-empty { flex:1; background: var(--bg3); }

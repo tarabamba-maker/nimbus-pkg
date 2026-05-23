@@ -1998,9 +1998,10 @@ def api_photo_groups_rename():
 
 @flask_app.route('/api/photo-groups/merge', methods=['POST'])
 def api_photo_groups_merge():
-    """Merges source group into target: moves all asset_ids from source → target, deletes source.
+    """Merges source group into target.
+    Collects canonical asset_ids from both photo_groups.json AND ms_library.json,
+    writes them all into target in photo_groups.json, removes source.
     Body: {source: str, target: str}
-    Works only on user photo_groups.json entries (ms_library groups are read-only here).
     """
     data = request.get_json(force=True, silent=True) or {}
     source, target = data.get('source', '').strip(), data.get('target', '').strip()
@@ -2008,10 +2009,28 @@ def api_photo_groups_merge():
         return jsonify({'status': 'error', 'msg': 'missing source or target'}), 400
     if source == target:
         return jsonify({'status': 'error', 'msg': 'source == target'}), 400
+
+    # Collect all canonical asset_ids for the source group
+    src_ids: list = []
+
+    # 1. From ms_library — pick one canonical id per photo (priority: adobestock > shutterstock > istock > esp > first)
+    _priority = ['adobestock', 'shutterstock', 'istock', 'esp']
+    for photo in load_ms_library():
+        if (photo.get('group') or '').strip() != source:
+            continue
+        stockids = {k: str(v) for k, v in photo.get('stockids', {}).items() if k in _RELEVANT_STOCKS and v}
+        canonical = next((stockids[k] for k in _priority if k in stockids), next(iter(stockids.values()), None))
+        if canonical and canonical not in src_ids:
+            src_ids.append(canonical)
+
+    # 2. From photo_groups.json (user-added extras not in ms_library)
     groups = load_groups()
-    src_ids = groups.get(source, [])
-    tgt_ids = groups.get(target, [])
-    # Merge: add src ids to target (dedup)
+    for aid in groups.get(source, []):
+        if str(aid) not in src_ids:
+            src_ids.append(str(aid))
+
+    # Merge into target (dedup)
+    tgt_ids = [str(a) for a in groups.get(target, [])]
     merged = list(tgt_ids) + [a for a in src_ids if a not in tgt_ids]
     groups[target] = merged
     if source in groups:
