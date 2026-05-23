@@ -9,7 +9,7 @@
   import { stockColors } from '$lib/stockColors.js';
   import { get } from 'svelte/store';
   import {
-    photoGroups, stockList, matches, loadMatches, saveMatches, syncTick, currentPeriod, appReady,
+    photoGroups, stockList, matches, loadMatches, saveMatches, syncTick, currentPeriod, appReady, bestSellersCache,
   } from '$lib/stores/appState.js';
   import { unlinkFromMatches, linkMatches, getSiblings } from '$lib/utils/matching.js';
 
@@ -70,18 +70,35 @@
     load(true);
   }
 
-  async function load(reset = false) {
+  async function load(reset = false, skipCache = false) {
     if (loading) return;  // guard against concurrent loads (period + syncTick effects)
+    const _period = get(currentPeriod);
+
+    // Restore from cache on tab switch / app restart
+    if (reset && !skipCache && !search) {
+      const cached = bestSellersCache.read();
+      if (cached && cached.period === _period && cached.stock === stock &&
+          cached.sort === sort && cached.sortDir === sortDir) {
+        items = cached.items; totalCount = cached.totalCount; totalSum = cached.totalSum;
+        page = Math.ceil(cached.items.length / perPage) || 1;
+        return;
+      }
+    }
+
     if (reset) { page = 1; items = []; totalCount = 0; totalSum = 0; }
     loading = true;
     try {
       const sortParam = sort === 'Earnings' ? 'total' : 'count';
-      const qs = new URLSearchParams({ period: get(currentPeriod), stock, page: String(page), per_page: String(perPage), sort: sortParam, dir: sortDir, q: search });
+      const qs = new URLSearchParams({ period: _period, stock, page: String(page), per_page: String(perPage), sort: sortParam, dir: sortDir, q: search });
       const r  = await fetch(API_BASE + `/api/sales?${qs}`).then(r => r.json());
       const incoming = r.items ?? [];
       items      = reset ? incoming : [...items, ...incoming];
       totalCount = r.total_count ?? 0;
       totalSum   = r.total_sum   ?? 0;
+      // Persist to cache (only on full reset, not append-page)
+      if (reset) {
+        bestSellersCache.write({ items, totalCount, totalSum, period: _period, stock, sort, sortDir });
+      }
     } catch (e) { console.error(e); }
     loading = false;
   }
@@ -150,11 +167,11 @@
     return () => observer.disconnect();
   });
 
-  // Refresh when any sync completes
+  // Refresh when any sync completes — skip cache
   let _lastTick = 0;
   $effect(() => {
     const t = $syncTick;
-    if (t > 0 && t !== _lastTick) { _lastTick = t; untrack(() => load(true)); }
+    if (t > 0 && t !== _lastTick) { _lastTick = t; untrack(() => load(true, true)); }
   });
 
   // Reload when period changes OR when backend becomes ready.

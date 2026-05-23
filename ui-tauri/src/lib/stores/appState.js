@@ -92,6 +92,10 @@ export const appReady = writable(false);
 export const syncTick = writable(0);
 
 export function notifySyncDone() {
+  // Invalidate tab caches — sync brings new data, tabs must refetch.
+  _dlMem = null; _lsClear(_DL_KEY);
+  _bsMem = null; _lsClear(_BS_KEY);
+  _groupsLoaded = false;
   syncTick.update(n => n + 1);
 }
 
@@ -99,4 +103,48 @@ export function notifySyncDone() {
 //    Top stat boxes drive this; Downloads/BestSellers read it and reload data.
 //    Values: 'All-time' | 'Today' | 'Week' | 'Month' | 'Year'
 export const currentPeriod = writable(/** @type {string} */ ('All-time'));
+
+// ── Tab data caches — persist across tab switches (in-memory) and app restarts (localStorage).
+//    Key structure: { items, totalCount, period, stock, [sort, sortDir, totalSum] }
+//    Written after every successful load; read on component mount for instant display.
+//    Invalidated by: sync/refresh (syncTick), or filter change (period/stock/sort).
+
+/** @param {string} key @returns {any} */
+function _lsRead(key) {
+  try { return JSON.parse(localStorage.getItem(key) || 'null'); } catch { return null; }
+}
+/** @param {string} key @param {any} val */
+function _lsWrite(key, val) {
+  try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+}
+/** @param {string} key */
+function _lsClear(key) {
+  try { localStorage.removeItem(key); } catch {}
+}
+
+// Downloads cache
+const _DL_KEY = 'dl_cache_v1';
+/** @type {{ items:any[], totalCount:number, period:string, stock:string } | null} */
+let _dlMem = null;   // in-memory (survives tab switch, cleared on refresh)
+
+export const downloadsCache = {
+  /** @returns {{ items:any[], totalCount:number, period:string, stock:string } | null} */
+  read() { return _dlMem ?? _lsRead(_DL_KEY); },
+  /** @param {{ items:any[], totalCount:number, period:string, stock:string }} d */
+  write(d) { _dlMem = d; _lsWrite(_DL_KEY, d); },
+  clear() { _dlMem = null; _lsClear(_DL_KEY); },
+};
+
+// BestSellers cache
+const _BS_KEY = 'bs_cache_v1';
+/** @type {{ items:any[], totalCount:number, totalSum:number, period:string, stock:string, sort:string, sortDir:string } | null} */
+let _bsMem = null;
+
+export const bestSellersCache = {
+  /** @returns {{ items:any[], totalCount:number, totalSum:number, period:string, stock:string, sort:string, sortDir:string } | null} */
+  read() { return _bsMem ?? _lsRead(_BS_KEY); },
+  /** @param {{ items:any[], totalCount:number, totalSum:number, period:string, stock:string, sort:string, sortDir:string }} d */
+  write(d) { _bsMem = d; _lsWrite(_BS_KEY, d); },
+  clear() { _bsMem = null; _lsClear(_BS_KEY); },
+};
 

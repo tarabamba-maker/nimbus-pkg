@@ -17,6 +17,7 @@
   let tabDir         = $state(1);
   let tabBarInner    = $state(/** @type {HTMLElement|null} */ (null));
   let tabSlider      = $state({ left: 0, width: 0 });
+  let _sliderReady   = $state(false);  // true after first measurement — enables CSS transition
 
   async function updateTabSlider() {
     await tick();
@@ -24,6 +25,7 @@
     const btn = /** @type {HTMLElement|null} */ (tabBarInner.querySelector('.tab-btn.active'));
     if (!btn) return;
     tabSlider = { left: btn.offsetLeft, width: btn.offsetWidth };
+    _sliderReady = true;
   }
 
   /** @param {number} i */
@@ -253,7 +255,7 @@
   <!-- Nav tabs -->
   <nav class="tab-bar">
     <div class="tab-bar-inner" bind:this={tabBarInner}>
-      <span class="tab-slider" style="left:{tabSlider.left}px;width:{tabSlider.width}px"></span>
+      <span class="tab-slider {_sliderReady ? 'animated' : ''}" style="left:{tabSlider.left}px;width:{tabSlider.width}px"></span>
       {#each TABS as tab, i}
         <button class="tab-btn {activeTab === i ? 'active' : ''}" onclick={() => switchTab(i)}>
           {#if tab.emoji}<span class="tab-emoji">{tab.emoji}</span>
@@ -477,6 +479,8 @@
     background: var(--sel-bg-solid);
     border: 1px solid var(--sel-border);
     border-radius: var(--radius-pill);
+  }
+  .tab-slider.animated {
     transition: left 0.26s cubic-bezier(0.34,1.15,0.64,1), width 0.26s cubic-bezier(0.34,1.15,0.64,1);
     box-shadow:
       inset 0 1px 0 rgba(255,255,255,0.22),

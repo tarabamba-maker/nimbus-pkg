@@ -8,7 +8,7 @@
   import FilterPills from '$lib/components/FilterPills.svelte';
   import { stockColors } from '$lib/stockColors.js';
   import { get } from 'svelte/store';
-  import { photoGroups, stockList, loadStockList, notifySyncDone, syncTick, currentPeriod, appReady } from '$lib/stores/appState.js';
+  import { photoGroups, stockList, loadStockList, notifySyncDone, syncTick, currentPeriod, appReady, downloadsCache } from '$lib/stores/appState.js';
 
   let { onRefresh, onStockChange } = $props();
 
@@ -37,13 +37,26 @@
   /**
    * @param {boolean} [reset]
    * @param {number|null} [prevMaxId] - if set, items with id > prevMaxId are marked _isNew
+   * @param {boolean} [skipCache] - if true, always fetch (used after sync)
    */
-  async function load(reset = false, prevMaxId = null) {
+  async function load(reset = false, prevMaxId = null, skipCache = false) {
     if (loading) return;
-    if (reset) { page = 1; items = []; }
-    loading = true;
     const _period  = get(currentPeriod);
     const _stock   = stock;
+
+    // Restore from cache on first load (reset=true, no new-item highlighting)
+    if (reset && prevMaxId === null && !skipCache) {
+      const cached = downloadsCache.read();
+      if (cached && cached.period === _period && cached.stock === _stock) {
+        items = cached.items;
+        totalCount = cached.totalCount;
+        page = Math.ceil(cached.items.length / perPage) || 1;
+        return;  // instant — no fetch needed
+      }
+    }
+
+    if (reset) { page = 1; items = []; }
+    loading = true;
     const _page    = page;
     const _perPage = perPage;
     try {
@@ -63,6 +76,13 @@
         day: 'numeric', month: 'short', year: 'numeric',
         hour: '2-digit', minute: '2-digit'
       });
+      // Persist to cache (strip _isNew flags — stale after restart)
+      if (reset || page === 1) {
+        downloadsCache.write({
+          items: items.map(it => ({ ...it, _isNew: false })),
+          totalCount, period: _period, stock: _stock,
+        });
+      }
     } catch (e) { console.error(e); }
     loading = false;
   }
@@ -143,10 +163,10 @@
     return () => observer.disconnect();
   });
 
-  // Refresh when any sync (e.g. from Browser tab) completes
+  // Refresh when any sync (e.g. from Browser tab) completes — skip cache, data is stale
   $effect(() => {
     const t = $syncTick;
-    if (t > 0 && t !== _lastTick) { _lastTick = t; untrack(() => load(true, null)); }
+    if (t > 0 && t !== _lastTick) { _lastTick = t; untrack(() => load(true, null, true)); }
   });
 
   // Reload when period changes OR when backend becomes ready.
