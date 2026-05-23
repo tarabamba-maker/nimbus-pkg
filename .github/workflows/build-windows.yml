@@ -1,0 +1,127 @@
+name: Build Windows
+
+# Triggers when release.sh publishes a new GitHub Release on Mac.
+# Builds the Windows .msi + NSIS installer, uploads them to the same release,
+# then merges the windows-x86_64 entry into latest.json so Windows users
+# see the auto-update banner.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write   # needed to upload artifacts and update latest.json
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      # ── 1. Code ────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Toolchain ───────────────────────────────────────────────────────
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ui-tauri/package-lock.json
+
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust build cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './ui-tauri/src-tauri -> target'
+
+      # ── 3. Python deps (needed to verify packages import in lib.rs) ────────
+      - name: Install Python packages
+        run: pip install flask playwright pillow beautifulsoup4 requests
+
+      # ── 4. Frontend deps ───────────────────────────────────────────────────
+      - name: npm install
+        working-directory: ui-tauri
+        run: npm ci
+
+      # ── 5. Build Tauri app for Windows ────────────────────────────────────
+      - name: Build Tauri
+        working-directory: ui-tauri
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build
+
+      # ── 6. Upload .msi and NSIS .exe to the existing GitHub Release ────────
+      - name: Upload Windows installers
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+
+          MSI=$(find ui-tauri/src-tauri/target/release/bundle/msi  -name "*.msi"     2>/dev/null | head -1)
+          EXE=$(find ui-tauri/src-tauri/target/release/bundle/nsis -name "*-setup.exe" 2>/dev/null | head -1)
+
+          FILES=()
+          [ -n "$MSI" ] && FILES+=("$MSI")
+          [ -n "$EXE" ] && FILES+=("$EXE")
+
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "ERROR: no Windows installers found"
+            exit 1
+          fi
+
+          gh release upload "$TAG" "${FILES[@]}" --clobber
+
+      # ── 7. Merge windows-x86_64 into latest.json ──────────────────────────
+      - name: Update latest.json
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          REPO="${{ github.repository }}"
+
+          # Tauri 2 updater artifact: NSIS .zip + .sig (preferred), else MSI .zip + .sig
+          WIN_ZIP=$(find ui-tauri/src-tauri/target/release/bundle/nsis -name "*.zip" 2>/dev/null | head -1)
+          WIN_SIG=$(find ui-tauri/src-tauri/target/release/bundle/nsis -name "*.sig" 2>/dev/null | head -1)
+
+          if [ -z "$WIN_ZIP" ]; then
+            WIN_ZIP=$(find ui-tauri/src-tauri/target/release/bundle/msi -name "*.zip" 2>/dev/null | head -1)
+            WIN_SIG=$(find ui-tauri/src-tauri/target/release/bundle/msi -name "*.sig" 2>/dev/null | head -1)
+          fi
+
+          if [ -z "$WIN_ZIP" ] || [ -z "$WIN_SIG" ]; then
+            echo "No updater artifacts (.zip + .sig) found — skipping latest.json update"
+            exit 0
+          fi
+
+          # Upload updater zip + signature to release
+          gh release upload "$TAG" "$WIN_ZIP" "$WIN_SIG" --clobber
+
+          WIN_SIG_CONTENT=$(cat "$WIN_SIG")
+          WIN_FNAME=$(basename "$WIN_ZIP")
+          # GitHub URLs use dots instead of spaces
+          WIN_URL="https://github.com/${REPO}/releases/download/${TAG}/${WIN_FNAME// /.}"
+
+          # Download the Mac-only latest.json that release.sh uploaded
+          gh release download "$TAG" --pattern "latest.json" --dir /tmp --clobber
+
+          # Add windows-x86_64 entry and re-upload
+          python -c "
+          import json, os
+          with open('/tmp/latest.json') as f:
+              d = json.load(f)
+          d['platforms']['windows-x86_64'] = {
+              'signature': os.environ['WIN_SIG_CONTENT'],
+              'url':       os.environ['WIN_URL'],
+          }
+          with open('/tmp/latest.json', 'w') as f:
+              json.dump(d, f, indent=2)
+          print('latest.json updated:', json.dumps(d['platforms'].keys(), default=list))
+          "
+
+          gh release upload "$TAG" /tmp/latest.json --clobber
+          echo "latest.json now has both darwin-aarch64 and windows-x86_64"
