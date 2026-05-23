@@ -83,6 +83,10 @@ export async function reloadGroups() {
   await loadGroups({ force: true });
 }
 
+// ── App ready — set to true after waitForBackend() succeeds in +page.svelte.
+//    Tabs that depend on Flask data gate their initial load on this flag.
+export const appReady = writable(false);
+
 // ── Sync tick — incremented when any sync (downloads or browser) completes.
 //    Subscribing components refresh their data when this changes.
 export const syncTick = writable(0);

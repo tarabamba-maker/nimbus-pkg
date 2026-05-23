@@ -11,7 +11,7 @@
   import StockColorSettings from '$lib/StockColorSettings.svelte';
   import UpdateBanner from '$lib/components/UpdateBanner.svelte';
   import { stockColors, loadStockColors, STOCK_ABBR } from '$lib/stockColors.js';
-  import { loadPhotoGroups, loadStockList, loadMatches, currentPeriod } from '$lib/stores/appState.js';
+  import { loadPhotoGroups, loadStockList, loadMatches, currentPeriod, appReady } from '$lib/stores/appState.js';
 
   let activeTab      = $state(0);
   let tabDir         = $state(1);
@@ -159,6 +159,7 @@
 
   onMount(async () => {
     await waitForBackend();
+    appReady.set(true);
     await Promise.all([
       loadStats(),
       loadPhotoGroups(),

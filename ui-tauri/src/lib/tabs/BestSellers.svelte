@@ -9,7 +9,7 @@
   import { stockColors } from '$lib/stockColors.js';
   import { get } from 'svelte/store';
   import {
-    photoGroups, stockList, matches, loadMatches, saveMatches, syncTick, currentPeriod,
+    photoGroups, stockList, matches, loadMatches, saveMatches, syncTick, currentPeriod, appReady,
   } from '$lib/stores/appState.js';
   import { unlinkFromMatches, linkMatches, getSiblings } from '$lib/utils/matching.js';
 
@@ -157,10 +157,11 @@
     if (t > 0 && t !== _lastTick) { _lastTick = t; untrack(() => load(true)); }
   });
 
-  // Reload when period changes (also fires on initial mount — replaces onMount).
-  // untrack() prevents load()'s internal reads from re-triggering this effect.
+  // Reload when period changes OR when backend becomes ready.
   $effect(() => {
-    $currentPeriod;
+    const period = $currentPeriod;
+    const ready  = $appReady;
+    if (!ready) return;
     untrack(() => load(true));
   });
 

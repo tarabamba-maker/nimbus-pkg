@@ -8,7 +8,7 @@
   import FilterPills from '$lib/components/FilterPills.svelte';
   import { stockColors } from '$lib/stockColors.js';
   import { get } from 'svelte/store';
-  import { photoGroups, stockList, loadStockList, notifySyncDone, syncTick, currentPeriod } from '$lib/stores/appState.js';
+  import { photoGroups, stockList, loadStockList, notifySyncDone, syncTick, currentPeriod, appReady } from '$lib/stores/appState.js';
 
   let { onRefresh, onStockChange } = $props();
 
@@ -149,11 +149,12 @@
     if (t > 0 && t !== _lastTick) { _lastTick = t; untrack(() => load(true, null)); }
   });
 
-  // Reload when period changes (also fires on initial mount — replaces onMount).
-  // untrack() prevents load()'s internal reactive reads (loading, page, etc.)
-  // from being tracked by this effect — avoids infinite re-run loop.
+  // Reload when period changes OR when backend becomes ready.
+  // Gated on $appReady so the initial mount in .app doesn't fire before Flask starts.
   $effect(() => {
-    $currentPeriod;
+    const period = $currentPeriod;
+    const ready  = $appReady;
+    if (!ready) return;
     untrack(() => load(true, null));
   });
 </script>
