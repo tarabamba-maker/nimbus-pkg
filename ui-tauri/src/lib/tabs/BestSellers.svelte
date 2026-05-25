@@ -38,10 +38,8 @@
   let ctxMenu = $state(/** @type {{item:any, x:number, y:number}|null} */ (null));
   let sentinel = $state(/** @type {HTMLElement|null} */ (null));
 
-  // Match mode
-  let matchMode    = $state(false);
-  let pendingMatch = $state(/** @type {{asset_id:string, stocks:Set<string>}|null} */ (null));
-  let matchStatus  = $state('');
+  // Match mode — pendingMatch != null means mode is active (source selected)
+  let pendingMatch = $state(/** @type {string|null} */ (null));  // asset_id of source
 
   // Auto-match
   let autoMatching  = $state(false);
@@ -112,44 +110,27 @@
   /** @param {Event} e @param {any} item */
   function handleCardClick(e, item) {
     e.stopPropagation();
-    if (matchMode) { doMatch(item); return; }
+    if (pendingMatch) { doMatch(item); return; }
     popup = item;
-  }
-
-  function toggleMatchMode() {
-    matchMode = !matchMode;
-    pendingMatch = null; matchStatus = ''; popup = null;
   }
 
   /** Called from popup "Match" button — enter match mode with this item pre-selected */
   /** @param {any} item */
   function startMatchFrom(item) {
     popup = null;
-    matchMode = true;
-    const itemStocks = new Set(Object.keys(item.by_stock || {}));
-    pendingMatch = { asset_id: item.asset_id, stocks: itemStocks };
-    matchStatus = `Selected: ${item.asset_id} — click another photo to link`;
+    pendingMatch = item.asset_id;
   }
 
   /** @param {any} item */
   async function doMatch(item) {
-    const itemStocks = new Set(Object.keys(item.by_stock || {}));
-    if (!pendingMatch) {
-      pendingMatch = { asset_id: item.asset_id, stocks: itemStocks };
-      matchStatus  = `Selected: ${item.asset_id} — click another photo`;
-      return;
-    }
-    if (item.asset_id === pendingMatch.asset_id) {
-      matchMode = false; pendingMatch = null; matchStatus = ''; return;
-    }
-    const a1 = pendingMatch.asset_id, a2 = item.asset_id;
+    if (!pendingMatch) { pendingMatch = item.asset_id; return; }
+    if (item.asset_id === pendingMatch) { pendingMatch = null; return; }
+    const a1 = pendingMatch, a2 = item.asset_id;
+    pendingMatch = null;
     try {
       await saveMatches(linkMatches(a1, a2, $matches));
-      matchStatus  = `✅ Linked: ${a1} ↔ ${a2}`;
-      pendingMatch = null;
-      matchMode = false;
       load(true);
-    } catch (err) { matchStatus = `Error: ${err}`; }
+    } catch (err) { console.error('match error', err); }
   }
 
   /** @param {MouseEvent} e @param {any} item */
@@ -168,7 +149,7 @@
   });
 
   // Refresh when any sync completes — skip cache
-  let _lastTick = 0;
+  let _lastTick = get(syncTick);
   $effect(() => {
     const t = $syncTick;
     if (t > 0 && t !== _lastTick) { _lastTick = t; untrack(() => load(true, true)); }
@@ -186,6 +167,8 @@
   $effect(() => () => { if (_autoMatchTimer) clearTimeout(_autoMatchTimer); });
 </script>
 
+<svelte:window onkeydown={(e) => { if (e.key === 'Escape' && pendingMatch) pendingMatch = null; }} />
+
 <div class="bs">
   <!-- Header -->
   <div class="header">
@@ -193,10 +176,12 @@
       <span class="total-sum">${totalSum.toFixed(2)}</span>
       <span class="total-count">{totalCount} photos</span>
       <div style="flex:1"></div>
-      {#if matchMode}
-        <button class="match-toggle active" onclick={toggleMatchMode}>
-          🔗 {pendingMatch ? `Selected ${pendingMatch.asset_id}` : 'Match mode'} · ✕ Cancel
-        </button>
+      {#if pendingMatch}
+        <div class="match-mode-bar">
+          <Link size={13} strokeWidth={1.8} />
+          Linking «{pendingMatch}» — click another photo
+          <button class="match-cancel" onclick={() => pendingMatch = null}>✕ Cancel</button>
+        </div>
       {/if}
       <button class="action-pill {autoMatching?'busy':''}" onclick={autoMatch} disabled={autoMatching}>
         <Link size={13} strokeWidth={1.8} /> {autoMatching ? 'Matching…' : 'Auto-match'}
@@ -204,9 +189,6 @@
       {#if autoMatchMsg}<span class="automatch-msg">{autoMatchMsg}</span>{/if}
       <input class="search-input" placeholder="Search ID…" bind:value={search} oninput={() => load(true)} />
     </div>
-    {#if matchStatus}
-      <div class="match-status">{matchStatus}</div>
-    {/if}
     <div class="filter-row">
       <FilterPills label="Sort:" options={['Earnings','Sales']}
         value={sort} activeSuffix={sortDir==='desc' ? ' ↓' : ' ↑'}
@@ -219,10 +201,10 @@
   <!-- Grid: fixed 160px cards -->
   <div class="grid scroll-y">
     {#each items as item, i (item.asset_id)}
-      {@const isPending  = pendingMatch?.asset_id === item.asset_id}
+      {@const isSrc      = pendingMatch === item.asset_id}
       {@const stockKeys  = Object.keys(item.by_stock || {}).length ? Object.keys(item.by_stock) : [item.stock]}
       {@const inGroups   = Object.entries($photoGroups).filter(([,ids]) => ids.includes(item.asset_id)).map(([n]) => n)}
-      <div class="card {isPending?'selected':''} {matchMode?'match-mode':''}"
+      <div class="card {isSrc ? 'match-src' : ''} {pendingMatch && !isSrc ? 'match-pick' : ''}"
         in:fly={i < 15 ? { y: 14, duration: 180, delay: i * 16 } : { y: 0, duration: 0 }}
         onclick={(e) => handleCardClick(e, item)}
         oncontextmenu={(e) => openCtx(e, item)}
@@ -258,6 +240,12 @@
           {#if inGroups.length > 0}
             <div class="group-badge">📁 {inGroups[0]}</div>
           {/if}
+        </div>
+        <!-- Link icon: appears on hover, enters match mode for this card -->
+        <div class="card-actions">
+          <button class="card-act" title="Link to another photo" onclick={(e) => { e.stopPropagation(); pendingMatch = item.asset_id; }}>
+            <Link size={11} strokeWidth={2} />
+          </button>
         </div>
       </div>
     {/each}
@@ -298,13 +286,17 @@
   .total-sum { font-size:22px; font-weight:700; color: var(--accent); letter-spacing:-0.5px; }
   .total-count { font-size:11px; color: var(--label2); }
 
-  .match-toggle {
-    background: rgba(10,132,255,0.08); border:1px solid rgba(10,132,255,0.35); color: var(--label2);
-    border-radius: var(--radius-pill); padding:5px 16px; cursor:pointer; font-size:12px; font-weight:600; font-family:inherit;
-    box-shadow: 0 0 10px rgba(10,132,255,0.08); transition: background .15s, color .15s;
+  .match-mode-bar {
+    display:flex; align-items:center; gap:6px;
+    background: rgba(10,132,255,0.10); border:1px solid rgba(10,132,255,0.30);
+    border-radius: var(--radius-pill); padding:4px 12px;
+    font-size:12px; color: var(--accent); font-weight:600;
   }
-  .match-toggle.active { background: var(--sel-bg-solid); border-color: var(--sel-border); color: var(--sel-fg); box-shadow: 0 0 16px rgba(10,132,255,0.18); }
-  .match-status { font-size:11px; color: var(--accent); }
+  .match-cancel {
+    background:none; border:none; color: var(--label2); cursor:pointer; font-size:12px;
+    padding:0 2px; margin-left:4px; font-family:inherit;
+  }
+  .match-cancel:hover { color: var(--label); }
 
   .busy { opacity: .45; cursor: not-allowed; }
   .automatch-msg { font-size:11px; color: var(--green); flex-shrink:0; }
@@ -327,8 +319,24 @@
     box-shadow: var(--shadow-sm), var(--glass-shine), var(--refract);
   }
   .card:hover  { border-color: var(--accent); transform:translateY(-3px) scale(1.015); box-shadow: var(--shadow), var(--glass-shine), var(--refract); }
-  .card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent), var(--shadow-sm); }
-  .card.match-mode { cursor:crosshair; }
+  .card:hover .card-actions { opacity:1; }
+  .card.match-src  { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent), var(--shadow-sm); cursor:default; }
+  .card.match-src:hover { transform:none; }
+  .card.match-pick { cursor:crosshair; }
+  .card.match-pick:hover { border-color: var(--green, #30d158); box-shadow: 0 0 0 1px var(--green, #30d158), var(--shadow); }
+
+  .card-actions {
+    position:absolute; top:4px; right:4px;
+    display:flex; gap:3px; opacity:0; transition:opacity .15s;
+  }
+  .card-act {
+    display:flex; align-items:center; justify-content:center;
+    width:22px; height:22px; border-radius: var(--radius-xs, 4px);
+    background: rgba(0,0,0,0.55); border: 1px solid rgba(255,255,255,0.1);
+    color: var(--label2); cursor:pointer; padding:0;
+    transition: background .12s, color .12s;
+  }
+  .card-act:hover { background: var(--accent); color:#fff; }
 
   .stock-bars { display:flex; height:3px; gap:1px; flex-shrink:0; }
   .stock-bar  { height:3px; min-width:4px; }

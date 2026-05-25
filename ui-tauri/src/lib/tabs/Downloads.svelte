@@ -76,10 +76,11 @@
         day: 'numeric', month: 'short', year: 'numeric',
         hour: '2-digit', minute: '2-digit'
       });
-      // Persist to cache (strip _isNew flags — stale after restart)
+      // Persist to cache. Preserve _isNew when this is a post-sync load (prevMaxId set)
+      // so blues survive tab switches. Strip them on plain loads (no prevMaxId).
       if (reset || page === 1) {
         downloadsCache.write({
-          items: items.map(it => ({ ...it, _isNew: false })),
+          items: items.map(it => ({ ...it, _isNew: prevMaxId !== null ? it._isNew : false })),
           totalCount, period: _period, stock: _stock,
         });
       }
@@ -101,7 +102,7 @@
    * prevMaxId captured NOW (before sync) so any item inserted during sync is marked blue.
    */
   let _syncEs = /** @type {EventSource|null} */ (null);
-  let _lastTick = 0;  // tracks syncTick — used to skip self-triggered reloads
+  let _lastTick = get(syncTick);  // init to current tick so remount doesn't re-trigger load
 
   async function doRefresh() {
     if (syncing) return;
@@ -212,7 +213,7 @@
         </div>
         <div class="meta">
           <div class="price {isNew?'new':''}">${(item.price||0).toFixed(2)}</div>
-          <div class="info">{item.stock} · {item.date?.slice(5)}</div>
+          <div class="info">{item.stock} · {item.date?.slice(5, 10)}</div>
           {#if inGroups.length > 0}<div class="group-badge">📁 {inGroups[0]}</div>{/if}
         </div>
         <div class="dots">

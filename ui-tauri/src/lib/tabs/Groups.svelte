@@ -1,6 +1,7 @@
 <script>
   import { API_BASE } from "$lib/api.js";
   import { onMount, untrack } from 'svelte';
+  import { get } from 'svelte/store';
   import { scale, fly } from 'svelte/transition';
   import { backOut } from 'svelte/easing';
   import { RefreshCw, RotateCcw, Pencil, Trash2, Link, Plus, X, UserPlus, Merge } from 'lucide-svelte';
@@ -54,9 +55,10 @@
   let renaming     = $state(/** @type {string|null} */ (null));
   let renameVal    = $state('');
   let confirmDel   = $state(/** @type {string|null} */ (null));
-  let merging      = $state(/** @type {string|null} */ (null));  // group name being merged FROM
-  let mergeTarget  = $state('');   // target group name to merge INTO
+  let merging      = $state(/** @type {string|null} */ (null));  // group name being merged FROM (dropdown mode)
+  let mergeTarget  = $state('');   // target group name to merge INTO (dropdown mode)
   let mergeMsg     = $state('');
+  let mergeClickSrc = $state(/** @type {string|null} */ (null));  // card-click merge mode source
   let photoPopup   = $state(/** @type {any} */ (null));
 
   // Add-photo dialog state
@@ -174,6 +176,7 @@
   function handleKey(e) {
     if (e.key === 'Escape') {
       if (addPhotoOpen) { addPhotoOpen = false; addSearch = ''; addResults = []; return; }
+      if (mergeClickSrc) { mergeClickSrc = null; return; }
       if (merging) { merging = null; mergeTarget = ''; mergeMsg = ''; return; }
       if (modalMatchPending) { modalMatchPending = null; modalMatchStatus = ''; return; }
       if (modalGroup) { modalGroup = null; onGroupDeselect?.(); return; }
@@ -238,6 +241,20 @@
     }
   }
 
+  /** Card-click merge: call this when user clicks a group card while mergeClickSrc is set. */
+  async function mergeClickDo(/** @type {string} */ targetName) {
+    const source = mergeClickSrc;
+    if (!source || source === targetName) { mergeClickSrc = null; return; }
+    mergeClickSrc = null;
+    const r = await fetch(API_BASE + '/api/photo-groups/merge', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source, target: targetName }),
+    }).then(r => r.json());
+    if (r.status === 'ok') {
+      await load({ force: true }); onGroupsChange?.();
+    }
+  }
+
   /** @param {string} groupName @param {any} ph */
   async function removeFromGroup(groupName, ph) {
     if (!ph.asset_id) return;
@@ -299,7 +316,7 @@
   });
 
   // Refresh when any sync completes (force — new sales data changes group totals)
-  let _lastTick = 0;
+  let _lastTick = get(syncTick);
   $effect(() => {
     const t = $syncTick;
     if (t > 0 && t !== _lastTick) { _lastTick = t; untrack(() => load({ force: true })); }
@@ -336,6 +353,13 @@
       </button>
     {/each}
     <span class="groups-count">{groups.length} groups</span>
+    {#if mergeClickSrc}
+      <div class="merge-mode-bar">
+        <Merge size={13} strokeWidth={2} />
+        Merging «{mergeClickSrc}» — click a group to merge into it
+        <button class="merge-cancel" onclick={() => mergeClickSrc = null}>✕ Cancel</button>
+      </div>
+    {/if}
   </div>
 
   <div class="grid scroll-y">
@@ -343,15 +367,18 @@
       <div class="loader-inline">Loading…</div>
     {:else}
       {#each visibleGroups as g, i (g.name)}
-        <div class="group-card" in:fly={i < 15 ? { y: 14, duration: 180, delay: i * 16 } : { y: 0, duration: 0 }}
+        {@const isMergeSrc = mergeClickSrc === g.name}
+        <div class="group-card {mergeClickSrc ? 'merge-pick' : ''} {isMergeSrc ? 'merge-src' : ''}"
+          in:fly={i < 15 ? { y: 14, duration: 180, delay: i * 16 } : { y: 0, duration: 0 }}
           role="button" tabindex="0"
           onclick={() => {
+            if (mergeClickSrc) { mergeClickDo(g.name); return; }
             modalGroup = g;
             modalMatchPending = null; modalMatchStatus = '';
             onGroupSelect?.(g);
             ensureFullPhotos(g);
           }}
-          onkeydown={(e) => e.key === 'Enter' && (modalGroup = g, ensureFullPhotos(g))}>
+          onkeydown={(e) => e.key === 'Enter' && (mergeClickSrc ? mergeClickDo(g.name) : (modalGroup = g, ensureFullPhotos(g)))}>
           <div class="group-thumbs">
             {#each (g.photos || []).slice(0,3) as ph}
               <img src={thumbUrl(ph)} alt="" class="group-thumb"
@@ -377,7 +404,7 @@
             <button class="card-act" title="Rename" onclick={(e) => { e.stopPropagation(); renaming = g.name; renameVal = g.name; }}>
               <Pencil size={11} strokeWidth={2} />
             </button>
-            <button class="card-act" title="Merge into another group" onclick={(e) => { e.stopPropagation(); merging = g.name; mergeTarget = ''; mergeMsg = ''; }}>
+            <button class="card-act" title="Merge into another group" onclick={(e) => { e.stopPropagation(); mergeClickSrc = g.name; }}>
               <Merge size={11} strokeWidth={2} />
             </button>
             <button class="card-act danger" title="Delete" onclick={(e) => { e.stopPropagation(); confirmDel = g.name; }}>
@@ -671,6 +698,10 @@
   }
   .group-card:hover { border-color: var(--accent); box-shadow: var(--shadow), var(--glass-shine), var(--refract); transform:translateY(-3px) scale(1.015); }
   .group-card:hover .card-actions { opacity:1; }
+  .group-card.merge-pick { cursor:crosshair; }
+  .group-card.merge-pick:hover { border-color: var(--green, #30d158); box-shadow: 0 0 0 1px var(--green, #30d158), var(--shadow); }
+  .group-card.merge-src { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent), var(--shadow-sm); cursor:default; }
+  .group-card.merge-src:hover { transform:none; }
 
   .card-actions {
     position:absolute; top:4px; right:4px;
@@ -735,6 +766,18 @@
     border-radius: var(--radius-sm); padding:8px 10px; font-size:13px; width:100%;
   }
   .merge-msg { font-size:12px; color: var(--accent); text-align:center; margin-top:2px; }
+  .merge-mode-bar {
+    display:flex; align-items:center; gap:6px;
+    background: rgba(10,132,255,0.10); border:1px solid rgba(10,132,255,0.30);
+    border-radius: var(--radius-pill); padding:4px 12px;
+    font-size:12px; color: var(--accent); font-weight:600;
+    margin-left:auto;
+  }
+  .merge-cancel {
+    background:none; border:none; color: var(--label2); cursor:pointer; font-size:12px;
+    padding:0 2px; margin-left:4px; font-family:inherit;
+  }
+  .merge-cancel:hover { color: var(--label); }
 
   .modal-panel {
     background: var(--glass2); backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);
