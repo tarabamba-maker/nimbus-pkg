@@ -29,17 +29,26 @@ if os.path.exists(_env_path):
 
 # Автоматично встановлюємо Playwright браузери якщо їх немає
 def _ensure_playwright_browsers():
+    """Verify chromium binaries exist and match Playwright version. Old caches
+    pass the executable_path check but fail on launch because the directory
+    name encodes the version (chromium-XXXX, chromium_headless_shell-XXXX)."""
     import subprocess, sys
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as _pw:
-            _pw.chromium.executable_path  # перевіряємо наявність
-    except Exception:
-        print("[Playwright] Браузери не знайдено — встановлюю...")
+            # Actually launch — this catches version mismatch (old cache, new lib)
+            browser = _pw.chromium.launch(headless=True)
+            browser.close()
+            return
+    except Exception as ex:
+        print(f"[Playwright] Browser launch failed: {ex} — installing chromium + headless-shell...")
+    try:
         subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            check=False)
-        print("[Playwright] ✅ Встановлено")
+            [sys.executable, "-m", "playwright", "install", "chromium", "chromium-headless-shell"],
+            check=False, timeout=300)
+        print("[Playwright] ✅ Browsers installed")
+    except Exception as e:
+        print(f"[Playwright] ⚠️ Install failed: {e}")
 
 _ensure_playwright_browsers()
 
