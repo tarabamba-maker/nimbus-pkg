@@ -59,7 +59,7 @@ fn chrono_now() -> String {
 
 fn python_has_deps(python: &str) -> bool {
     Command::new(python)
-        .args(["-c", "import flask, playwright, PIL, bs4"])
+        .args(["-c", "import flask, flask_cors, playwright, PIL, bs4, requests"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
