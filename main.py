@@ -1961,27 +1961,48 @@ def api_groups_get():
         preview_n = int(request.args.get('preview', 0))
     except ValueError:
         preview_n = 0
+    # Groups come ONLY from photo_groups.json. ms_library.json is a separate
+    # reference file (stockids for cross-stock lookup) — it does NOT define
+    # which groups are visible. On Reset DB, photo_groups.json is deleted →
+    # this returns []. On next sync, Pass D of rebuild-matches re-populates
+    # photo_groups.json from ms_library.group field.
+    user_groups = load_groups()
+    if not user_groups:
+        return jsonify([])
+
     lib = load_ms_library()
-
-    # ── Build ms_library groups ──────────────────────────────────────────
-    ms_groups: dict = {}   # gname → [{filename, thumb, stockids}]
+    # Index ms_library by any stockid → photo (for sibling lookup & thumbs)
+    sid_to_photo: dict = {}
     for photo in lib:
-        gname = photo.get('group', '').strip()
-        if not gname:
-            continue
-        ms_groups.setdefault(gname, []).append({
-            'filename': photo.get('filename', ''),
-            'ms_thumb': photo.get('thumb', ''),
-            'stockids': {k: str(v) for k, v in photo.get('stockids', {}).items()
-                         if k in _RELEVANT_STOCKS and v},
-        })
+        for k, v in (photo.get('stockids') or {}).items():
+            if k in _RELEVANT_STOCKS and v:
+                sid_to_photo[str(v)] = photo
 
-    # ── Collect all IDs to query ─────────────────────────────────────────
+    # Build ms_groups by walking user_groups; for each user-assigned primary,
+    # find its ms_library entry and treat siblings (stockids) as members too.
+    ms_groups: dict = {}
+    for gname, aids in user_groups.items():
+        ms_groups[gname] = []
+        seen_keys: set = set()
+        for aid in aids:
+            photo = sid_to_photo.get(str(aid))
+            if photo:
+                key = id(photo)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                ms_groups[gname].append({
+                    'filename': photo.get('filename', ''),
+                    'ms_thumb': photo.get('thumb', ''),
+                    'stockids': {k: str(v) for k, v in (photo.get('stockids') or {}).items()
+                                 if k in _RELEVANT_STOCKS and v},
+                })
+
+    # Collect all IDs to query (group members + ms siblings)
     all_ids: set = set()
     for photos_raw in ms_groups.values():
         for ph in photos_raw:
             all_ids.update(ph['stockids'].values())
-    user_groups = load_groups()
     for aids in user_groups.values():
         all_ids.update(str(a) for a in aids)
 
@@ -2104,11 +2125,6 @@ def api_groups_get():
                          for k, v in g_by_stock.items()},
             'photos': photos,
         })
-
-    # Filter out groups with zero actual sales — when DB is wiped, ms_library still
-    # has 14k photos with group names, but if nothing was ever sold for them they
-    # shouldn't clutter the UI. Show only groups where at least one photo has sales.
-    result = [g for g in result if g.get('sales', 0) > 0]
 
     result.sort(key=lambda x: x['total'], reverse=True)
 
@@ -2346,10 +2362,11 @@ def api_ms_remove_from_group():
 
 @flask_app.route('/api/reset-db', methods=['POST'])
 def api_reset_db():
-    """Lightweight DB-only reset: drops sales + asset_meta, clears processed-dates
-    so collectors re-fetch full history on next sync. KEEPS browser profiles,
-    ms_library, photo_groups, matches, manual overrides — i.e. all collector
-    state and user customizations. Body: { "confirm": "RESET" }."""
+    """Full data wipe — app returns to fresh state. KEEPS ONLY chrome_profile*
+    (logins) and stock_colors.json (UI preference). Everything else (sales,
+    asset_meta, ms_library, photo_groups, matches, overrides, image caches,
+    processed_dates) is removed. Next sync rebuilds everything from scratch.
+    Body: { "confirm": "RESET" }."""
     data = request.get_json(force=True, silent=True) or {}
     if data.get('confirm') != 'RESET':
         return jsonify({'status': 'error', 'msg': 'send {"confirm":"RESET"} to proceed'}), 400
@@ -2357,32 +2374,56 @@ def api_reset_db():
     _sync_stop_flag[0] = True
     _sync_state['running'] = False
 
-    # Truncate tables (don't drop — keeps schema for next sync)
+    removed_counts = {}
+
+    # 1. Truncate DB tables
     try:
         with sqlite3.connect(DB_NAME, timeout=15) as c:
             c.execute("DELETE FROM sales")
             c.execute("DELETE FROM asset_meta")
             c.commit()
             c.execute("VACUUM")
-        removed_rows = True
+        removed_counts['db_tables'] = 'cleared'
     except Exception as e:
         return jsonify({'status': 'error', 'msg': f'db: {e}'}), 500
 
-    # Clear derived/runtime files so they rebuild fresh from new sync data.
-    # KEEP: ms_library.json (reference data), chrome_profile* (logins),
-    #       _manual_overrides.json (user link/unlink choices), stock_colors.json.
-    for fname in ("_processed_dates.json", "photo_groups.json",
-                  "_cross_stock_matches.json"):
-        fp = os.path.join(RECIPES_DIR, fname)
-        if os.path.exists(fp):
-            try: os.remove(fp)
+    # 2. Remove all recipes files EXCEPT stock_colors.json
+    try:
+        for entry in os.listdir(RECIPES_DIR):
+            if entry == 'stock_colors.json':
+                continue
+            fp = os.path.join(RECIPES_DIR, entry)
+            if os.path.isfile(fp):
+                os.remove(fp)
+        removed_counts['recipes'] = 'cleared'
+    except Exception:
+        removed_counts['recipes'] = 'partial'
+
+    # 3. Remove ms_library.json from base dir if it lives there too
+    for legacy in (os.path.join(_BASE_DIR, 'ms_library.json'),):
+        if os.path.exists(legacy):
+            try: os.remove(legacy)
             except Exception: pass
 
+    # 4. Wipe image caches (sync will rebuild them as it downloads thumbnails)
+    import shutil as _sh
+    cache_removed = 0
+    for cache_dir in (CACHE_DIR, MATCH_CACHE_DIR, MS_CACHE_DIR, ICON_CACHE_DIR):
+        if os.path.isdir(cache_dir):
+            try:
+                files = [f for f in os.listdir(cache_dir) if not f.startswith('.')]
+                for f in files:
+                    fp = os.path.join(cache_dir, f)
+                    if os.path.isfile(fp):
+                        os.remove(fp)
+                cache_removed += len(files)
+            except Exception:
+                pass
+    removed_counts['cache_files'] = cache_removed
+
     return jsonify({'status': 'ok',
-                    'db_cleared': removed_rows,
-                    'profiles_kept': True,
-                    'ms_library_kept': True,
-                    'overrides_kept': True})
+                    'wiped': removed_counts,
+                    'kept': ['chrome_profile*', 'stock_colors.json']})
 
 
 @flask_app.route('/api/reset', methods=['POST'])

@@ -2,7 +2,7 @@
   import { API_BASE } from "$lib/api.js";
   import { scale } from 'svelte/transition';
   import { backOut } from 'svelte/easing';
-  import { X, Download, Upload, Trash2, Eraser } from 'lucide-svelte';
+  import { X, Download, Upload, Trash2, Eraser, RotateCcw } from 'lucide-svelte';
   import { stockColors, saveStockColor } from '$lib/stockColors.js';
 
   let { onClose, stocks = [] } = $props();
@@ -19,6 +19,9 @@
   let dbResetStatus = $state('');
   let dbResetting   = $state(false);
   let dbResetConfirm = $state(false);
+  let rebuildStatus = $state('');
+  let rebuilding    = $state(false);
+  let rebuildConfirm = $state(false);
 
   /** @param {string} stock @param {string} color */
   function onChange(stock, color) {
@@ -168,6 +171,44 @@
     dbResetConfirm = false;
   }
 
+  async function doRebuildFromScratch() {
+    rebuilding = true; rebuildStatus = 'Очищаю БД…';
+    try {
+      // 1. Wipe everything except logins
+      const r1 = await fetch(API_BASE + '/api/reset-db', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: 'RESET' }),
+      }).then(r => r.json());
+      if (r1.status !== 'ok') {
+        rebuildStatus = `✗ reset: ${r1.msg || 'error'}`;
+        rebuilding = false; rebuildConfirm = false;
+        return;
+      }
+      // Clear UI cache
+      try {
+        for (const k of Object.keys(localStorage)) {
+          if (k.startsWith('sa:') || k.includes('cache') || k.includes('downloads') || k.includes('bestsellers') || k.includes('groups')) {
+            localStorage.removeItem(k);
+          }
+        }
+        sessionStorage.clear();
+      } catch {}
+      rebuildStatus = 'Стартую повний синк (5 стоків)…';
+      // 2. Trigger full sync (auto-runs rebuild-matches at the end)
+      const r2 = await fetch(API_BASE + '/api/sync/start', { method: 'POST' }).then(r => r.json()).catch(() => ({ok: false}));
+      if (r2.ok === false && r2.msg) {
+        rebuildStatus = `✓ Очищено. Синк: ${r2.msg}`;
+      } else {
+        rebuildStatus = '✓ Очищено + синк стартував. Перезавантажую UI…';
+      }
+      setTimeout(() => location.reload(), 1500);
+    } catch (e) {
+      rebuildStatus = `✗ ${String(e)}`;
+    }
+    rebuilding = false;
+    rebuildConfirm = false;
+  }
+
   async function doReset() {
     resetting = true; resetStatus = '';
     try {
@@ -245,6 +286,26 @@
     {/if}
     {#if dbResetStatus}
       <div class="import-status" class:ok={dbResetStatus.startsWith('✓')}>{dbResetStatus}</div>
+    {/if}
+    {#if !rebuildConfirm}
+      <div class="db-row">
+        <button class="db-btn" onclick={() => rebuildConfirm = true} disabled={rebuilding}>
+          <RotateCcw size={13} strokeWidth={2} /> Build database from scratch
+        </button>
+      </div>
+    {:else}
+      <div class="reset-confirm">
+        <span class="reset-warn">Скинути ВСЕ і стартувати повний синк? Збереже тільки логіни.</span>
+        <div class="confirm-btns-row">
+          <button class="btn-cancel-sm" onclick={() => rebuildConfirm = false}>Cancel</button>
+          <button class="btn-reset" onclick={doRebuildFromScratch} disabled={rebuilding}>
+            {rebuilding ? rebuildStatus : 'Yes, rebuild all'}
+          </button>
+        </div>
+      </div>
+    {/if}
+    {#if rebuildStatus && !rebuilding}
+      <div class="import-status" class:ok={rebuildStatus.startsWith('✓')}>{rebuildStatus}</div>
     {/if}
 
     <!-- Reset -->
