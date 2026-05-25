@@ -2339,6 +2339,45 @@ def api_ms_remove_from_group():
     save_ms_library(photos)
     return jsonify({'status': 'ok'})
 
+@flask_app.route('/api/reset-db', methods=['POST'])
+def api_reset_db():
+    """Lightweight DB-only reset: drops sales + asset_meta, clears processed-dates
+    so collectors re-fetch full history on next sync. KEEPS browser profiles,
+    ms_library, photo_groups, matches, manual overrides — i.e. all collector
+    state and user customizations. Body: { "confirm": "RESET" }."""
+    data = request.get_json(force=True, silent=True) or {}
+    if data.get('confirm') != 'RESET':
+        return jsonify({'status': 'error', 'msg': 'send {"confirm":"RESET"} to proceed'}), 400
+
+    _sync_stop_flag[0] = True
+    _sync_state['running'] = False
+
+    # Truncate tables (don't drop — keeps schema for next sync)
+    try:
+        with sqlite3.connect(DB_NAME, timeout=15) as c:
+            c.execute("DELETE FROM sales")
+            c.execute("DELETE FROM asset_meta")
+            c.commit()
+            c.execute("VACUUM")
+        removed_rows = True
+    except Exception as e:
+        return jsonify({'status': 'error', 'msg': f'db: {e}'}), 500
+
+    # Clear processed-dates so historical chunks rerun
+    proc_file = os.path.join(RECIPES_DIR, "_processed_dates.json")
+    if os.path.exists(proc_file):
+        try:
+            os.remove(proc_file)
+        except Exception:
+            pass
+
+    return jsonify({'status': 'ok',
+                    'db_cleared': removed_rows,
+                    'profiles_kept': True,
+                    'ms_library_kept': True,
+                    'groups_kept': True})
+
+
 @flask_app.route('/api/reset', methods=['POST'])
 def api_reset():
     """Full account reset: wipes sales DB, all browser profiles, image caches,

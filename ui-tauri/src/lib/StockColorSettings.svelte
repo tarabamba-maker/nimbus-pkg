@@ -16,6 +16,9 @@
   let resetting    = $state(false);
   let dedupStatus  = $state('');
   let deduping     = $state(false);
+  let dbResetStatus = $state('');
+  let dbResetting   = $state(false);
+  let dbResetConfirm = $state(false);
 
   /** @param {string} stock @param {string} color */
   function onChange(stock, color) {
@@ -136,6 +139,35 @@
     setTimeout(() => dedupStatus = '', 8000);
   }
 
+  async function doResetDb() {
+    dbResetting = true; dbResetStatus = '';
+    try {
+      const r = await fetch(API_BASE + '/api/reset-db', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: 'RESET' }),
+      }).then(r => r.json());
+      if (r.status === 'ok') {
+        // Clear ALL frontend caches so UI doesn't show stale numbers
+        try {
+          for (const k of Object.keys(localStorage)) {
+            if (k.startsWith('sa:') || k.includes('cache') || k.includes('downloads') || k.includes('bestsellers') || k.includes('groups')) {
+              localStorage.removeItem(k);
+            }
+          }
+          sessionStorage.clear();
+        } catch {}
+        dbResetStatus = '✓ База очищена. Перезавантажую…';
+        setTimeout(() => location.reload(), 800);
+      } else {
+        dbResetStatus = `✗ ${r.msg || 'error'}`;
+      }
+    } catch (e) {
+      dbResetStatus = `✗ ${String(e)}`;
+    }
+    dbResetting = false;
+    dbResetConfirm = false;
+  }
+
   async function doReset() {
     resetting = true; resetStatus = '';
     try {
@@ -193,6 +225,26 @@
     </div>
     {#if dedupStatus}
       <div class="import-status" class:ok={dedupStatus.startsWith('✓')}>{dedupStatus}</div>
+    {/if}
+    {#if !dbResetConfirm}
+      <div class="db-row">
+        <button class="db-btn danger" onclick={() => dbResetConfirm = true} disabled={dbResetting}>
+          <Trash2 size={13} strokeWidth={2} /> Reset DB (keep logins)
+        </button>
+      </div>
+    {:else}
+      <div class="reset-confirm">
+        <span class="reset-warn">Очистити всі продажі? Логіни/групи/MS+ залишаться.</span>
+        <div class="confirm-btns-row">
+          <button class="btn-cancel-sm" onclick={() => dbResetConfirm = false}>Cancel</button>
+          <button class="btn-reset" onclick={doResetDb} disabled={dbResetting}>
+            {dbResetting ? 'Resetting…' : 'Yes, wipe DB'}
+          </button>
+        </div>
+      </div>
+    {/if}
+    {#if dbResetStatus}
+      <div class="import-status" class:ok={dbResetStatus.startsWith('✓')}>{dbResetStatus}</div>
     {/if}
 
     <!-- Reset -->
