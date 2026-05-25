@@ -153,26 +153,25 @@ fn find_python3(project_root: Option<&std::path::Path>) -> Option<String> {
 fn find_main_py() -> Option<std::path::PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
-            // Windows packaged: NSIS puts resources in the same dir as the exe
+            // Windows packaged: resources are placed in a _up_/_up_/ structure
+            // mirroring the relative path "../../main.py".
             #[cfg(target_os = "windows")]
-            {
-                let p = exe_dir.join("main.py");
+            for rel in ["_up_/_up_/main.py", "_up_/main.py", "main.py"] {
+                let p = exe_dir.join(rel);
                 if p.exists() { return Some(p); }
             }
 
-            // macOS packaged: exe is in Contents/MacOS/, resources in Contents/Resources/
+            // macOS packaged: exe is in Contents/MacOS/, resources in Contents/Resources/.
+            // Tauri 2 with resource paths "../../main.py" places them under _up_/_up_/.
             #[cfg(target_os = "macos")]
-            {
-                let p = exe_dir.join("../Resources/main.py");
+            for rel in [
+                "../Resources/_up_/_up_/main.py",
+                "../Resources/_up_/main.py",
+                "../Resources/main.py",
+            ] {
+                let p = exe_dir.join(rel);
                 if p.exists() {
-                    // Only use this if the parent directory is writable (skip read-only .app installs)
-                    let parent = p.parent().unwrap_or(exe_dir);
-                    if std::fs::OpenOptions::new().append(true).open(parent.join(".write_test")).is_ok()
-                        || std::fs::write(parent.join(".write_test"), b"").is_ok()
-                    {
-                        let _ = std::fs::remove_file(parent.join(".write_test"));
-                        return Some(p.canonicalize().unwrap_or(p));
-                    }
+                    return Some(p.canonicalize().unwrap_or(p));
                 }
             }
 
