@@ -7,7 +7,7 @@ ssl._create_default_https_context = ssl._create_unverified_context
 
 # ── Логування у файл + термінал ──────────────────────────────
 _LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.log")
-_log_file_handle = open(_LOG_FILE, "a", encoding="utf-8", buffering=1)
+_log_file_handle = open(_LOG_FILE, "a", encoding="utf-8", errors="replace", buffering=1)
 atexit.register(lambda: _log_file_handle.close())
 
 def _app_log(msg: str):
@@ -128,7 +128,7 @@ _STOCK_KEY = {
 }
 
 def init_db():
-    with sqlite3.connect(DB_NAME) as c:
+    with sqlite3.connect(DB_NAME, timeout=15) as c:
         c.execute('''CREATE TABLE IF NOT EXISTS sales (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             asset_id TEXT, photo_name TEXT,
@@ -182,23 +182,42 @@ def init_db():
 
 
 def is_already_saved(stock, asset_id, price, date_str):
-    """Повертає True якщо цей продаж вже є в БД (той самий stock+asset+price+день)."""
+    """Returns True if this exact sale already exists in the DB.
+
+    Two-pass strategy to handle both old (date-only) and new (datetime) records:
+    1. If date_str has a time component (ISO from Adobe): exact datetime match
+       against records stored with time.  Different sales of the same photo on
+       the same day have different timestamps → correctly allowed.
+    2. Fallback: price±0.005 + day match, restricted to old date-only rows
+       (LENGTH(date)=10).  Catches re-synced duplicates stored before we kept time.
+    """
     if not asset_id:
         return False
     try:
-        # Конвертуємо будь-який формат дати → YYYY-MM-DD для порівняння з БД
         raw = str(date_str)
-        day = raw[:10]  # default: вже YYYY-MM-DD
+        day = raw[:10]
         for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d"):
             try:
                 day = datetime.strptime(raw[:10], fmt).strftime("%Y-%m-%d")
                 break
             except ValueError:
                 pass
-        with sqlite3.connect(DB_NAME) as c:
+        p = float(price) if price else 0.0
+        with sqlite3.connect(DB_NAME, timeout=15) as c:
+            # Pass 1: exact datetime (new records stored with HH:MM:SS)
+            if 'T' in raw or (' ' in raw and len(raw) > 10):
+                dt_norm = raw.replace('T', ' ').split('+')[0].split('Z')[0][:19]
+                row = c.execute(
+                    'SELECT 1 FROM sales WHERE stock=? AND asset_id=? AND date=?',
+                    (stock, str(asset_id), dt_norm)
+                ).fetchone()
+                if row:
+                    return True
+            # Pass 2: price+day fallback for old date-only records
             row = c.execute(
-                'SELECT 1 FROM sales WHERE stock=? AND asset_id=? AND price=? AND date LIKE ?',
-                (stock, str(asset_id), float(price or 0), day + '%')
+                'SELECT 1 FROM sales WHERE stock=? AND asset_id=? AND date LIKE ? '
+                'AND LENGTH(date)=10 AND ABS(price - ?) < 0.005',
+                (stock, str(asset_id), day + '%', p)
             ).fetchone()
         return row is not None
     except Exception:
@@ -209,7 +228,7 @@ def save_to_db(d):
         stock = d.get('stock', 'Adobe Stock')
         aid   = str(d.get('asset_id', ''))
         price = float(d.get('price') or 0)
-        with sqlite3.connect(DB_NAME) as c:
+        with sqlite3.connect(DB_NAME, timeout=15) as c:
             c.execute(
                 'INSERT INTO sales (asset_id,photo_name,stock,price,thumb_url,date,filename) '
                 'VALUES (?,?,?,?,?,?,?)',
@@ -233,8 +252,11 @@ def api_update():
     if not d: return jsonify({"status": "error"}), 400
     raw_date = d.get('date'); dt = datetime.now()
     if raw_date:
-        for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d"):
-            try: dt = datetime.strptime(raw_date, fmt); break
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z",
+                    "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(raw_date.split('+')[0].split('Z')[0], fmt)
+                break
             except Exception: pass
     d['date']  = dt.strftime("%Y-%m-%d %H:%M:%S")
     d['stock'] = d.get('stock', 'Adobe Stock')
@@ -385,25 +407,28 @@ def _adobe_api_collect_global(pw_page):
         page_old = 0
         stop_early = False
         for item in history:
-            asset_id = str(item.get("id", ""))
-            price    = float(item.get("commissionAmount", 0))
-            thumb    = item.get("thumbnailUrl", "")
-            sale_dt  = item.get("saleDate", "")[:10]
+            asset_id   = str(item.get("id", ""))
+            price      = float(item.get("commissionAmount", 0))
+            thumb      = item.get("thumbnailUrl", "")
+            sale_full  = item.get("saleDate", "")        # full ISO: "2026-05-03T01:13:34+00:00"
+            sale_dt    = sale_full[:10]                  # "2026-05-03" — display/filter only
             photo_name = item.get("title") or item.get("originalName") or asset_id
             orig_name  = item.get("originalName") or ""
             fname_no_ext = orig_name.rsplit(".", 1)[0] if orig_name and "." in orig_name else orig_name
             if not asset_id or not sale_dt:
                 continue
             all_seen += 1
-            if is_already_saved("Adobe Stock", asset_id, price, sale_dt):
+            # Dedup on full datetime: same sale re-synced has same timestamp;
+            # different sales of the same photo have different timestamps.
+            if is_already_saved("Adobe Stock", asset_id, price, sale_full):
                 page_old += 1
-                if pg == 1 and page_old >= 10:
-                    _sync_log(f"⏹ Adobe: 10 збережених поспіль на стор.1 — зупиняємось")
+                if pg == 1 and page_old >= 100:
+                    _sync_log(f"⏹ Adobe: 100 збережених на стор.1 — зупиняємось")
                     stop_early = True
                     break
                 continue
             rec = {"asset_id": asset_id, "photo_name": photo_name, "stock": "Adobe Stock",
-                   "price": price, "thumb_url": thumb, "date": sale_dt,
+                   "price": price, "thumb_url": thumb, "date": sale_full,
                    "filename": fname_no_ext}
             if thumb:
                 load_img_async(asset_id, thumb, None, is_adobe=True)
@@ -497,17 +522,18 @@ def _adobe_api_collect_global(pw_page):
                 asset_id   = str(item.get("id", ""))
                 price      = float(item.get("commissionAmount", 0))
                 thumb      = item.get("thumbnailUrl", "")
-                sale_dt    = item.get("saleDate", "")[:10]
+                sale_full  = item.get("saleDate", "")
+                sale_dt    = sale_full[:10]
                 photo_name = item.get("title") or item.get("originalName") or asset_id
                 orig_name  = item.get("originalName") or ""
                 fname_no_ext = orig_name.rsplit(".", 1)[0] if orig_name and "." in orig_name else orig_name
                 if not asset_id or not sale_dt:
                     continue
-                if is_already_saved("Adobe Stock", asset_id, price, sale_dt):
+                if is_already_saved("Adobe Stock", asset_id, price, sale_full):
                     continue
                 rec = {"asset_id": asset_id, "photo_name": photo_name,
                        "stock": "Adobe Stock", "price": price,
-                       "thumb_url": thumb, "date": sale_dt, "filename": fname_no_ext}
+                       "thumb_url": thumb, "date": sale_full, "filename": fname_no_ext}
                 if thumb:
                     load_img_async(asset_id, thumb, None, is_adobe=True)
                 _http_executor.submit(
@@ -737,7 +763,7 @@ def _depositphotos_collect(pw_page):
     page_num    = 1
     all_known_streak = 0
 
-    while not _sync_state.get("stop"):
+    while not _sync_stop_flag[0]:
         url = ("/sales.html" if page_num == 1
                else f"/sales/page{page_num}.html?ajax=true")
         _sync_log(f"Depositphotos: page {page_num}…")
@@ -791,7 +817,7 @@ def _depositphotos_collect(pw_page):
         # the most recent Deposit sale we already have in DB, every page beyond
         # is guaranteed already-synced. Cheap one-shot SQL lookup per page.
         try:
-            with sqlite3.connect(DB_NAME) as _c:
+            with sqlite3.connect(DB_NAME, timeout=15) as _c:
                 _last = _c.execute(
                     "SELECT MAX(date) FROM sales WHERE stock='Depositphotos'"
                 ).fetchone()[0]
@@ -991,7 +1017,7 @@ def _getty_api_collect_global(pw_page, force=False):
                 return f"{y}-{MONTH_MAP.get(m.lower(),'01')}-{d.zfill(2)} 00:00:00"
             return s
         reader = _csv.DictReader(_io.StringIO(content), delimiter="\t")
-        with sqlite3.connect(DB_NAME) as _conn:
+        with sqlite3.connect(DB_NAME, timeout=15) as _conn:
             for row in reader:
                 asset_id = row.get("Asset Number", "").strip()
                 filename = row.get("Alternate Asset Number", "").strip()
@@ -1087,7 +1113,7 @@ def _getty_api_collect_global(pw_page, force=False):
                 asset_id = str(item.get("MasterId", ""))
                 thumb    = item.get("ThumbnailUrl", "")
                 if asset_id and thumb:
-                    with sqlite3.connect(DB_NAME) as _c:
+                    with sqlite3.connect(DB_NAME, timeout=15) as _c:
                         _c.execute(
                             "UPDATE sales SET thumb_url=? WHERE asset_id=? "
                             "AND stock IN ('iStock','iStockphoto') AND (thumb_url IS NULL OR thumb_url='')",
@@ -1108,9 +1134,12 @@ def _getty_api_collect_global(pw_page, force=False):
             _pd2 = json.load(_f)
     except Exception:
         _pd2 = {}
+    from datetime import date as _dt
     _pd2["Getty_auto_month"] = this_month
+    _pd2["Getty/iStock_last_sync"] = _dt.today().isoformat()
     with open(proc_file, "w") as _f:
         json.dump(_pd2, _f, indent=2)
+    _app_log(f"[Getty] last_sync recorded: {_pd2['Getty/iStock_last_sync']}")
 
 
 def _run_collector_global(p, profile_dir, stock_name, start_url, headless):
@@ -1160,14 +1189,34 @@ def _collect_one_stock_global(name, url):
     is_getty   = name == "Getty Images"
     main_prof  = os.path.join(_BASE_DIR, "chrome_profile")
 
-    # Запобіжник для Getty: статистика з'являється тільки після 20-го числа.
-    # Раніше за 21-е навіть не відкриваємо браузер.
+    # Getty guard: stats publish around the 21st each month.
+    # 1) Block before the 21st of the current month.
+    # 2) Block after a successful sync until the 21st of the NEXT month.
     if is_getty:
         from datetime import date as _date
-        today_day = _date.today().day
-        if today_day < 21:
-            _sync_log(f"📅 [{name}] пропущено — збір автоматично з 21-го (сьогодні {today_day}-е)")
+        today = _date.today()
+        if today.day < 21:
+            _sync_log(f"📅 [{name}] skipped — available from the 21st (today is the {today.day}th)")
             return
+        # Check if already synced this month cycle
+        try:
+            with open(PROCESSED_DATES_FILE) as _pf:
+                _pd_g = json.load(_pf)
+        except Exception:
+            _pd_g = {}
+        last_sync_str = _pd_g.get('Getty/iStock_last_sync', '')
+        if last_sync_str:
+            try:
+                last = _date.fromisoformat(last_sync_str)
+                # Next allowed = 21st of the month after last sync
+                next_m = last.month % 12 + 1
+                next_y = last.year + (1 if last.month == 12 else 0)
+                next_allowed = _date(next_y, next_m, 21)
+                if today < next_allowed:
+                    _sync_log(f"📅 [{name}] already collected this cycle — next sync from {next_allowed.strftime('%d.%m.%Y')}")
+                    return
+            except Exception:
+                pass
 
     if is_getty:
         stock_profile = os.path.abspath("getty_profile")
@@ -1274,7 +1323,7 @@ def api_sales():
         'Year':  (now - timedelta(days=365)).strftime('%Y-%m-%d'),
     }
 
-    with sqlite3.connect(DB_NAME) as conn:
+    with sqlite3.connect(DB_NAME, timeout=15) as conn:
         params = []
         where  = ["stock != 'Envato Elements'"]
         if period in cutoffs:
@@ -1347,7 +1396,7 @@ def api_feed():
         'Year':  (now - timedelta(days=365)).strftime('%Y-%m-%d'),
     }
 
-    with sqlite3.connect(DB_NAME) as conn:
+    with sqlite3.connect(DB_NAME, timeout=15) as conn:
         params = []
         where  = ["stock != 'Envato Elements'"]
         if period in cutoffs:
@@ -1380,7 +1429,7 @@ def api_feed():
             if group:
                 expanded.update(str(m) for m in group)
 
-        with sqlite3.connect(DB_NAME) as conn2:
+        with sqlite3.connect(DB_NAME, timeout=15) as conn2:
             exp_list = list(expanded)
             ph2 = ','.join('?' * len(exp_list))
             agg = conn2.execute(
@@ -1440,7 +1489,7 @@ def api_stats():
                   (now - timedelta(days=730)).strftime('%Y-%m-%d')),
     }
     result = {}
-    with sqlite3.connect(DB_NAME) as conn:
+    with sqlite3.connect(DB_NAME, timeout=15) as conn:
         def q(extra_where, extra_params):
             r = conn.execute(
                 f"SELECT SUM(price), COUNT(*) FROM sales WHERE {base_where} AND {extra_where}",
@@ -1485,7 +1534,7 @@ def api_stats():
 @flask_app.route('/api/stock-list', methods=['GET'])
 def api_stock_list():
     """Повертає список стоків (без Envato Elements)."""
-    with sqlite3.connect(DB_NAME) as conn:
+    with sqlite3.connect(DB_NAME, timeout=15) as conn:
         rows = conn.execute(
             "SELECT DISTINCT stock FROM sales WHERE stock != 'Envato Elements' AND stock IS NOT NULL ORDER BY stock"
         ).fetchall()
@@ -1557,7 +1606,7 @@ def api_export():
                     # Use sqlite backup API to guarantee a consistent snapshot
                     # even if Flask is mid-write to sales.db.
                     db_snap = tmp_path + '.db'
-                    src = sqlite3.connect(DB_NAME)
+                    src = sqlite3.connect(DB_NAME, timeout=15)
                     dst = sqlite3.connect(db_snap)
                     try:
                         src.backup(dst)
@@ -1642,6 +1691,9 @@ def _do_import(zip_path):
             names = zf.namelist()
             if 'sales.db' not in names:
                 return jsonify({'ok': False, 'msg': 'ZIP does not contain sales.db'}), 400
+            for member in names:
+                if member.startswith('/') or '..' in member.replace('\\', '/'):
+                    return jsonify({'ok': False, 'msg': f'Unsafe path in ZIP: {member}'}), 400
             zf.extractall(_BASE_DIR)
         _app_log(f"[import] restored {len(names)} files to {_BASE_DIR}")
         return jsonify({'ok': True, 'files': len(names)})
@@ -1658,7 +1710,7 @@ def _query_earnings_batch(ids_iterable):
     ids_list = list(set(str(i) for i in ids_iterable if i))
     if not ids_list:
         return earnings, thumb_map
-    with sqlite3.connect(DB_NAME) as conn:
+    with sqlite3.connect(DB_NAME, timeout=15) as conn:
         for off in range(0, len(ids_list), 800):
             chunk = ids_list[off:off + 800]
             phs = ','.join('?' * len(chunk))
@@ -1978,6 +2030,15 @@ def api_photo_groups_delete(name):
     if name in groups:
         del groups[name]
         save_groups(groups)
+    # Also clear the group field in ms_library.json so the group doesn't reappear
+    lib = load_ms_library()
+    changed = False
+    for photo in lib:
+        if photo.get('group') == name:
+            photo['group'] = ''
+            changed = True
+    if changed:
+        save_ms_library(lib)
     return jsonify({"status": "ok"})
 
 @flask_app.route('/api/photo-groups/rename', methods=['POST'])
@@ -2036,6 +2097,17 @@ def api_photo_groups_merge():
     if source in groups:
         del groups[source]
     save_groups(groups)
+
+    # Also update ms_library.json: remap group field from source → target
+    lib = load_ms_library()
+    changed = False
+    for photo in lib:
+        if (photo.get('group') or '').strip() == source:
+            photo['group'] = target
+            changed = True
+    if changed:
+        save_ms_library(lib)
+
     return jsonify({'status': 'ok', 'merged': len(merged)})
 
 @flask_app.route('/api/ms-library/remove-from-group', methods=['POST'])
@@ -2053,6 +2125,143 @@ def api_ms_remove_from_group():
     save_ms_library(photos)
     return jsonify({'status': 'ok'})
 
+@flask_app.route('/api/reset', methods=['POST'])
+def api_reset():
+    """Full account reset: wipes sales DB, all browser profiles, image caches,
+    and processed-dates log. Keeps user groups, stock colors, and ms_library.
+    Body: { "confirm": "RESET" }  — required to prevent accidental calls.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    if data.get('confirm') != 'RESET':
+        return jsonify({'status': 'error', 'msg': 'send {"confirm":"RESET"} to proceed'}), 400
+
+    # Stop any active sync first
+    global _sync_state
+    _sync_state['running'] = False
+
+    removed = []
+    errors  = []
+
+    # 1. Drop + recreate sales.db
+    try:
+        db_path = os.path.join(BASE_DIR, 'sales.db')
+        if os.path.exists(db_path):
+            os.remove(db_path)
+        init_db()
+        removed.append('sales.db')
+    except Exception as e:
+        errors.append(f'sales.db: {e}')
+
+    # 2. Delete all browser profile directories
+    import glob
+    profile_patterns = [
+        os.path.join(BASE_DIR, 'chrome_profile*'),
+        os.path.join(BASE_DIR, '*_profile'),
+        os.path.join(BASE_DIR, '*_profile_*'),
+    ]
+    for pat in profile_patterns:
+        for d in glob.glob(pat):
+            if os.path.isdir(d):
+                try:
+                    import shutil
+                    shutil.rmtree(d)
+                    removed.append(os.path.basename(d))
+                except Exception as e:
+                    errors.append(f'{os.path.basename(d)}: {e}')
+
+    # 3. Delete image caches
+    cache_dirs = [
+        os.path.join(BASE_DIR, 'img_cache'),
+        os.path.join(BASE_DIR, 'img_cache_match'),
+        os.path.join(BASE_DIR, 'img_cache_ms'),
+        os.path.join(BASE_DIR, 'img_cache_icons'),
+    ]
+    for d in cache_dirs:
+        if os.path.isdir(d):
+            try:
+                import shutil
+                shutil.rmtree(d)
+                os.makedirs(d)          # recreate empty dir
+                removed.append(os.path.basename(d))
+            except Exception as e:
+                errors.append(f'{os.path.basename(d)}: {e}')
+
+    # 4. Clear all recipes state (processed dates, groups, matches)
+    recipes_to_clear = [
+        '_processed_dates.json',
+        'photo_groups.json',
+        '_cross_stock_matches.json',
+    ]
+    for fname in recipes_to_clear:
+        fpath = os.path.join(RECIPES_DIR, fname)
+        if os.path.exists(fpath):
+            try:
+                os.remove(fpath)
+                removed.append(fname)
+            except Exception as e:
+                errors.append(f'{fname}: {e}')
+
+    _app_log(f'[reset] removed: {removed}, errors: {errors}')
+    return jsonify({'status': 'ok', 'removed': removed, 'errors': errors})
+
+
+@flask_app.route('/api/deduplicate', methods=['POST'])
+def api_deduplicate():
+    """One-shot cleanup:
+    1. Remove duplicate sale rows (keep highest-price row per stock+asset_id+date-day).
+    2. Deduplicate IDs within each group.
+    3. Remove IDs that appear in multiple groups (keep in the first group alphabetically).
+    """
+    result = {}
+
+    # ── 1. Sales DB dedup ────────────────────────────────────────────────────
+    try:
+        with sqlite3.connect(DB_NAME, timeout=15) as c:
+            before = c.execute('SELECT COUNT(*) FROM sales').fetchone()[0]
+            # Keep the row with the highest price for each (stock, asset_id, date-day)
+            c.execute('''
+                DELETE FROM sales WHERE rowid NOT IN (
+                    SELECT MAX(rowid) FROM sales
+                    GROUP BY stock, asset_id, DATE(date)
+                )
+            ''')
+            c.commit()
+            after = c.execute('SELECT COUNT(*) FROM sales').fetchone()[0]
+        result['sales_removed'] = before - after
+        result['sales_remaining'] = after
+    except Exception as e:
+        result['sales_error'] = str(e)
+
+    # ── 2. Groups dedup ──────────────────────────────────────────────────────
+    try:
+        groups = load_groups()
+        # Pass 1: deduplicate within each group, sort groups alphabetically
+        clean = {}
+        for name in sorted(groups.keys()):
+            clean[name] = list(dict.fromkeys(str(a) for a in groups[name]))
+
+        # Pass 2: if an ID appears in multiple groups, keep it only in the
+        # first group alphabetically (the dict is already sorted above)
+        seen_ids: set = set()
+        cross_removed = 0
+        final = {}
+        for name, ids in clean.items():
+            deduped = [a for a in ids if a not in seen_ids]
+            cross_removed += len(ids) - len(deduped)
+            seen_ids.update(deduped)
+            if deduped:
+                final[name] = deduped
+
+        save_groups(final)
+        result['groups_cross_removed'] = cross_removed
+        result['groups_total'] = len(final)
+    except Exception as e:
+        result['groups_error'] = str(e)
+
+    _app_log(f'[deduplicate] {result}')
+    return jsonify({'status': 'ok', **result})
+
+
 @flask_app.route('/api/group-names', methods=['GET'])
 def api_group_names():
     """Returns sorted list of all group names (ms_library + user)."""
@@ -2069,7 +2278,7 @@ def _hash_based_matches(existing_matches, threshold=8):
     (Hamming distance ≤ threshold) and merge into existing match groups.
     Returns merged matches dict + count of new pairs found.
     """
-    with sqlite3.connect(DB_NAME) as c:
+    with sqlite3.connect(DB_NAME, timeout=15) as c:
         rows = c.execute(
             "SELECT stock, asset_id, thumb_hash, aspect_ratio, r, g, b FROM asset_meta "
             "WHERE thumb_hash IS NOT NULL AND thumb_hash != ''"
@@ -2143,7 +2352,7 @@ def api_compute_hashes():
 
     # Build aid -> stock map from sales
     aid_stock = {}
-    with sqlite3.connect(DB_NAME) as c:
+    with sqlite3.connect(DB_NAME, timeout=15) as c:
         for aid, stock in c.execute("SELECT DISTINCT asset_id, stock FROM sales WHERE asset_id IS NOT NULL"):
             if aid and stock and aid not in aid_stock:
                 aid_stock[str(aid)] = stock
@@ -2175,7 +2384,7 @@ def api_compute_hashes():
         computed += 1
 
     if rows:
-        with sqlite3.connect(DB_NAME) as c:
+        with sqlite3.connect(DB_NAME, timeout=15) as c:
             c.executemany(
                 "INSERT OR REPLACE INTO asset_meta "
                 "(stock, asset_id, thumb_hash, aspect_ratio, r, g, b, updated_at) "
@@ -2196,7 +2405,7 @@ def api_compute_ms_hashes():
     if not os.path.isdir(MS_CACHE_DIR):
         return jsonify({'computed': 0, 'msg': 'no ms cache dir'})
 
-    with sqlite3.connect(DB_NAME) as c:
+    with sqlite3.connect(DB_NAME, timeout=15) as c:
         complete = set(r[0] for r in c.execute("SELECT fname FROM ms_meta WHERE r IS NOT NULL"))
 
     computed = 0
@@ -2214,7 +2423,7 @@ def api_compute_ms_hashes():
         computed += 1
         # flush in batches to keep memory bounded
         if len(rows) >= 1000:
-            with sqlite3.connect(DB_NAME) as c:
+            with sqlite3.connect(DB_NAME, timeout=15) as c:
                 c.executemany(
                     "INSERT OR REPLACE INTO ms_meta "
                     "(fname, thumb_hash, aspect_ratio, r, g, b, updated_at) "
@@ -2223,7 +2432,7 @@ def api_compute_ms_hashes():
             rows = []
 
     if rows:
-        with sqlite3.connect(DB_NAME) as c:
+        with sqlite3.connect(DB_NAME, timeout=15) as c:
             c.executemany(
                 "INSERT OR REPLACE INTO ms_meta "
                 "(fname, thumb_hash, aspect_ratio, r, g, b, updated_at) "
@@ -2279,7 +2488,7 @@ def _ms_visual_matches(aid_to_group, strict_hamming=8, loose_hamming=12, loose_r
 
     lib_filenames = set(fname_to_group.keys())
 
-    with sqlite3.connect(DB_NAME) as c:
+    with sqlite3.connect(DB_NAME, timeout=15) as c:
         sales_rows = c.execute(
             "SELECT stock, asset_id, thumb_hash, aspect_ratio, r, g, b FROM asset_meta "
             "WHERE thumb_hash IS NOT NULL AND thumb_hash != ''"
@@ -2716,14 +2925,22 @@ def img_cache_serve(aid):
     p = os.path.join(CACHE_DIR, f"{aid}.jpg")
     if os.path.exists(p):
         return send_file(p, mimetype='image/jpeg')
-    # Try to fetch thumb_url from DB and cache it
+    # Try to fetch thumb_url from DB and cache it (resize to 400×400 for consistency)
     try:
-        with sqlite3.connect(DB_NAME) as _c:
+        with sqlite3.connect(DB_NAME, timeout=15) as _c:
             row = _c.execute("SELECT thumb_url FROM sales WHERE asset_id=? AND thumb_url!='' LIMIT 1", (aid,)).fetchone()
         if row and row[0]:
-            r = _req.get(row[0], timeout=6, headers={'User-Agent': 'Mozilla/5.0'})
-            if r.status_code == 200 and b'\xff\xd8' in r.content[:4]:
-                with open(p, 'wb') as f: f.write(r.content)
+            raw_url = row[0]
+            # Prefer higher-res variant for Adobe CDN URLs
+            if '_F_' in raw_url:
+                raw_url = re.sub(r'\d{3}_F_', '500_F_', raw_url)
+            r = _req.get(raw_url, timeout=6, headers={'User-Agent': 'Mozilla/5.0'})
+            if r.status_code != 200 and raw_url != row[0]:
+                r = _req.get(row[0], timeout=6, headers={'User-Agent': 'Mozilla/5.0'})
+            if r.status_code == 200 and r.content[:2] == b'\xff\xd8':
+                img = Image.open(BytesIO(r.content)).convert('RGB')
+                img = ImageOps.fit(img, (400, 400), Image.Resampling.LANCZOS)
+                img.save(p, 'JPEG', quality=88)
                 return send_file(p, mimetype='image/jpeg')
     except Exception:
         pass
@@ -2820,7 +3037,7 @@ def _save_asset_meta(stock, asset_id, path):
     h, ar, r, g, b = _dhash_from_path(path)
     if not h: return
     try:
-        with sqlite3.connect(DB_NAME) as c:
+        with sqlite3.connect(DB_NAME, timeout=15) as c:
             c.execute("""INSERT INTO asset_meta (stock, asset_id, thumb_hash, aspect_ratio, r, g, b, updated_at)
                          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                          ON CONFLICT(stock, asset_id) DO UPDATE SET
@@ -2857,8 +3074,8 @@ def load_img(asset_id, url, stock=None):
             r = req_lib.get(u, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
             if r.status_code == 200:
                 img = Image.open(BytesIO(r.content)).convert("RGB")
-                img = ImageOps.fit(img, (200, 200), Image.Resampling.LANCZOS)
-                img.save(path, "JPEG", quality=85)
+                img = ImageOps.fit(img, (400, 400), Image.Resampling.LANCZOS)
+                img.save(path, "JPEG", quality=88)
                 if stock:
                     _save_asset_meta(stock, asset_id, path)
                 return path
@@ -2868,6 +3085,7 @@ def load_img(asset_id, url, stock=None):
 from concurrent.futures import ThreadPoolExecutor as _TPE
 _img_executor  = _TPE(max_workers=5)
 _http_executor = _TPE(max_workers=8)
+atexit.register(lambda: (_img_executor.shutdown(wait=False), _http_executor.shutdown(wait=False)))
 
 def load_match_thumb(asset_id, thumb_url):
     """Завантажує clean Adobe thumbnail у MATCH_CACHE_DIR, square crop 200×200."""
@@ -2905,8 +3123,11 @@ def load_groups() -> dict:
         return {}
 
 def save_groups(groups: dict):
+    # Deduplicate: remove duplicate IDs within each group
+    clean = {name: list(dict.fromkeys(str(a) for a in ids))
+             for name, ids in groups.items() if ids}
     with open(GROUPS_FILE, "w") as f:
-        json.dump(groups, f, indent=2, ensure_ascii=False)
+        json.dump(clean, f, indent=2, ensure_ascii=False)
 
 _ms_library_cache: list = []
 _ms_library_mtime: float = 0.0

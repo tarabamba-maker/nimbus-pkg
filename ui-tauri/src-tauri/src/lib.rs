@@ -174,13 +174,6 @@ fn find_main_py() -> Option<std::path::PathBuf> {
         if pb.exists() { return Some(pb); }
     }
 
-    // Last-resort dev path (developer's Mac)
-    #[cfg(target_os = "macos")]
-    {
-        let fb = std::path::PathBuf::from("/Users/admin/Desktop/Stock_Automation/main.py");
-        if fb.exists() { return Some(fb); }
-    }
-
     None
 }
 

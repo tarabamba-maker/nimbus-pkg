@@ -195,7 +195,7 @@
 
   <!-- Tile grid with infinite scroll -->
   <div class="grid scroll-y">
-    {#each items as item, i (i)}
+    {#each items as item (item.id ?? item.asset_id + item.date)}
       {@const isNew       = item._isNew === true}
       {@const isFirstSale = Object.values(item.by_stock||{}).reduce((/** @type {number} */ s, /** @type {any} */ d) => s + d.count, 0) === 1}
       {@const inGroups    = Object.entries($photoGroups).filter(([,ids]) => ids.includes(item.asset_id)).map(([n]) => n)}

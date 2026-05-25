@@ -2,13 +2,20 @@
   import { API_BASE } from "$lib/api.js";
   import { scale } from 'svelte/transition';
   import { backOut } from 'svelte/easing';
-  import { X, Download, Upload, Check } from 'lucide-svelte';
+  import { X, Download, Upload, Trash2, Eraser } from 'lucide-svelte';
   import { stockColors, saveStockColor } from '$lib/stockColors.js';
 
   let { onClose, stocks = [] } = $props();
 
   let colors = $derived({ ...$stockColors });
+  let appVersion = $state('');
+  import('@tauri-apps/api/app').then(m => m.getVersion()).then(v => appVersion = v).catch(() => {});
   let importStatus = $state('');
+  let resetConfirm = $state(false);
+  let resetStatus  = $state('');
+  let resetting    = $state(false);
+  let dedupStatus  = $state('');
+  let deduping     = $state(false);
 
   /** @param {string} stock @param {string} color */
   function onChange(stock, color) {
@@ -112,8 +119,45 @@
     }
   }
 
+  async function doDedup() {
+    deduping = true; dedupStatus = '';
+    try {
+      const r = await fetch(API_BASE + '/api/deduplicate', { method: 'POST' }).then(r => r.json());
+      if (r.status === 'ok') {
+        const parts = [];
+        if (r.sales_removed)       parts.push(`${r.sales_removed} sale rows removed`);
+        if (r.groups_cross_removed) parts.push(`${r.groups_cross_removed} cross-group dups`);
+        dedupStatus = parts.length ? `✓ ${parts.join(', ')}` : '✓ Nothing to clean';
+      } else {
+        dedupStatus = `✗ ${r.msg || 'error'}`;
+      }
+    } catch (e) { dedupStatus = `✗ ${String(e)}`; }
+    deduping = false;
+    setTimeout(() => dedupStatus = '', 8000);
+  }
+
+  async function doReset() {
+    resetting = true; resetStatus = '';
+    try {
+      const r = await fetch(API_BASE + '/api/reset', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: 'RESET' }),
+      }).then(r => r.json());
+      if (r.status === 'ok') {
+        resetStatus = `✓ Reset done — restart app`;
+      } else {
+        resetStatus = `✗ ${r.msg || 'error'}`;
+      }
+    } catch (e) {
+      resetStatus = `✗ ${String(e)}`;
+    }
+    resetting = false;
+    resetConfirm = false;
+    setTimeout(() => resetStatus = '', 8000);
+  }
+
   /** @param {KeyboardEvent} e */
-  function handleKey(e) { if (e.key === 'Escape') onClose?.(); }
+  function handleKey(e) { if (e.key === 'Escape') { if (resetConfirm) { resetConfirm = false; return; } onClose?.(); } }
 </script>
 
 <svelte:window onkeydown={handleKey} />
@@ -127,6 +171,7 @@
 
     <div class="header">
       <span class="title">Settings</span>
+      {#if appVersion}<span class="version">v{appVersion}</span>{/if}
       <button class="close-btn" onclick={onClose}><X size={14} strokeWidth={2} /></button>
     </div>
 
@@ -140,6 +185,38 @@
       <div class="import-status" class:ok={(exportStatus||importStatus).startsWith('✓')}>
         {exportStatus || importStatus}
       </div>
+    {/if}
+    <div class="db-row">
+      <button class="db-btn" onclick={doDedup} disabled={deduping}>
+        <Eraser size={13} strokeWidth={2} /> {deduping ? 'Cleaning…' : 'Deduplicate'}
+      </button>
+    </div>
+    {#if dedupStatus}
+      <div class="import-status" class:ok={dedupStatus.startsWith('✓')}>{dedupStatus}</div>
+    {/if}
+
+    <!-- Reset -->
+    <div class="section-label">Reset</div>
+    <div class="reset-desc">Full wipe: sales data, groups, browser sessions, image cache. Only stock colors are kept. Use to switch accounts.</div>
+    {#if !resetConfirm}
+      <div class="db-row">
+        <button class="db-btn danger" onclick={() => resetConfirm = true} disabled={resetting}>
+          <Trash2 size={13} strokeWidth={2} /> Reset account data
+        </button>
+      </div>
+    {:else}
+      <div class="reset-confirm">
+        <span class="reset-warn">This cannot be undone. Continue?</span>
+        <div class="confirm-btns-row">
+          <button class="btn-cancel-sm" onclick={() => resetConfirm = false}>Cancel</button>
+          <button class="btn-reset" onclick={doReset} disabled={resetting}>
+            {resetting ? 'Resetting…' : 'Yes, reset'}
+          </button>
+        </div>
+      </div>
+    {/if}
+    {#if resetStatus}
+      <div class="import-status" class:ok={resetStatus.startsWith('✓')}>{resetStatus}</div>
     {/if}
 
     <div class="section-label">Stock Colors</div>
@@ -178,6 +255,7 @@
     padding: 12px 16px; border-bottom: 1px solid var(--sep); flex-shrink: 0;
   }
   .title { font-size: 14px; font-weight: 700; color: var(--label); }
+  .version { font-size: 11px; color: var(--label3); margin-left: auto; margin-right: 8px; font-weight: 500; }
   .close-btn {
     background: none; border: none; color: var(--label3); cursor: pointer;
     padding: 4px; display: flex; align-items: center; border-radius: 4px;
@@ -200,6 +278,25 @@
     font-size: 11px; padding: 0 16px 8px; color: var(--label3);
   }
   .import-status.ok { color: var(--green); }
+  .db-btn.danger { color: var(--red, #ff3b30); }
+  .db-btn.danger:hover { background: rgba(255,59,48,0.12); border-color: rgba(255,59,48,0.4); color: var(--red, #ff3b30); }
+  .reset-desc { font-size: 11px; color: var(--label3); padding: 0 16px 8px; line-height: 1.45; }
+  .reset-confirm { padding: 0 16px 8px; display: flex; flex-direction: column; gap: 8px; }
+  .reset-warn { font-size: 12px; color: var(--red, #ff3b30); font-weight: 600; }
+  .confirm-btns-row { display: flex; gap: 8px; }
+  .btn-cancel-sm {
+    flex: 1; background: var(--glass); border: 1px solid var(--glass-border);
+    color: var(--label2); border-radius: var(--radius-sm); padding: 6px 10px;
+    cursor: pointer; font-size: 12px; font-family: inherit;
+  }
+  .btn-cancel-sm:hover { background: rgba(255,255,255,0.08); }
+  .btn-reset {
+    flex: 1; background: rgba(255,59,48,0.15); border: 1px solid rgba(255,59,48,0.4);
+    color: var(--red, #ff3b30); border-radius: var(--radius-sm); padding: 6px 10px;
+    cursor: pointer; font-size: 12px; font-weight: 600; font-family: inherit;
+  }
+  .btn-reset:hover { background: rgba(255,59,48,0.28); }
+  .btn-reset:disabled { opacity: .5; cursor: default; }
   .list { padding: 8px 0; overflow-y: auto; max-height: 40vh; }
   .row {
     display: flex; align-items: center; gap: 10px;
