@@ -2360,6 +2360,54 @@ def api_ms_remove_from_group():
     save_ms_library(photos)
     return jsonify({'status': 'ok'})
 
+@flask_app.route('/api/rebuild-groups', methods=['POST'])
+def api_rebuild_groups():
+    """Rebuild group structure from scratch using existing sales data.
+
+    Wipes: ms_library.json, photo_groups.json, _manual_overrides.json,
+           _cross_stock_matches.json
+    Keeps: sales.db, asset_meta (pHash + RGB), chrome_profile*, stock_colors
+
+    Then: triggers a MS+ collector run (refreshes ms_library) in background.
+    rebuild-matches will be auto-invoked at the end via _sync_all_global path
+    (but only MS+ runs here, not all stocks). The user can trigger /api/rebuild-
+    matches manually after MS+ finishes, OR we run it here at the end.
+
+    Body: { "confirm": "REBUILD" }."""
+    data = request.get_json(force=True, silent=True) or {}
+    if data.get('confirm') != 'REBUILD':
+        return jsonify({'status': 'error', 'msg': 'send {"confirm":"REBUILD"} to proceed'}), 400
+
+    # 1. Wipe group/match data files
+    for fname in ('photo_groups.json', '_manual_overrides.json',
+                  '_cross_stock_matches.json', 'ms_library.json'):
+        fp = os.path.join(RECIPES_DIR, fname)
+        if os.path.exists(fp):
+            try: os.remove(fp)
+            except Exception: pass
+
+    # 2. Trigger MS+ sync in background (re-fetches ms_library, then rebuild-matches)
+    def _run():
+        try:
+            ms_url = STOCK_URLS.get("Microstock+", "https://microstock.plus/myfiles")
+            _sync_state["running"] = True
+            _sync_state["log"] = []
+            _sync_stop_flag[0] = False
+            _collect_one_stock_global("Microstock+", ms_url)
+            # Auto-trigger rebuild-matches now that ms_library is fresh
+            try:
+                with flask_app.test_request_context():
+                    resp = api_rebuild_matches()
+                _sync_log(f"✅ Groups rebuilt: {resp.get_json()}")
+            except Exception as ex:
+                _sync_log(f"⚠️ rebuild-matches failed: {ex}")
+        finally:
+            _sync_state["running"] = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({'status': 'ok', 'msg': 'MS+ sync + rebuild started in background'})
+
+
 @flask_app.route('/api/reset-db', methods=['POST'])
 def api_reset_db():
     """Full data wipe — app returns to fresh state. KEEPS ONLY chrome_profile*

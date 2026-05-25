@@ -22,6 +22,9 @@
   let rebuildStatus = $state('');
   let rebuilding    = $state(false);
   let rebuildConfirm = $state(false);
+  let rebuildGroupsStatus = $state('');
+  let rebuildingGroups    = $state(false);
+  let rebuildGroupsConfirm = $state(false);
 
   /** @param {string} stock @param {string} color */
   function onChange(stock, color) {
@@ -209,6 +212,26 @@
     rebuildConfirm = false;
   }
 
+  async function doRebuildGroups() {
+    rebuildingGroups = true; rebuildGroupsStatus = 'Очищаю групи + MS+ → старт re-sync…';
+    try {
+      const r = await fetch(API_BASE + '/api/rebuild-groups', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: 'REBUILD' }),
+      }).then(r => r.json());
+      if (r.status === 'ok') {
+        rebuildGroupsStatus = '✓ Запущено у фоні. Слідкуй у Browser tab за прогресом';
+      } else {
+        rebuildGroupsStatus = `✗ ${r.msg || 'error'}`;
+      }
+    } catch (e) {
+      rebuildGroupsStatus = `✗ ${String(e)}`;
+    }
+    rebuildingGroups = false;
+    rebuildGroupsConfirm = false;
+    setTimeout(() => rebuildGroupsStatus = '', 8000);
+  }
+
   async function doReset() {
     resetting = true; resetStatus = '';
     try {
@@ -306,6 +329,26 @@
     {/if}
     {#if rebuildStatus && !rebuilding}
       <div class="import-status" class:ok={rebuildStatus.startsWith('✓')}>{rebuildStatus}</div>
+    {/if}
+    {#if !rebuildGroupsConfirm}
+      <div class="db-row">
+        <button class="db-btn" onclick={() => rebuildGroupsConfirm = true} disabled={rebuildingGroups}>
+          <RotateCcw size={13} strokeWidth={2} /> Rebuild groups (re-sync MS+)
+        </button>
+      </div>
+    {:else}
+      <div class="reset-confirm">
+        <span class="reset-warn">Перезібрати групи з MS+ заново? Продажі лишаються, ручні зміни груп — обнуляться.</span>
+        <div class="confirm-btns-row">
+          <button class="btn-cancel-sm" onclick={() => rebuildGroupsConfirm = false}>Cancel</button>
+          <button class="btn-reset" onclick={doRebuildGroups} disabled={rebuildingGroups}>
+            {rebuildingGroups ? 'Starting…' : 'Yes, rebuild groups'}
+          </button>
+        </div>
+      </div>
+    {/if}
+    {#if rebuildGroupsStatus}
+      <div class="import-status" class:ok={rebuildGroupsStatus.startsWith('✓')}>{rebuildGroupsStatus}</div>
     {/if}
 
     <!-- Reset -->

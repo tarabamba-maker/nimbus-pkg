@@ -338,11 +338,10 @@
     <input class="search-input" placeholder="Search group…" bind:value={search} />
     <div style="flex:1"></div>
     <button class="action-pill {rebuilding?'busy':''}" onclick={rebuild} disabled={rebuilding}>
-      <span class:spin={rebuilding}><RotateCcw size={13} strokeWidth={2} /></span>
-      {rebuilding ? 'Rebuilding…' : 'Rebuild'}
+      <span class:spin={rebuilding}><RefreshCw size={13} strokeWidth={2} /></span>
+      {rebuilding ? 'Updating…' : 'Refresh'}
     </button>
     {#if rebuildMsg}<span class="rebuild-msg">{rebuildMsg}</span>{/if}
-    <button class="action-pill" onclick={load}><RefreshCw size={13} strokeWidth={2} /> Refresh</button>
   </div>
 
   <!-- Sort tabs -->
