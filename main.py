@@ -2105,6 +2105,11 @@ def api_groups_get():
             'photos': photos,
         })
 
+    # Filter out groups with zero actual sales — when DB is wiped, ms_library still
+    # has 14k photos with group names, but if nothing was ever sold for them they
+    # shouldn't clutter the UI. Show only groups where at least one photo has sales.
+    result = [g for g in result if g.get('sales', 0) > 0]
+
     result.sort(key=lambda x: x['total'], reverse=True)
 
     # Truncate photos list for preview mode — frontend fetches the full list
