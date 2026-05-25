@@ -137,6 +137,7 @@ def _adobe_clean_thumb_url(thumb_url: str) -> str:
 
 RECIPES_DIR            = os.path.join(_BASE_DIR, "recipes")
 MATCHES_FILE           = os.path.join(RECIPES_DIR, "_cross_stock_matches.json")
+MANUAL_OVERRIDES_FILE  = os.path.join(RECIPES_DIR, "_manual_overrides.json")
 GROUPS_FILE            = os.path.join(RECIPES_DIR, "photo_groups.json")
 MS_LIBRARY_FILE        = os.path.join(RECIPES_DIR, "ms_library.json")
 PROCESSED_DATES_FILE   = os.path.join(RECIPES_DIR, "_processed_dates.json")
@@ -153,6 +154,22 @@ def _load_matches() -> dict:
 def _save_matches(m: dict):
     with open(MATCHES_FILE, "w") as f:
         json.dump(m, f, indent=2)
+
+def _load_overrides() -> dict:
+    """Manual user-edited match overrides. Structure:
+       {"linked":   {primary_id: [forced_member_ids...]},
+        "unlinked": {primary_id: [forced_removed_ids...]}}
+       Applied AFTER all auto passes; always wins over auto-matching."""
+    try:
+        with open(MANUAL_OVERRIDES_FILE) as f:
+            d = json.load(f)
+            return {"linked": d.get("linked", {}), "unlinked": d.get("unlinked", {})}
+    except Exception:
+        return {"linked": {}, "unlinked": {}}
+
+def _save_overrides(d: dict):
+    with open(MANUAL_OVERRIDES_FILE, "w") as f:
+        json.dump({"linked": d.get("linked", {}), "unlinked": d.get("unlinked", {})}, f, indent=2)
 
 STOCKS = [
     "Adobe Stock", "Shutterstock", "Getty Images", "Depositphotos",
@@ -480,7 +497,7 @@ def _adobe_api_collect_global(pw_page):
                    "price": price, "thumb_url": thumb, "date": sale_full,
                    "filename": fname_no_ext}
             if thumb:
-                load_img_async(asset_id, thumb, None, is_adobe=True)
+                load_img_async(asset_id, thumb, None, is_adobe=True, stock="Adobe Stock")
             _http_executor.submit(
                 lambda dd=rec: req_lib.post(
                     f"http://127.0.0.1:{FLASK_PORT}/update", json=dd, timeout=5))
@@ -584,7 +601,7 @@ def _adobe_api_collect_global(pw_page):
                        "stock": "Adobe Stock", "price": price,
                        "thumb_url": thumb, "date": sale_full, "filename": fname_no_ext}
                 if thumb:
-                    load_img_async(asset_id, thumb, None, is_adobe=True)
+                    load_img_async(asset_id, thumb, None, is_adobe=True, stock="Adobe Stock")
                 _http_executor.submit(
                     lambda dd=rec: req_lib.post(
                         f"http://127.0.0.1:{FLASK_PORT}/update", json=dd, timeout=5))
@@ -744,7 +761,7 @@ def _shutterstock_api_collect_global(pw_page):
                            "price": price, "thumb_url": thumb,
                            "photo_name": name, "date": date_str}
                     if thumb:
-                        load_img_async(asset_id, thumb, None)
+                        load_img_async(asset_id, thumb, None, stock="Shutterstock")
                     _http_executor.submit(
                         lambda dd=rec: req_lib.post(
                             f"http://127.0.0.1:{FLASK_PORT}/update",
@@ -885,7 +902,7 @@ def _depositphotos_collect(pw_page):
             save_to_db({"stock": "Depositphotos", "asset_id": row["asset_id"],
                         "price": row["price"], "date": row["date"],
                         "title": row["title"], "thumb_url": row["thumb"]})
-            load_img_async(row["asset_id"], row["thumb"], None, False)
+            load_img_async(row["asset_id"], row["thumb"], None, False, stock="Depositphotos")
             new_in_page  += 1
             total_saved  += 1
 
@@ -1197,7 +1214,7 @@ def _getty_api_collect_global(pw_page, force=False):
                         changed = _c.execute("SELECT changes()").fetchone()[0]
                     if changed:
                         thumb_updated += 1
-                        load_img_async(asset_id, thumb, None)
+                        load_img_async(asset_id, thumb, None, stock="iStock")
             total_pages_g = (data.get("TotalAssetCount", 0) + 49) // 50
             if page_n >= total_pages_g:
                 break
@@ -1500,6 +1517,15 @@ def _sync_all_global():
                 _sync_log(f"[{name}] ⏱ watchdog timeout ({WATCHDOG_SECONDS}s) — moving on (browser may still be open)")
         if not _sync_stop_flag[0]:
             _sync_log("✅ All stocks collected")
+            # Auto-trigger rebuild-matches: pHash for newly downloaded thumbs is
+            # now in asset_meta, ms_library was refreshed by MS+ collector.
+            try:
+                _sync_log("🔗 Auto: rebuilding cross-stock matches...")
+                with flask_app.test_request_context():
+                    resp = api_rebuild_matches()
+                _sync_log(f"✅ Matches rebuilt: {resp.get_json()}")
+            except Exception as ex:
+                _sync_log(f"⚠️ rebuild-matches failed: {ex}")
         else:
             _sync_log("⛔ Sync stopped by user")
     except Exception as ex:
@@ -2745,12 +2771,142 @@ def _ms_visual_matches(aid_to_group, strict_hamming=8, loose_hamming=12, loose_r
     return additions
 
 
+def _filename_fallback_matches(matches, lib, threshold_hamming=8, threshold_rgb=90):
+    """Pass C: filename fallback.
+    For each asset NOT yet in any cluster, look up ms_library entries with the
+    same filename basename. Candidates from ms_library.stockids are VERIFIED via
+    pHash+RGB (camera reuses filenames every ~10k photos — name alone is unreliable).
+    """
+    # Build aid → cluster_key index
+    aid_to_key = {m: k for k, members in matches.items() for m in members}
+
+    # ms_library: filename → set of candidate stockids
+    fn_to_candidates = {}
+    for photo in lib:
+        fn = (photo.get('filename') or '').strip()
+        if not fn:
+            continue
+        sids = photo.get('stockids') or {}
+        cand = {str(v) for k, v in sids.items() if k in _RELEVANT_STOCKS and v}
+        if not cand:
+            continue
+        fn_to_candidates.setdefault(fn, set()).update(cand)
+
+    # Pull asset_meta + sales.filename for unmatched assets
+    with sqlite3.connect(DB_NAME, timeout=15) as c:
+        rows = c.execute("""
+            SELECT s.stock, s.asset_id, MAX(s.filename), m.thumb_hash, m.aspect_ratio, m.r, m.g, m.b
+              FROM sales s LEFT JOIN asset_meta m
+                ON m.stock=s.stock AND m.asset_id=s.asset_id
+             WHERE s.filename IS NOT NULL AND s.filename != ''
+               AND m.thumb_hash IS NOT NULL
+             GROUP BY s.stock, s.asset_id
+        """).fetchall()
+        # Also fetch candidate meta in one query
+        cand_meta_cache = {}
+        def _meta(aid):
+            if aid in cand_meta_cache:
+                return cand_meta_cache[aid]
+            row = c.execute(
+                "SELECT stock, thumb_hash, aspect_ratio, r, g, b FROM asset_meta WHERE asset_id=?",
+                (str(aid),)).fetchone()
+            cand_meta_cache[aid] = row
+            return row
+
+        new_pairs = 0
+        for stock, aid, fn, h, ar, r, g, b in rows:
+            if aid in aid_to_key:
+                continue   # already matched
+            fn_clean = (fn or '').rsplit('.', 1)[0]   # strip extension if any
+            cands = fn_to_candidates.get(fn_clean, set())
+            if not cands:
+                continue
+            for cand_aid in cands:
+                if cand_aid == aid:
+                    continue
+                meta = _meta(cand_aid)
+                if not meta or not meta[1]:
+                    continue
+                c_stock, ch, car, cr, cg, cb = meta
+                if c_stock == stock:
+                    continue
+                if ar and car and abs(ar - car) > 0.15:
+                    continue
+                if _hamming_hex(h, ch) > threshold_hamming:
+                    continue
+                if (isinstance(r, int) and isinstance(cr, int) and
+                    isinstance(g, int) and isinstance(cg, int) and
+                    isinstance(b, int) and isinstance(cb, int) and
+                    abs(r - cr) + abs(g - cg) + abs(b - cb) > threshold_rgb):
+                    continue
+                # Verified — merge into cluster
+                ka, kb = aid_to_key.get(aid), aid_to_key.get(cand_aid)
+                if ka and kb:
+                    if ka == kb:
+                        continue
+                    matches[ka] = sorted(set(matches.get(ka, []) + matches.get(kb, [])))
+                    for m in matches.get(kb, []):
+                        aid_to_key[m] = ka
+                    matches.pop(kb, None)
+                elif ka:
+                    matches[ka] = sorted(set(matches[ka] + [cand_aid]))
+                    aid_to_key[cand_aid] = ka
+                elif kb:
+                    matches[kb] = sorted(set(matches[kb] + [aid]))
+                    aid_to_key[aid] = kb
+                else:
+                    matches[aid] = sorted([aid, cand_aid])
+                    aid_to_key[aid] = aid
+                    aid_to_key[cand_aid] = aid
+                new_pairs += 1
+                break   # one verified match per asset is enough
+    return matches, new_pairs
+
+
+def _apply_manual_overrides(matches, overrides):
+    """Pass H: force-apply user-edited link/unlink. Wins over auto-matching."""
+    if not overrides:
+        return matches, 0
+    linked   = overrides.get('linked', {}) or {}
+    unlinked = overrides.get('unlinked', {}) or {}
+    changes = 0
+    # Remove unlinked members
+    for pk, removed in unlinked.items():
+        if pk in matches:
+            before = len(matches[pk])
+            matches[pk] = [m for m in matches[pk] if m not in set(removed)]
+            changes += before - len(matches[pk])
+    # Add linked members (create cluster if absent)
+    for pk, added in linked.items():
+        if pk not in matches:
+            matches[pk] = [pk]
+        existing = set(matches[pk])
+        for a in added:
+            if a not in existing:
+                matches[pk].append(a)
+                existing.add(a)
+                changes += 1
+        matches[pk] = sorted(existing)
+    return matches, changes
+
+
 @flask_app.route('/api/rebuild-matches', methods=['POST'])
 def api_rebuild_matches():
-    """Rebuild cross-stock matches + sync ms_library groups into photo_groups.json."""
-    lib = load_ms_library()
+    """Rebuild cross-stock matches + sync ms_library groups into photo_groups.json.
 
-    # 1. Rebuild _cross_stock_matches.json
+    Pass order (approved with user):
+      0. Load manual overrides
+      A. pHash+RGB clustering (PRIMARY)
+      B. ms_library stockids (FALLBACK — adds links pHash missed)
+      C. Filename fallback (ms_library candidates verified via pHash+RGB)
+      D. Sync MS+ groups → photo_groups
+      E. Auto-propagate groups via match clusters
+      F. MS+ visual matching (img_cache_ms references)
+      G. Dedup
+      H. Apply manual overrides (always wins)
+    """
+    lib = load_ms_library()
+    overrides = _load_overrides()
     _PRIMARY_PRIORITY = ['adobestock', 'shutterstock', 'istock', 'esp', 'depositphotos']
 
     def _pick_primary(stockids):
@@ -2760,29 +2916,42 @@ def api_rebuild_matches():
                 return str(v)
         return None
 
-    matches: dict = {}
+    # ── Pass A: pHash+RGB clustering (PRIMARY) ───────────────────────────
+    matches, hash_pairs = _hash_based_matches({})
+
+    # ── Pass B: ms_library stockids (FALLBACK) ───────────────────────────
+    aid_to_key = {m: k for k, members in matches.items() for m in members}
+    ms_added_pairs = 0
     for photo in lib:
         stockids = photo.get('stockids', {})
         ids = [str(v) for k, v in stockids.items() if k in _RELEVANT_STOCKS and v]
         if len(ids) < 2:
             continue
-        primary = _pick_primary(stockids)
-        if not primary:
-            continue
-        if primary not in matches:
-            matches[primary] = ids
+        # Merge these ids into a single cluster, picking primary by priority.
+        # If any of these ids is already in a pHash cluster, merge into that.
+        existing_keys = {aid_to_key[i] for i in ids if i in aid_to_key}
+        if existing_keys:
+            target = sorted(existing_keys)[0]   # deterministic merge target
+            combined = set(matches.get(target, []))
+            for k in existing_keys - {target}:
+                combined.update(matches.pop(k, []))
+            combined.update(ids)
+            matches[target] = sorted(combined)
+            for m in matches[target]:
+                aid_to_key[m] = target
         else:
-            existing = set(matches[primary])
-            existing.update(ids)
-            matches[primary] = sorted(existing)
+            primary = _pick_primary(stockids) or ids[0]
+            matches[primary] = sorted(set(ids))
+            for m in ids:
+                aid_to_key[m] = primary
+            ms_added_pairs += len(ids) - 1
 
-    # 1b. Augment with perceptual-hash matches (catches photos not in ms_library)
-    matches, new_pairs = _hash_based_matches(matches)
+    # ── Pass C: filename fallback ────────────────────────────────────────
+    matches, fn_pairs = _filename_fallback_matches(matches, lib)
+
     _save_matches(matches)
 
-    # 2. Sync ms_library groups → photo_groups.json
-    #    Only the PRIMARY stockid per photo — siblings are resolved via ms_library
-    #    cross-stock lookup in api_groups_get, so adding them here causes duplicates.
+    # ── Pass D: sync ms_library groups → photo_groups.json ───────────────
     groups = load_groups()
     photos_synced = 0
     for photo in lib:
@@ -2802,10 +2971,7 @@ def api_rebuild_matches():
             groups[gname].append(primary)
             photos_synced += 1
 
-    # 3. Auto-propagate group membership to visually-matched siblings.
-    #    If asset X is in group "Sunset" and asset Y has identical/near thumb_hash
-    #    (via the `matches` dict augmented with hash pairs), add Y to the same group.
-    #    Skips siblings already assigned to any other group (no overwrite).
+    # ── Pass E: auto-propagate groups via match clusters ────────────────
     aid_to_group = {}
     for gname, aids in groups.items():
         for aid in aids:
@@ -2829,10 +2995,7 @@ def api_rebuild_matches():
                 aid_to_group[sib] = gname
                 auto_added += 1
 
-    # 3b. MS+ visual matching: for each ungrouped sales aid, find the closest
-    #     reference thumbnail in img_cache_ms/ and inherit its ms_library group.
-    #     Closes the gap for sales photos that don't have an iStock/Adobe ID in
-    #     ms_library.json but DO have a matching MS+ reference file.
+    # ── Pass F: MS+ visual matching against img_cache_ms/ reference ─────
     ms_added = 0
     ms_additions = _ms_visual_matches(aid_to_group)
     for gname, aids in ms_additions.items():
@@ -2841,7 +3004,7 @@ def api_rebuild_matches():
         groups[gname].extend(aids)
         ms_added += len(aids)
 
-    # 4. Dedup all group lists (remove any sibling IDs added by previous rebuild runs)
+    # ── Pass G: dedup group lists ───────────────────────────────────────
     for gname in list(groups.keys()):
         seen: set = set()
         deduped = []
@@ -2852,9 +3015,47 @@ def api_rebuild_matches():
         groups[gname] = deduped
     save_groups(groups)
 
-    return jsonify({'status': 'ok', 'entries': len(matches), 'photos': photos_synced,
-                    'groups': len(groups), 'hash_pairs': new_pairs,
-                    'auto_grouped': auto_added, 'ms_visual_grouped': ms_added})
+    # ── Pass H: apply manual overrides (always wins) ────────────────────
+    matches, override_changes = _apply_manual_overrides(matches, overrides)
+    _save_matches(matches)
+
+    return jsonify({'status': 'ok',
+                    'entries': len(matches),
+                    'photos': photos_synced,
+                    'groups': len(groups),
+                    'hash_pairs': hash_pairs,
+                    'ms_lib_pairs': ms_added_pairs,
+                    'filename_pairs': fn_pairs,
+                    'auto_grouped': auto_added,
+                    'ms_visual_grouped': ms_added,
+                    'override_changes': override_changes})
+
+
+@flask_app.route('/api/match-override', methods=['POST'])
+def api_match_override():
+    """User-triggered: persist a manual link/unlink that will survive future
+    rebuild-matches runs. Body: {action: 'link'|'unlink', primary, asset_id}."""
+    body = request.get_json(force=True, silent=True) or {}
+    action  = body.get('action')
+    primary = str(body.get('primary', '')).strip()
+    aid     = str(body.get('asset_id', '')).strip()
+    if action not in ('link', 'unlink') or not primary or not aid:
+        return jsonify({'ok': False, 'msg': 'need {action: link|unlink, primary, asset_id}'}), 400
+    ov = _load_overrides()
+    key = 'linked' if action == 'link' else 'unlinked'
+    bucket = ov.setdefault(key, {})
+    lst = set(bucket.get(primary, []))
+    lst.add(aid)
+    bucket[primary] = sorted(lst)
+    # Remove conflicting entry from the OTHER bucket (link cancels prior unlink and vice versa)
+    other_key = 'unlinked' if action == 'link' else 'linked'
+    other = ov.setdefault(other_key, {})
+    if primary in other and aid in other[primary]:
+        other[primary] = [x for x in other[primary] if x != aid]
+        if not other[primary]:
+            other.pop(primary)
+    _save_overrides(ov)
+    return jsonify({'ok': True, 'action': action, 'primary': primary, 'asset_id': aid})
 
 @flask_app.route('/api/matches', methods=['GET'])
 def api_matches_get():
@@ -3277,9 +3478,14 @@ _http_executor = _TPE(max_workers=8)
 atexit.register(lambda: (_img_executor.shutdown(wait=False), _http_executor.shutdown(wait=False)))
 
 def load_match_thumb(asset_id, thumb_url):
-    """Завантажує clean Adobe thumbnail у MATCH_CACHE_DIR, square crop 200×200."""
+    """Завантажує clean Adobe thumbnail (без watermark) у MATCH_CACHE_DIR.
+    Після збереження рахує pHash+RGB з цього CHISTOGO фото — це авторитетний відбиток
+    для крос-стокового матчингу (вотермарка хоч і слабко, але псує dHash gradient)."""
     path = os.path.join(MATCH_CACHE_DIR, f"{asset_id}.jpg")
-    if os.path.exists(path): return path
+    if os.path.exists(path):
+        # Backfill: meta could be missing if path was created in older build
+        _save_asset_meta("Adobe Stock", asset_id, path)
+        return path
     clean_url = _adobe_clean_thumb_url(thumb_url)
     if not clean_url: return None
     try:
@@ -3288,14 +3494,19 @@ def load_match_thumb(asset_id, thumb_url):
             img = Image.open(BytesIO(r.content)).convert("RGB")
             img = ImageOps.fit(img, (200, 200), Image.Resampling.LANCZOS)
             img.save(path, "JPEG", quality=85)
+            # Adobe pHash MUST come from the clean version, not the watermarked img_cache one.
+            _save_asset_meta("Adobe Stock", asset_id, path)
             return path
     except Exception:
         pass
     return None
 
-def load_img_async(asset_id, url, callback, is_adobe=False):
+def load_img_async(asset_id, url, callback, is_adobe=False, stock=None):
     def run():
-        path = load_img(asset_id, url)
+        # For Adobe, skip pHash computation here — it'll be (re)computed from the
+        # clean match thumbnail inside load_match_thumb below.
+        meta_stock = None if is_adobe else stock
+        path = load_img(asset_id, url, stock=meta_stock)
         if is_adobe and url:
             _img_executor.submit(lambda: load_match_thumb(asset_id, url))
         if path and callback: callback(path)
