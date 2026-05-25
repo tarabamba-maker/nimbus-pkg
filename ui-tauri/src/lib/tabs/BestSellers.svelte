@@ -302,7 +302,6 @@
   .automatch-msg { font-size:11px; color: var(--green); flex-shrink:0; }
 
   .filter-row { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
-  .filter-label { font-size:11px; color: var(--label3); min-width:44px; font-weight:600; text-transform:uppercase; letter-spacing:.06em; }
 
   .grid {
     flex:1; overflow-y:auto;

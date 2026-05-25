@@ -253,15 +253,12 @@
     box-shadow: var(--shadow-sm), var(--glass-shine);
   }
   .filter-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
-  .filter-label { font-size:11px; color: var(--label3); min-width:44px; font-weight:600; text-transform:uppercase; letter-spacing:.06em; }
 
   .refresh-btn { margin-left: auto; }
   .refresh-btn.busy { opacity: .45; cursor: default; }
-  .refresh-row { display:inline-flex; align-items:center; gap:5px; }
   .refresh-icon { display:inline-flex; align-items:center; }
   .refresh-icon.spin { animation:spin 1s linear infinite; }
   @keyframes spin { to { transform:rotate(360deg); } }
-  .sync-time { font-size:9px; opacity:.7; font-weight:400; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100px; display:block; }
 
   .grid {
     flex:1; overflow-y:auto;

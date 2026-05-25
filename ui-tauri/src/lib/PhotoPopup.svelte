@@ -31,8 +31,9 @@
     const url = item.thumb_url || '';
     if (url.includes('depositphotos.com'))
       return ('https:' + url).replace('/i/110/', '/i/450/');
+    // Adobe ftcdn.net: size is encoded as NNN_F_ in the path — swap to 500_F_
     if (url.includes('ftcdn.net'))
-      return url.replace(/([?&]w=)\d+/, '$1600');
+      return url.replace(/\/\d+_F_/, '/500_F_');
     return `${API_BASE}/img/cache/${item.asset_id}`;
   }
 

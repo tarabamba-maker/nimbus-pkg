@@ -1,6 +1,6 @@
 <script>
   import { API_BASE } from "$lib/api.js";
-  import { onMount, tick } from 'svelte';
+  import { onMount } from 'svelte';
   import { fly } from 'svelte/transition';
   import { cubicOut, cubicIn } from 'svelte/easing';
   import { ArrowDownToLine, Star, RefreshCw, Sun, Moon, Settings } from 'lucide-svelte';
@@ -19,15 +19,6 @@
   let tabSlider      = $state({ left: 0, width: 0 });
   let _sliderReady   = $state(false);  // true after first measurement — enables CSS transition
 
-  async function updateTabSlider() {
-    await tick();
-    if (!tabBarInner) return;
-    const btn = /** @type {HTMLElement|null} */ (tabBarInner.querySelector('.tab-btn.active'));
-    if (!btn) return;
-    tabSlider = { left: btn.offsetLeft, width: btn.offsetWidth };
-    _sliderReady = true;
-  }
-
   /** @param {number} i */
   function switchTab(i) {
     if (i === activeTab) return;
@@ -36,7 +27,23 @@
     activeTab = i;
   }
 
-  $effect(() => { activeTab; updateTabSlider(); });
+  // Read both activeTab and tabBarInner synchronously so Svelte tracks both as dependencies.
+  // Using rAF instead of tick() ensures the browser has completed layout before measuring.
+  $effect(() => {
+    activeTab;
+    const bar = tabBarInner;
+    if (!bar) return;
+    (async () => {
+      await new Promise(r => requestAnimationFrame(r));
+      const btn = /** @type {HTMLElement|null} */ (bar.querySelector('.tab-btn.active'));
+      if (!btn) return;
+      tabSlider = { left: btn.offsetLeft, width: btn.offsetWidth };
+      if (!_sliderReady) {
+        await new Promise(r => requestAnimationFrame(r));
+        _sliderReady = true;
+      }
+    })();
+  });
   let downloadsStock  = $state('All');
   let darkMode        = $state(true);
   let activeGroup     = $state(/** @type {any} */ (null)); // group open in Groups tab

@@ -3,7 +3,6 @@
 // Use Vite's compile-time PROD flag so the value is baked in correctly — runtime
 // `window` checks fail during SSR prerender and get inlined as `false` → ''.
 export const API_BASE = import.meta.env.PROD ? 'http://localhost:8000' : '';
-export const IS_TAURI = typeof window !== 'undefined' && ('__TAURI_INTERNALS__' in window || '__TAURI__' in window);
 const BASE = API_BASE;
 
 /** @param {string} path @param {Record<string,any>} [params] */
@@ -37,18 +36,4 @@ export const api = {
   saveMatches:     /** @param {any} data     */ (data)    => post('/api/matches', data),
   syncStatus:      ()                                     => get('/api/sync/status'),
   imgUrl:          /** @param {any} aid      */ (aid)     => `${BASE}/img/cache/${aid}`,
-  imgMsUrl:        /** @param {any} fname    */ (fname)   => `${BASE}/img/ms/${fname}`,
 };
-
-// SSE підписка на лог синхронізації
-/** @param {(msg:string)=>void} [onMessage] @param {()=>void} [onDone] */
-export function syncStream(onMessage, onDone) {
-  const es = new EventSource(`${BASE}/api/sync/stream`);
-  es.onmessage = (e) => {
-    const d = JSON.parse(e.data);
-    if (d.done) { es.close(); onDone?.(); }
-    else onMessage?.(d.msg);
-  };
-  es.onerror = () => { es.close(); onDone?.(); };
-  return () => es.close();
-}

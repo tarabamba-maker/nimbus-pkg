@@ -1,7 +1,6 @@
 import ssl, time, threading, sqlite3, os, re, json, base64, atexit
 from io import BytesIO
 from datetime import datetime, timedelta
-from collections import defaultdict
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
@@ -71,8 +70,6 @@ os.makedirs(MATCH_CACHE_DIR, exist_ok=True)
 os.makedirs(MS_CACHE_DIR, exist_ok=True)
 os.makedirs(ICON_CACHE_DIR, exist_ok=True)
 
-import re as _re
-
 def _adobe_clean_thumb_url(thumb_url: str) -> str:
     """
     Конвертує будь-який Adobe ftcdn.net URL у чисту 110px версію без watermark.
@@ -80,10 +77,8 @@ def _adobe_clean_thumb_url(thumb_url: str) -> str:
     """
     if not thumb_url or "ftcdn.net" not in thumb_url:
         return thumb_url
-    # замінюємо розмір (160_F_, 500_F_, 320_F_ тощо) на 110_F_
-    url = _re.sub(r'/\d+_F_', '/110_F_', thumb_url)
-    # замінюємо субдомен на as2
-    url = _re.sub(r'https?://[^/]+\.ftcdn\.net', 'https://as2.ftcdn.net', url)
+    url = re.sub(r'/\d+_F_', '/110_F_', thumb_url)
+    url = re.sub(r'https?://[^/]+\.ftcdn\.net', 'https://as2.ftcdn.net', url)
     return url
 
 RECIPES_DIR            = os.path.join(_BASE_DIR, "recipes")
@@ -1644,24 +1639,6 @@ def api_export():
         return jsonify({"error": str(e)}), 500
 
 
-@flask_app.route('/api/import', methods=['POST'])
-def api_import():
-    """Unpack uploaded ZIP (multipart form) — replaces sales.db, recipes/."""
-    if 'file' not in request.files:
-        return jsonify({'ok': False, 'msg': 'No file uploaded'}), 400
-    f = request.files['file']
-    if not f.filename.endswith('.zip'):
-        return jsonify({'ok': False, 'msg': 'Expected a .zip file'}), 400
-    tmp = tempfile.NamedTemporaryFile(suffix='.zip', delete=False).name
-    try:
-        f.save(tmp)
-        return _do_import(tmp)
-    finally:
-        if os.path.exists(tmp):
-            try: os.remove(tmp)
-            except Exception: pass
-
-
 @flask_app.route('/api/import-raw', methods=['POST'])
 def api_import_raw():
     """Unpack raw-bytes ZIP body (Content-Type: application/zip) — simpler than
@@ -2144,7 +2121,7 @@ def api_reset():
 
     # 1. Drop + recreate sales.db
     try:
-        db_path = os.path.join(BASE_DIR, 'sales.db')
+        db_path = os.path.join(_BASE_DIR, 'sales.db')
         if os.path.exists(db_path):
             os.remove(db_path)
         init_db()
@@ -2155,9 +2132,9 @@ def api_reset():
     # 2. Delete all browser profile directories
     import glob
     profile_patterns = [
-        os.path.join(BASE_DIR, 'chrome_profile*'),
-        os.path.join(BASE_DIR, '*_profile'),
-        os.path.join(BASE_DIR, '*_profile_*'),
+        os.path.join(_BASE_DIR, 'chrome_profile*'),
+        os.path.join(_BASE_DIR, '*_profile'),
+        os.path.join(_BASE_DIR, '*_profile_*'),
     ]
     for pat in profile_patterns:
         for d in glob.glob(pat):
@@ -2171,10 +2148,10 @@ def api_reset():
 
     # 3. Delete image caches
     cache_dirs = [
-        os.path.join(BASE_DIR, 'img_cache'),
-        os.path.join(BASE_DIR, 'img_cache_match'),
-        os.path.join(BASE_DIR, 'img_cache_ms'),
-        os.path.join(BASE_DIR, 'img_cache_icons'),
+        os.path.join(_BASE_DIR, 'img_cache'),
+        os.path.join(_BASE_DIR, 'img_cache_match'),
+        os.path.join(_BASE_DIR, 'img_cache_ms'),
+        os.path.join(_BASE_DIR, 'img_cache_icons'),
     ]
     for d in cache_dirs:
         if os.path.isdir(d):
@@ -2749,7 +2726,8 @@ _inspector_lock  = threading.Lock()
 _inspector_browser_ref: list = [None]
 _inspector_log_file = [None]
 
-os.makedirs("inspector_logs", exist_ok=True)
+INSPECTOR_LOG_DIR = os.path.join(_BASE_DIR, "inspector_logs")
+os.makedirs(INSPECTOR_LOG_DIR, exist_ok=True)
 
 def _inspector_log_push(msg: str):
     with _inspector_lock:
@@ -2774,7 +2752,7 @@ def _inspector_thread(stock_name: str, start_url: str):
 
     safe_name    = stock_name.replace(" ", "_")
     profile_dir  = os.path.abspath(f"chrome_profile_{safe_name}")
-    log_path     = os.path.abspath(f"inspector_logs/{safe_name}.log")
+    log_path     = os.path.join(INSPECTOR_LOG_DIR, f"{safe_name}.log")
 
     # open log file (append so old sessions are kept, separator added)
     fh = open(log_path, "a", encoding="utf-8")
