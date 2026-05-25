@@ -299,15 +299,22 @@ CORS(flask_app)
 def api_update():
     d = request.json
     if not d: return jsonify({"status": "error"}), 400
-    raw_date = d.get('date'); dt = datetime.now()
+    raw_date = d.get('date'); dt = datetime.now(); has_time = False
     if raw_date:
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z",
-                    "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d"):
+        # Preserve granularity: day-only inputs stay 10-char so is_already_saved's
+        # LENGTH(date)=10 fallback matches them on re-sync (Shutterstock/Getty).
+        # Adobe ISO timestamps keep full datetime for per-sale dedup.
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
             try:
                 dt = datetime.strptime(raw_date.split('+')[0].split('Z')[0], fmt)
-                break
+                has_time = True; break
             except Exception: pass
-    d['date']  = dt.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d"):
+                try:
+                    dt = datetime.strptime(raw_date[:10], fmt); break
+                except Exception: pass
+    d['date']  = dt.strftime("%Y-%m-%d %H:%M:%S") if has_time else dt.strftime("%Y-%m-%d")
     d['stock'] = d.get('stock', 'Adobe Stock')
     save_to_db(d)
     return jsonify({"status": "success"}), 200
