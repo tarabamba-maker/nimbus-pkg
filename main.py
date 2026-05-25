@@ -2363,19 +2363,21 @@ def api_reset_db():
     except Exception as e:
         return jsonify({'status': 'error', 'msg': f'db: {e}'}), 500
 
-    # Clear processed-dates so historical chunks rerun
-    proc_file = os.path.join(RECIPES_DIR, "_processed_dates.json")
-    if os.path.exists(proc_file):
-        try:
-            os.remove(proc_file)
-        except Exception:
-            pass
+    # Clear derived/runtime files so they rebuild fresh from new sync data.
+    # KEEP: ms_library.json (reference data), chrome_profile* (logins),
+    #       _manual_overrides.json (user link/unlink choices), stock_colors.json.
+    for fname in ("_processed_dates.json", "photo_groups.json",
+                  "_cross_stock_matches.json"):
+        fp = os.path.join(RECIPES_DIR, fname)
+        if os.path.exists(fp):
+            try: os.remove(fp)
+            except Exception: pass
 
     return jsonify({'status': 'ok',
                     'db_cleared': removed_rows,
                     'profiles_kept': True,
                     'ms_library_kept': True,
-                    'groups_kept': True})
+                    'overrides_kept': True})
 
 
 @flask_app.route('/api/reset', methods=['POST'])
