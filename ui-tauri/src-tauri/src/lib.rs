@@ -58,6 +58,10 @@ fn chrono_now() -> String {
 }
 
 fn python_has_deps(python: &str) -> bool {
+    // ⚠️ KEEP THIS LIST IN SYNC WITH main.py's top-level imports.
+    // If a module main.py needs isn't listed here, the launcher may pick a Python
+    // missing it → Flask crashes at startup with ModuleNotFoundError → empty UI
+    // with no clear error. flask_cors and requests are mandatory.
     Command::new(python)
         .args(["-c", "import flask, flask_cors, playwright, PIL, bs4, requests"])
         .stdout(Stdio::null())
@@ -153,16 +157,18 @@ fn find_python3(project_root: Option<&std::path::Path>) -> Option<String> {
 fn find_main_py() -> Option<std::path::PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
-            // Windows packaged: resources are placed in a _up_/_up_/ structure
-            // mirroring the relative path "../../main.py".
+            // ⚠️ DO NOT REMOVE THE _up_/_up_/ PATHS — they are NOT dev artifacts.
+            // tauri.conf.json declares resources as ["../../main.py", ...] (two parent
+            // traversals). Tauri 2 mirrors that depth under Resources as _up_/_up_/.
+            // Without these paths, packaged app can't find main.py → empty UI.
+            //
+            // ⚠️ DO NOT add a writability check here. Signed .app installs ARE
+            // read-only; user-writable state lives in STOCK_DATA_DIR (see data_dir()).
             #[cfg(target_os = "windows")]
             for rel in ["_up_/_up_/main.py", "_up_/main.py", "main.py"] {
                 let p = exe_dir.join(rel);
                 if p.exists() { return Some(p); }
             }
-
-            // macOS packaged: exe is in Contents/MacOS/, resources in Contents/Resources/.
-            // Tauri 2 with resource paths "../../main.py" places them under _up_/_up_/.
             #[cfg(target_os = "macos")]
             for rel in [
                 "../Resources/_up_/_up_/main.py",

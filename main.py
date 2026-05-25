@@ -58,13 +58,20 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════
 # КОНСТАНТИ
 # ═══════════════════════════════════════════════════════════
-# Data dir is passed by Tauri via STOCK_DATA_DIR — survives auto-updates.
-# Fallback to script dir for dev/standalone use.
+# ⚠️ DO NOT REVERT _BASE_DIR to os.path.dirname(__file__).
+# Tauri-packaged main.py lives INSIDE the .app bundle (.../Resources/_up_/_up_/),
+# which is replaced wholesale on every auto-update. Storing sales.db there →
+# all user data lost on update. STOCK_DATA_DIR points to a stable user-writable
+# location (~/Library/Application Support/StockAutomation on Mac).
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _BASE_DIR   = os.environ.get("STOCK_DATA_DIR", _SCRIPT_DIR)
 os.makedirs(_BASE_DIR, exist_ok=True)
 
-# Migrate from old in-bundle / dev locations on first run after update.
+# ⚠️ DO NOT DELETE THIS MIGRATION BLOCK.
+# First launch on a fresh install (after the STOCK_DATA_DIR switch) needs to
+# pull existing data from the old script-relative location and from the user's
+# dev tree on Desktop. Safe to run repeatedly — it's a no-op if new dir already
+# has sales.db.
 def _migrate_from(old_dir):
     """Copy DB + recipes + caches + chrome profiles from old location if new dir is empty."""
     if not os.path.isdir(old_dir) or os.path.abspath(old_dir) == os.path.abspath(_BASE_DIR):
