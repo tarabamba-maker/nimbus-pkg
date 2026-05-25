@@ -58,7 +58,54 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════
 # КОНСТАНТИ
 # ═══════════════════════════════════════════════════════════
-_BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
+# Data dir is passed by Tauri via STOCK_DATA_DIR — survives auto-updates.
+# Fallback to script dir for dev/standalone use.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_BASE_DIR   = os.environ.get("STOCK_DATA_DIR", _SCRIPT_DIR)
+os.makedirs(_BASE_DIR, exist_ok=True)
+
+# Migrate from old in-bundle / dev locations on first run after update.
+def _migrate_from(old_dir):
+    """Copy DB + recipes + caches + chrome profiles from old location if new dir is empty."""
+    if not os.path.isdir(old_dir) or os.path.abspath(old_dir) == os.path.abspath(_BASE_DIR):
+        return
+    new_db = os.path.join(_BASE_DIR, "sales.db")
+    old_db = os.path.join(old_dir, "sales.db")
+    if os.path.exists(new_db) or not os.path.exists(old_db):
+        return
+    import shutil as _sh
+    print(f"[migration] copying user data from {old_dir} → {_BASE_DIR}", flush=True)
+    for name in ("sales.db", "recipes", "img_cache", "img_cache_match",
+                 "img_cache_ms", "img_cache_icons", "ms_library.json"):
+        src = os.path.join(old_dir, name)
+        dst = os.path.join(_BASE_DIR, name)
+        if not os.path.exists(src) or os.path.exists(dst):
+            continue
+        try:
+            if os.path.isdir(src): _sh.copytree(src, dst)
+            else:                  _sh.copy2(src, dst)
+            print(f"[migration]   ✓ {name}", flush=True)
+        except Exception as ex:
+            print(f"[migration]   ✗ {name}: {ex}", flush=True)
+    # Profiles: copy lazily — they're heavy. Just copy the chrome_profile dirs.
+    for entry in os.listdir(old_dir):
+        if entry.endswith("_profile") or entry.startswith("chrome_profile") or entry.startswith("getty_profile"):
+            src = os.path.join(old_dir, entry)
+            dst = os.path.join(_BASE_DIR, entry)
+            if os.path.isdir(src) and not os.path.exists(dst):
+                try:
+                    _sh.copytree(src, dst)
+                    print(f"[migration]   ✓ {entry}/", flush=True)
+                except Exception as ex:
+                    print(f"[migration]   ✗ {entry}/: {ex}", flush=True)
+
+# Try common old locations
+for _cand in (
+    _SCRIPT_DIR,  # script's own dir (dev mode)
+    os.path.expanduser("~/Desktop/Stock_Automation"),  # user's dev tree
+):
+    _migrate_from(_cand)
+
 DB_NAME         = os.path.join(_BASE_DIR, "sales.db")
 CACHE_DIR       = os.path.join(_BASE_DIR, "img_cache")
 MATCH_CACHE_DIR = os.path.join(_BASE_DIR, "img_cache_match")

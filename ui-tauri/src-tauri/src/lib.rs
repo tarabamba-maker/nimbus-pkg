@@ -21,6 +21,24 @@ fn log_dir() -> std::path::PathBuf {
     }
 }
 
+// Persistent user-data directory — survives app updates. DB, recipes, image
+// caches, chrome profiles all live here. Mac: ~/Library/Application Support/
+// StockAutomation/. Windows: %APPDATA%\StockAutomation\.
+fn data_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        dirs_next::data_dir()
+            .map(|h| h.join("StockAutomation"))
+            .unwrap_or_else(|| std::path::PathBuf::from("C:\\Temp\\StockAutomation"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        dirs_next::home_dir()
+            .map(|h| h.join("Library/Application Support/StockAutomation"))
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/StockAutomation"))
+    }
+}
+
 fn log_line(msg: &str) {
     let dir = log_dir();
     let _ = std::fs::create_dir_all(&dir);
@@ -212,9 +230,15 @@ fn start_backend() {
     let stdout_log = OpenOptions::new().create(true).append(true).open(dir.join("python.log")).ok();
     let stderr_log = OpenOptions::new().create(true).append(true).open(dir.join("python.log")).ok();
 
+    // Stable data dir survives auto-updates (DB lived inside .app before — wiped on update).
+    let data = data_dir();
+    let _ = std::fs::create_dir_all(&data);
+    log_line(&format!("STOCK_DATA_DIR = {}", data.display()));
+
     let mut cmd = Command::new(&python);
     cmd.arg(&path)
-        .current_dir(path.parent().unwrap_or(std::path::Path::new(".")));
+        .current_dir(&data)
+        .env("STOCK_DATA_DIR", &data);
     if let Some(f) = stdout_log { cmd.stdout(Stdio::from(f)); }
     if let Some(f) = stderr_log { cmd.stderr(Stdio::from(f)); }
 
