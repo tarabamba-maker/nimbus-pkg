@@ -670,8 +670,25 @@ def _shutterstock_api_collect_global(pw_page):
     today = _date.today()
     total_saved = 0
 
-    recent_days = [(today - timedelta(days=i)) for i in range(30)]
-    _sync_log(f"⏩ Shutterstock: скануємо останні 30 днів...")
+    # Auto-detect first-time sync: if DB has 0 Shutterstock records, scan ALL months
+    # from 2018-01 to today (full account history). Otherwise stick to last 30 days.
+    try:
+        with sqlite3.connect(DB_NAME, timeout=15) as _c:
+            _ss_count = _c.execute("SELECT COUNT(*) FROM sales WHERE stock='Shutterstock'").fetchone()[0]
+    except Exception:
+        _ss_count = 0
+
+    if _ss_count == 0:
+        _sync_log(f"🔄 Shutterstock: БД пуста — повний історичний збір з 2018-01")
+        scan_days = []
+        d = _date(2018, 1, 1)
+        while d <= today:
+            scan_days.append(d)
+            d += timedelta(days=1)
+        recent_days = list(reversed(scan_days))  # newest first
+    else:
+        recent_days = [(today - timedelta(days=i)) for i in range(30)]
+        _sync_log(f"⏩ Shutterstock: інкрементальний збір — останні 30 днів...")
     stop_early = False
 
     _agg_cache = {}
@@ -812,6 +829,16 @@ def _depositphotos_collect(pw_page):
     page_num    = 1
     all_known_streak = 0
 
+    # First-time sync: raise page cap to 500 to pull full history.
+    try:
+        with sqlite3.connect(DB_NAME, timeout=15) as _c:
+            _dp_count = _c.execute("SELECT COUNT(*) FROM sales WHERE stock='Depositphotos'").fetchone()[0]
+    except Exception:
+        _dp_count = 0
+    PAGE_CAP = 500 if _dp_count == 0 else 30
+    if _dp_count == 0:
+        _sync_log(f"🔄 Depositphotos: БД пуста — повний історичний збір (до {PAGE_CAP} сторінок)")
+
     while not _sync_stop_flag[0]:
         url = ("/sales.html" if page_num == 1
                else f"/sales/page{page_num}.html?ajax=true")
@@ -888,8 +915,8 @@ def _depositphotos_collect(pw_page):
                 break
         else:
             all_known_streak = 0
-        if page_num >= 30:
-            _sync_log("Depositphotos: hit 30-page cap, stopping (raise if needed)")
+        if page_num >= PAGE_CAP:
+            _sync_log(f"Depositphotos: hit {PAGE_CAP}-page cap, stopping")
             break
 
         page_num += 1
@@ -1227,7 +1254,16 @@ def _run_collector_global(p, profile_dir, stock_name, start_url, headless):
     elif stock_name == "Depositphotos":
         _depositphotos_collect(pw_page)
     elif stock_name == "Getty Images":
-        _getty_api_collect_global(pw_page)
+        # Auto-force on empty DB: pulls every available TSV statement instead of
+        # waiting for the monthly-21st gate.
+        try:
+            with sqlite3.connect(DB_NAME, timeout=15) as _c:
+                _g_count = _c.execute(
+                    "SELECT COUNT(*) FROM sales WHERE stock IN ('iStock','iStockphoto','Getty Images')"
+                ).fetchone()[0]
+        except Exception:
+            _g_count = 0
+        _getty_api_collect_global(pw_page, force=(_g_count == 0))
     return browser, pw_page
 
 
