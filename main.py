@@ -1218,6 +1218,125 @@ def _getty_api_collect_global(pw_page, force=False):
     _app_log(f"[Getty] last_sync recorded: {_pd2['Getty/iStock_last_sync']}")
 
 
+def _ms_plus_collect_global(pw_page):
+    """Microstock+ → оновлює ms_library.json (stockids для крос-стокового матчингу).
+    Не зберігає продажі — це reference-source. Викликає 2 ендпоінти:
+      POST /contentdb/directories/getfulllist  → список папок
+      POST /contentdb/content/contentlist      → фото в кожній папці (paged по 250)
+    Структура збереженого запису: {filename, group, stockids: {adobestock, shutterstock, ...}}.
+    """
+    _sync_log("🚀 Microstock+: оновлюю бібліотеку stockids...")
+
+    if "microstock.plus" not in pw_page.url:
+        pw_page.goto("https://microstock.plus/myfiles",
+                     wait_until="domcontentloaded", timeout=45000)
+        time.sleep(3)
+
+    if any(x in pw_page.url.lower() for x in ["login", "signin", "auth"]):
+        _sync_log("🔒 Microstock+: потрібна авторизація")
+        return
+
+    def _fetch_json(path, body=""):
+        body_js = json.dumps(body)
+        js = f"""async () => {{
+            try {{
+                const r = await fetch("{path}", {{
+                    method: "POST",
+                    credentials: "include",
+                    headers: {{
+                        "x-requested-with": "XMLHttpRequest",
+                        "content-type": "application/x-www-form-urlencoded"
+                    }},
+                    body: {body_js}
+                }});
+                if (!r.ok) return {{error: r.status}};
+                return await r.json();
+            }} catch(e) {{ return {{error: e.toString()}}; }}
+        }}"""
+        try:
+            return pw_page.evaluate(js)
+        except Exception as ex:
+            return {"error": str(ex)}
+
+    # Step 1: get list of all directories with file counts
+    dirs_resp = _fetch_json("/contentdb/directories/getfulllist", "")
+    if "error" in dirs_resp or not dirs_resp.get("isOk"):
+        _sync_log(f"⚠️ Microstock+: getfulllist failed: {dirs_resp}")
+        return
+    dirs = [d for d in dirs_resp.get("list", []) if d.get("filestotal", 0) > 0]
+    _sync_log(f"📁 Microstock+: {len(dirs)} папок з файлами")
+
+    # Step 2: for each directory, fetch contentlist with pagination
+    AGENCIES = ["shutterstock", "esp", "adobestock", "dreamstime", "yaymicro",
+                "123rf", "depositphotos", "alamy", "pixta", "pond5", "vecteezy"]
+    agencies_param = "&".join([f"useragencyids[]={a}" for a in AGENCIES])
+
+    library = {}    # filename → record
+    total_files = 0
+
+    for dir_idx, dr in enumerate(dirs, 1):
+        if _sync_stop_flag[0]:
+            _sync_log("⛔ Microstock+: зупинено")
+            break
+        path = dr.get("path", "")
+        if not path:
+            continue
+        # urlencode the path manually (no JS quoting issues)
+        import urllib.parse as _up
+        path_enc = _up.quote(path, safe='')
+        skip = 0
+        dir_count = 0
+        while True:
+            body = (f"skip={skip}&limit=250&directory={path_enc}"
+                    f"&{agencies_param}&searchtext=&archive=0")
+            resp = _fetch_json("/contentdb/content/contentlist", body)
+            if "error" in resp or not resp.get("isOk"):
+                _sync_log(f"  ⚠️ {path} skip={skip}: {resp}")
+                break
+            items = resp.get("list", [])
+            if not items:
+                break
+            for it in items:
+                basepath = it.get("basepath", "")
+                if not basepath:
+                    continue
+                filename = basepath.split("/")[-1]   # last segment as canonical key
+                stockids = it.get("stockids") or {}
+                # Normalize: keep only non-empty values
+                stockids = {k: str(v) for k, v in stockids.items() if v}
+                if not stockids:
+                    continue
+                library[filename] = {
+                    "filename": filename,
+                    "group":    it.get("directory", "").lstrip("/"),
+                    "stockids": stockids,
+                    "basepath": basepath,
+                }
+                dir_count += 1
+            if len(items) < 250:
+                break
+            skip += 250
+            time.sleep(0.2)
+        total_files += dir_count
+        if dir_idx % 10 == 0 or dir_idx == len(dirs):
+            _sync_log(f"  📦 {dir_idx}/{len(dirs)} папок, всього {total_files} фото")
+
+    # Step 3: merge with existing ms_library.json (preserve manual edits / non-MS+ entries)
+    existing = load_ms_library()
+    existing_by_fn = {e.get("filename", ""): e for e in existing if e.get("filename")}
+    for fn, rec in library.items():
+        old = existing_by_fn.get(fn, {})
+        # Preserve manual group override if user set one different from MS+ directory
+        if old.get("group") and old["group"] != rec["group"]:
+            rec["_ms_plus_group"] = rec["group"]
+            rec["group"] = old["group"]
+        existing_by_fn[fn] = rec
+
+    merged = list(existing_by_fn.values())
+    save_ms_library(merged)
+    _sync_log(f"✅ Microstock+: {total_files} записів, ms_library.json = {len(merged)} всього")
+
+
 def _run_collector_global(p, profile_dir, stock_name, start_url, headless):
     """Відкриває браузер і запускає потрібний колектор."""
     wait_cond = "networkidle" if stock_name == "Shutterstock" else "domcontentloaded"
@@ -1264,6 +1383,8 @@ def _run_collector_global(p, profile_dir, stock_name, start_url, headless):
         except Exception:
             _g_count = 0
         _getty_api_collect_global(pw_page, force=(_g_count == 0))
+    elif stock_name == "Microstock+":
+        _ms_plus_collect_global(pw_page)
     return browser, pw_page
 
 
@@ -1358,7 +1479,7 @@ def _sync_all_global():
     _sync_state["running"] = True
     _sync_state["log"]     = []
     _sync_log("🚀 Parallel sync from all stocks...")
-    COLLECTABLE = {"Adobe Stock", "Shutterstock", "Getty Images", "Depositphotos"}
+    COLLECTABLE = {"Adobe Stock", "Shutterstock", "Getty Images", "Depositphotos", "Microstock+"}
     try:
         threads = []
         for name, url in STOCK_URLS.items():
