@@ -378,9 +378,13 @@ _LOGIN_SIGNALS = ["auth", "sign-in", "login", "signin", "ims-na1"]
 def _is_login_url(url_str):
     return any(x in url_str.lower() for x in _LOGIN_SIGNALS)
 
-def _open_browser_context(p, profile_dir, headless, off_screen=False):
+def _open_browser_context(p, profile_dir, headless, off_screen=False, channel=None):
+    """Open a Playwright persistent browser context.
+    channel='chrome' uses the system-installed Chrome instead of bundled Chromium
+    — reduces DataDome detection on Shutterstock. Falls back to chromium if
+    Chrome binary isn't found."""
     extra = ["--window-position=0,2000", "--window-size=1280,900"] if off_screen else []
-    return p.chromium.launch_persistent_context(
+    kwargs = dict(
         user_data_dir=profile_dir,
         headless=headless,
         no_viewport=True,
@@ -394,13 +398,20 @@ def _open_browser_context(p, profile_dir, headless, off_screen=False):
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-session-crashed-bubble",
-        ] + extra
+        ] + extra,
     )
+    if channel:
+        chrome_app = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        if os.path.exists(chrome_app):
+            kwargs['channel'] = channel
+    return p.chromium.launch_persistent_context(**kwargs)
 
 def _do_login_flow_global(p, profile_dir, target_url, stock_label, wait_cond):
     """Відкриває видимий браузер, чекає поки юзер залогіниться і закриє вікно."""
     _sync_log(f"🔒 {stock_label}: потрібна авторизація — відкриваю браузер...")
-    vis = _open_browser_context(p, profile_dir, headless=False)
+    # Shutterstock: use real Chrome for login too (matches collector engine)
+    channel = "chrome" if stock_label == "Shutterstock" else None
+    vis = _open_browser_context(p, profile_dir, headless=False, channel=channel)
     _apply_stealth(vis)
     vp = vis.pages[0] if vis.pages else vis.new_page()
     try:
@@ -1380,7 +1391,11 @@ def _ms_plus_collect_global(pw_page):
 def _run_collector_global(p, profile_dir, stock_name, start_url, headless):
     """Відкриває браузер і запускає потрібний колектор."""
     wait_cond = "networkidle" if stock_name == "Shutterstock" else "domcontentloaded"
-    browser = _open_browser_context(p, profile_dir, headless)
+    # Shutterstock: use real Chrome (channel='chrome') instead of bundled Chromium.
+    # DataDome blocks the Playwright Chromium build by fingerprint; system Chrome
+    # passes through normally.
+    channel = "chrome" if stock_name == "Shutterstock" else None
+    browser = _open_browser_context(p, profile_dir, headless, channel=channel)
     _apply_stealth(browser)
     pw_page = browser.pages[0] if browser.pages else browser.new_page()
     pw_page.goto(start_url, wait_until=wait_cond, timeout=60000)
@@ -2403,6 +2418,94 @@ def api_ms_remove_from_group():
             break
     save_ms_library(photos)
     return jsonify({'status': 'ok'})
+
+@flask_app.route('/api/full-reset', methods=['POST'])
+def api_full_reset():
+    """FULL wipe — like fresh install. Deletes:
+       - sales + asset_meta tables
+       - ALL files in recipes/ (incl. ms_library, photo_groups, stock_colors)
+       - ALL chrome_profile* dirs (logins!)
+       - ALL image caches
+    Nothing kept. Body: { "confirm": "RESET" }."""
+    data = request.get_json(force=True, silent=True) or {}
+    if data.get('confirm') != 'RESET':
+        return jsonify({'status': 'error', 'msg': 'send {"confirm":"RESET"} to proceed'}), 400
+
+    _sync_stop_flag[0] = True
+    _sync_state['running'] = False
+
+    # 1. Truncate DB
+    try:
+        with sqlite3.connect(DB_NAME, timeout=15) as c:
+            c.execute("DELETE FROM sales")
+            c.execute("DELETE FROM asset_meta")
+            c.commit()
+            c.execute("VACUUM")
+    except Exception as e:
+        return jsonify({'status': 'error', 'msg': f'db: {e}'}), 500
+
+    import shutil as _sh
+
+    # 2. Wipe recipes/ entirely
+    if os.path.isdir(RECIPES_DIR):
+        for entry in os.listdir(RECIPES_DIR):
+            fp = os.path.join(RECIPES_DIR, entry)
+            try:
+                if os.path.isfile(fp): os.remove(fp)
+                elif os.path.isdir(fp): _sh.rmtree(fp)
+            except Exception: pass
+
+    # 3. Wipe all chrome_profile* and *_profile dirs (LOGINS GONE)
+    profiles_removed = 0
+    for entry in os.listdir(_BASE_DIR):
+        if (entry.startswith('chrome_profile') or entry.endswith('_profile')
+                or entry.startswith('getty_profile')):
+            fp = os.path.join(_BASE_DIR, entry)
+            if os.path.isdir(fp):
+                try:
+                    _sh.rmtree(fp)
+                    profiles_removed += 1
+                except Exception: pass
+
+    # 4. Wipe image caches
+    cache_removed = 0
+    for cache_dir in (CACHE_DIR, MATCH_CACHE_DIR, MS_CACHE_DIR, ICON_CACHE_DIR):
+        if os.path.isdir(cache_dir):
+            for f in os.listdir(cache_dir):
+                fp = os.path.join(cache_dir, f)
+                if os.path.isfile(fp):
+                    try: os.remove(fp); cache_removed += 1
+                    except Exception: pass
+
+    return jsonify({'status': 'ok',
+                    'profiles_wiped': profiles_removed,
+                    'cache_files_wiped': cache_removed})
+
+
+@flask_app.route('/api/rebuild-from-db', methods=['POST'])
+def api_rebuild_from_db():
+    """Rebuild groups & matches from EXISTING DB data — no re-sync from APIs.
+    Keeps: sales, asset_meta, ms_library, chrome_profile*, stock_colors.
+    Wipes: photo_groups, _cross_stock_matches, _manual_overrides.
+    Then runs rebuild-matches synchronously.
+    Body: { "confirm": "REBUILD" }."""
+    data = request.get_json(force=True, silent=True) or {}
+    if data.get('confirm') != 'REBUILD':
+        return jsonify({'status': 'error', 'msg': 'send {"confirm":"REBUILD"} to proceed'}), 400
+
+    for fname in ('photo_groups.json', '_manual_overrides.json',
+                  '_cross_stock_matches.json'):
+        fp = os.path.join(RECIPES_DIR, fname)
+        if os.path.exists(fp):
+            try: os.remove(fp)
+            except Exception: pass
+
+    try:
+        resp = api_rebuild_matches()
+        return jsonify({'status': 'ok', 'result': resp.get_json()})
+    except Exception as e:
+        return jsonify({'status': 'error', 'msg': str(e)}), 500
+
 
 @flask_app.route('/api/rebuild-groups', methods=['POST'])
 def api_rebuild_groups():

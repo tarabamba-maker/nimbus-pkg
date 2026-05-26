@@ -16,15 +16,9 @@
   let resetting    = $state(false);
   let dedupStatus  = $state('');
   let deduping     = $state(false);
-  let dbResetStatus = $state('');
-  let dbResetting   = $state(false);
-  let dbResetConfirm = $state(false);
   let rebuildStatus = $state('');
   let rebuilding    = $state(false);
   let rebuildConfirm = $state(false);
-  let rebuildGroupsStatus = $state('');
-  let rebuildingGroups    = $state(false);
-  let rebuildGroupsConfirm = $state(false);
 
   /** @param {string} stock @param {string} color */
   function onChange(stock, color) {
@@ -145,66 +139,31 @@
     setTimeout(() => dedupStatus = '', 8000);
   }
 
-  async function doResetDb() {
-    dbResetting = true; dbResetStatus = '';
+  function _clearLocalCache() {
     try {
-      const r = await fetch(API_BASE + '/api/reset-db', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ confirm: 'RESET' }),
-      }).then(r => r.json());
-      if (r.status === 'ok') {
-        // Clear ALL frontend caches so UI doesn't show stale numbers
-        try {
-          for (const k of Object.keys(localStorage)) {
-            if (k.startsWith('sa:') || k.includes('cache') || k.includes('downloads') || k.includes('bestsellers') || k.includes('groups')) {
-              localStorage.removeItem(k);
-            }
-          }
-          sessionStorage.clear();
-        } catch {}
-        dbResetStatus = '✓ База очищена. Перезавантажую…';
-        setTimeout(() => location.reload(), 800);
-      } else {
-        dbResetStatus = `✗ ${r.msg || 'error'}`;
+      for (const k of Object.keys(localStorage)) {
+        if (k.startsWith('sa:') || k.includes('cache') || k.includes('downloads') || k.includes('bestsellers') || k.includes('groups')) {
+          localStorage.removeItem(k);
+        }
       }
-    } catch (e) {
-      dbResetStatus = `✗ ${String(e)}`;
-    }
-    dbResetting = false;
-    dbResetConfirm = false;
+      sessionStorage.clear();
+    } catch {}
   }
 
-  async function doRebuildFromScratch() {
-    rebuilding = true; rebuildStatus = 'Очищаю БД…';
+  async function doRebuildFromDb() {
+    rebuilding = true; rebuildStatus = 'Перебудовую матчі та групи…';
     try {
-      // 1. Wipe everything except logins
-      const r1 = await fetch(API_BASE + '/api/reset-db', {
+      const r = await fetch(API_BASE + '/api/rebuild-from-db', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ confirm: 'RESET' }),
+        body: JSON.stringify({ confirm: 'REBUILD' }),
       }).then(r => r.json());
-      if (r1.status !== 'ok') {
-        rebuildStatus = `✗ reset: ${r1.msg || 'error'}`;
-        rebuilding = false; rebuildConfirm = false;
-        return;
-      }
-      // Clear UI cache
-      try {
-        for (const k of Object.keys(localStorage)) {
-          if (k.startsWith('sa:') || k.includes('cache') || k.includes('downloads') || k.includes('bestsellers') || k.includes('groups')) {
-            localStorage.removeItem(k);
-          }
-        }
-        sessionStorage.clear();
-      } catch {}
-      rebuildStatus = 'Стартую повний синк (5 стоків)…';
-      // 2. Trigger full sync (auto-runs rebuild-matches at the end)
-      const r2 = await fetch(API_BASE + '/api/sync/start', { method: 'POST' }).then(r => r.json()).catch(() => ({ok: false}));
-      if (r2.ok === false && r2.msg) {
-        rebuildStatus = `✓ Очищено. Синк: ${r2.msg}`;
+      if (r.status === 'ok') {
+        _clearLocalCache();
+        rebuildStatus = '✓ Перебудовано. Перезавантажую…';
+        setTimeout(() => location.reload(), 800);
       } else {
-        rebuildStatus = '✓ Очищено + синк стартував. Перезавантажую UI…';
+        rebuildStatus = `✗ ${r.msg || 'error'}`;
       }
-      setTimeout(() => location.reload(), 1500);
     } catch (e) {
       rebuildStatus = `✗ ${String(e)}`;
     }
@@ -212,35 +171,17 @@
     rebuildConfirm = false;
   }
 
-  async function doRebuildGroups() {
-    rebuildingGroups = true; rebuildGroupsStatus = 'Очищаю групи + MS+ → старт re-sync…';
-    try {
-      const r = await fetch(API_BASE + '/api/rebuild-groups', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ confirm: 'REBUILD' }),
-      }).then(r => r.json());
-      if (r.status === 'ok') {
-        rebuildGroupsStatus = '✓ Запущено у фоні. Слідкуй у Browser tab за прогресом';
-      } else {
-        rebuildGroupsStatus = `✗ ${r.msg || 'error'}`;
-      }
-    } catch (e) {
-      rebuildGroupsStatus = `✗ ${String(e)}`;
-    }
-    rebuildingGroups = false;
-    rebuildGroupsConfirm = false;
-    setTimeout(() => rebuildGroupsStatus = '', 8000);
-  }
-
-  async function doReset() {
+  async function doFullReset() {
     resetting = true; resetStatus = '';
     try {
-      const r = await fetch(API_BASE + '/api/reset', {
+      const r = await fetch(API_BASE + '/api/full-reset', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ confirm: 'RESET' }),
       }).then(r => r.json());
       if (r.status === 'ok') {
-        resetStatus = `✓ Reset done — restart app`;
+        _clearLocalCache();
+        resetStatus = '✓ Все видалено. Перезавантажую…';
+        setTimeout(() => location.reload(), 800);
       } else {
         resetStatus = `✗ ${r.msg || 'error'}`;
       }
@@ -249,7 +190,6 @@
     }
     resetting = false;
     resetConfirm = false;
-    setTimeout(() => resetStatus = '', 8000);
   }
 
   /** @param {KeyboardEvent} e */
@@ -290,39 +230,20 @@
     {#if dedupStatus}
       <div class="import-status" class:ok={dedupStatus.startsWith('✓')}>{dedupStatus}</div>
     {/if}
-    {#if !dbResetConfirm}
-      <div class="db-row">
-        <button class="db-btn danger" onclick={() => dbResetConfirm = true} disabled={dbResetting}>
-          <Trash2 size={13} strokeWidth={2} /> Reset DB (keep logins)
-        </button>
-      </div>
-    {:else}
-      <div class="reset-confirm">
-        <span class="reset-warn">Очистити всі продажі? Логіни/групи/MS+ залишаться.</span>
-        <div class="confirm-btns-row">
-          <button class="btn-cancel-sm" onclick={() => dbResetConfirm = false}>Cancel</button>
-          <button class="btn-reset" onclick={doResetDb} disabled={dbResetting}>
-            {dbResetting ? 'Resetting…' : 'Yes, wipe DB'}
-          </button>
-        </div>
-      </div>
-    {/if}
-    {#if dbResetStatus}
-      <div class="import-status" class:ok={dbResetStatus.startsWith('✓')}>{dbResetStatus}</div>
-    {/if}
+    <!-- Two main actions: full reset OR rebuild from existing DB -->
     {#if !rebuildConfirm}
       <div class="db-row">
         <button class="db-btn" onclick={() => rebuildConfirm = true} disabled={rebuilding}>
-          <RotateCcw size={13} strokeWidth={2} /> Build database from scratch
+          <RotateCcw size={13} strokeWidth={2} /> Rebuild from DB
         </button>
       </div>
     {:else}
       <div class="reset-confirm">
-        <span class="reset-warn">Скинути ВСЕ і стартувати повний синк? Збереже тільки логіни.</span>
+        <span class="reset-warn">Перебудувати групи та матчі з існуючих даних? Продажі НЕ видаляються — тільки перематчити.</span>
         <div class="confirm-btns-row">
           <button class="btn-cancel-sm" onclick={() => rebuildConfirm = false}>Cancel</button>
-          <button class="btn-reset" onclick={doRebuildFromScratch} disabled={rebuilding}>
-            {rebuilding ? rebuildStatus : 'Yes, rebuild all'}
+          <button class="btn-reset" onclick={doRebuildFromDb} disabled={rebuilding}>
+            {rebuilding ? rebuildStatus : 'Yes, rebuild'}
           </button>
         </div>
       </div>
@@ -330,43 +251,19 @@
     {#if rebuildStatus && !rebuilding}
       <div class="import-status" class:ok={rebuildStatus.startsWith('✓')}>{rebuildStatus}</div>
     {/if}
-    {#if !rebuildGroupsConfirm}
-      <div class="db-row">
-        <button class="db-btn" onclick={() => rebuildGroupsConfirm = true} disabled={rebuildingGroups}>
-          <RotateCcw size={13} strokeWidth={2} /> Rebuild groups (re-sync MS+)
-        </button>
-      </div>
-    {:else}
-      <div class="reset-confirm">
-        <span class="reset-warn">Перезібрати групи з MS+ заново? Продажі лишаються, ручні зміни груп — обнуляться.</span>
-        <div class="confirm-btns-row">
-          <button class="btn-cancel-sm" onclick={() => rebuildGroupsConfirm = false}>Cancel</button>
-          <button class="btn-reset" onclick={doRebuildGroups} disabled={rebuildingGroups}>
-            {rebuildingGroups ? 'Starting…' : 'Yes, rebuild groups'}
-          </button>
-        </div>
-      </div>
-    {/if}
-    {#if rebuildGroupsStatus}
-      <div class="import-status" class:ok={rebuildGroupsStatus.startsWith('✓')}>{rebuildGroupsStatus}</div>
-    {/if}
-
-    <!-- Reset -->
-    <div class="section-label">Reset</div>
-    <div class="reset-desc">Full wipe: sales data, groups, browser sessions, image cache. Only stock colors are kept. Use to switch accounts.</div>
     {#if !resetConfirm}
       <div class="db-row">
         <button class="db-btn danger" onclick={() => resetConfirm = true} disabled={resetting}>
-          <Trash2 size={13} strokeWidth={2} /> Reset account data
+          <Trash2 size={13} strokeWidth={2} /> Full Reset (як свіже встановлення)
         </button>
       </div>
     {:else}
       <div class="reset-confirm">
-        <span class="reset-warn">This cannot be undone. Continue?</span>
+        <span class="reset-warn">УВАГА: видалить ВСЕ — продажі, групи, MS+, логіни в усіх стоках, кеш. Як свіже встановлення. Незворотно.</span>
         <div class="confirm-btns-row">
           <button class="btn-cancel-sm" onclick={() => resetConfirm = false}>Cancel</button>
-          <button class="btn-reset" onclick={doReset} disabled={resetting}>
-            {resetting ? 'Resetting…' : 'Yes, reset'}
+          <button class="btn-reset" onclick={doFullReset} disabled={resetting}>
+            {resetting ? 'Resetting…' : 'Yes, wipe everything'}
           </button>
         </div>
       </div>
