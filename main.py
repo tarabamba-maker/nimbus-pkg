@@ -2721,7 +2721,20 @@ def api_import_chrome_cookies():
                             'msg': f'Safari cookies not found at {safari_cookies_path}'}), 404
         try:
             all_cookies = _parse_safari_binarycookies(safari_cookies_path)
+        except PermissionError:
+            return jsonify({'status': 'error',
+                'msg': 'macOS блокує доступ до Safari cookies. '
+                       'Надай Full Disk Access застосунку:\n'
+                       '1. System Settings → Privacy & Security → Full Disk Access\n'
+                       '2. Натисни "+" і додай /Applications/Stock Automation.app\n'
+                       '3. Перезапусти Stock Automation і спробуй знову'}), 403
         except Exception as e:
+            # Errno 1 = EPERM = Operation not permitted (TCC block)
+            if 'Operation not permitted' in str(e) or 'Errno 1' in str(e):
+                return jsonify({'status': 'error',
+                    'msg': 'macOS блокує доступ до Safari cookies. '
+                           'System Settings → Privacy & Security → Full Disk Access → '
+                           'додай Stock Automation.app → перезапусти застосунок.'}), 403
             return jsonify({'status': 'error', 'msg': f'Safari parse: {e}'}), 500
 
         # Per-stock filter + inject via Playwright

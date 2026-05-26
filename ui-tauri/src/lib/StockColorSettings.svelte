@@ -185,8 +185,17 @@
         const lines = (r.per_stock || []).map(s =>
           `  ${s.stock}: ${s.imported} cookies${s.msg ? ' — '+s.msg : ''}${s.error ? ' ✗ '+s.error : ''}`).join('\n');
         cookieStatus = `✓ Total ${r.total_imported} (from ${r.source || 'auto'})\n${lines}`;
-      } else if (r.msg && r.msg.includes('Chrome зараз запущений')) {
+      } else if (r.msg && (r.msg.includes('Full Disk Access') || r.msg.includes('блокує'))) {
         cookieStatus = `✗ ${r.msg}`;
+        // Open System Settings directly to the Full Disk Access pane
+        if (confirm('Відкрити System Settings → Full Disk Access зараз?')) {
+          try {
+            const { open: tauriOpen } = await import('@tauri-apps/plugin-opener');
+            await tauriOpen('x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles');
+          } catch {
+            window.open('x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles');
+          }
+        }
       } else {
         cookieStatus = `✗ ${r.msg || 'error'}`;
       }
