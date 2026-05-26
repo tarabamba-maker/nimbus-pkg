@@ -19,6 +19,8 @@
   let rebuildStatus = $state('');
   let rebuilding    = $state(false);
   let rebuildConfirm = $state(false);
+  let cookieStatus  = $state('');
+  let importingCookies = $state(false);
 
   /** @param {string} stock @param {string} color */
   function onChange(stock, color) {
@@ -171,6 +173,30 @@
     rebuildConfirm = false;
   }
 
+  async function doImportChromeCookies() {
+    if (!confirm('Спочатку повністю ЗАКРИЙ Google Chrome (Cmd+Q).\n\nПродовжити імпорт cookies?')) return;
+    importingCookies = true; cookieStatus = 'Імпортую...';
+    try {
+      const r = await fetch(API_BASE + '/api/import-chrome-cookies', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      }).then(r => r.json());
+      if (r.status === 'ok') {
+        const lines = (r.per_stock || []).map(s =>
+          `  ${s.stock}: ${s.imported} cookies${s.msg ? ' — '+s.msg : ''}${s.error ? ' ✗ '+s.error : ''}`).join('\n');
+        cookieStatus = `✓ Total ${r.total_imported}\n${lines}`;
+      } else if (r.msg && r.msg.includes('Chrome зараз запущений')) {
+        cookieStatus = `✗ ${r.msg}`;
+      } else {
+        cookieStatus = `✗ ${r.msg || 'error'}`;
+      }
+    } catch (e) {
+      cookieStatus = `✗ ${String(e)}`;
+    }
+    importingCookies = false;
+    setTimeout(() => cookieStatus = '', 15000);
+  }
+
   async function doFullReset() {
     resetting = true; resetStatus = '';
     try {
@@ -230,6 +256,16 @@
     {#if dedupStatus}
       <div class="import-status" class:ok={dedupStatus.startsWith('✓')}>{dedupStatus}</div>
     {/if}
+    <!-- Cookie import from native Chrome (bypasses DataDome) -->
+    <div class="db-row">
+      <button class="db-btn" onclick={doImportChromeCookies} disabled={importingCookies}>
+        <Download size={13} strokeWidth={2} /> {importingCookies ? 'Importing…' : 'Import cookies from Chrome'}
+      </button>
+    </div>
+    {#if cookieStatus}
+      <div class="import-status" class:ok={cookieStatus.startsWith('✓')} style="white-space:pre-wrap;font-size:11px;line-height:1.4;">{cookieStatus}</div>
+    {/if}
+
     <!-- Two main actions: full reset OR rebuild from existing DB -->
     {#if !rebuildConfirm}
       <div class="db-row">

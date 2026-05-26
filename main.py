@@ -2468,6 +2468,108 @@ def api_ms_remove_from_group():
     save_ms_library(photos)
     return jsonify({'status': 'ok'})
 
+def _is_chrome_running():
+    """Returns True if Google Chrome is currently running (would lock cookies file)."""
+    import subprocess
+    try:
+        r = subprocess.run(['pgrep', '-f', 'Google Chrome'],
+                           capture_output=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+# Domain patterns per stock for cookie filtering when importing from native Chrome
+_STOCK_COOKIE_DOMAINS = {
+    "Adobe Stock":   ["adobe.com", "stock.adobe.com", "contributor.stock.adobe.com",
+                      "ims-na1.adobelogin.com"],
+    "Shutterstock":  ["shutterstock.com", "submit.shutterstock.com"],
+    "Getty Images":  ["gettyimages.com", "esp.gettyimages.com",
+                      "accountmanagement.gettyimages.com"],
+    "Depositphotos": ["depositphotos.com"],
+    "Microstock+":   ["microstock.plus"],
+}
+
+
+def _import_cookies_for_stock(stock_name, source_cookies_db):
+    """Copy native Chrome cookies for one stock's domains into its Playwright profile.
+    Preserves encrypted_value blob — Playwright Chrome decrypts via same macOS
+    Keychain key (same user) so auth survives."""
+    safe = stock_name.replace(" ", "_")
+    stock_profile = os.path.join(_BASE_DIR, f"chrome_profile_{safe}")
+    dest_dir = os.path.join(stock_profile, "Default")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_db = os.path.join(dest_dir, "Cookies")
+
+    domains = _STOCK_COOKIE_DOMAINS.get(stock_name, [])
+    if not domains:
+        return {'stock': stock_name, 'imported': 0, 'msg': 'no domain pattern'}
+
+    # Build LIKE clauses
+    where = " OR ".join(["host_key LIKE ?"] * len(domains))
+    params = [f"%{d}%" for d in domains]
+
+    try:
+        src = sqlite3.connect(f"file:{source_cookies_db}?mode=ro", uri=True, timeout=5)
+        rows = src.execute(
+            f"SELECT * FROM cookies WHERE {where}", params).fetchall()
+        cols = [d[0] for d in src.execute(f"SELECT * FROM cookies WHERE {where} LIMIT 0", params).description]
+        src.close()
+    except Exception as e:
+        return {'stock': stock_name, 'imported': 0, 'error': f'read source: {e}'}
+
+    if not rows:
+        return {'stock': stock_name, 'imported': 0, 'msg': 'no matching cookies in native Chrome'}
+
+    # Init dest schema by copying file if missing, or open existing
+    try:
+        if not os.path.exists(dest_db):
+            import shutil as _sh
+            _sh.copy2(source_cookies_db, dest_db)
+            # Clear all cookies in copied DB then re-insert filtered set
+            with sqlite3.connect(dest_db, timeout=10) as c:
+                c.execute("DELETE FROM cookies")
+                c.commit()
+        # Insert filtered rows
+        placeholders = ",".join(["?"] * len(cols))
+        with sqlite3.connect(dest_db, timeout=10) as c:
+            # Remove existing matching domains so we don't duplicate
+            c.execute(f"DELETE FROM cookies WHERE {where}", params)
+            c.executemany(
+                f"INSERT INTO cookies ({','.join(cols)}) VALUES ({placeholders})",
+                rows)
+            c.commit()
+    except Exception as e:
+        return {'stock': stock_name, 'imported': 0, 'error': f'write dest: {e}'}
+
+    return {'stock': stock_name, 'imported': len(rows)}
+
+
+@flask_app.route('/api/import-chrome-cookies', methods=['POST'])
+def api_import_chrome_cookies():
+    """Imports cookies from user's native Chrome → all stock profiles. Chrome
+    MUST be closed (Cookies SQLite is exclusively locked by running Chrome).
+    Body: { "stocks": ["Adobe Stock", "Shutterstock", ...] }  — optional, defaults to all."""
+    if _is_chrome_running():
+        return jsonify({'status': 'error',
+                        'msg': 'Google Chrome зараз запущений — закрий його повністю (Cmd+Q) і спробуй знову'}), 409
+
+    src = os.path.expanduser("~/Library/Application Support/Google/Chrome/Default/Cookies")
+    if not os.path.exists(src):
+        return jsonify({'status': 'error',
+                        'msg': f'Native Chrome cookies not found at {src}'}), 404
+
+    data = request.get_json(force=True, silent=True) or {}
+    stocks = data.get('stocks') or list(_STOCK_COOKIE_DOMAINS.keys())
+
+    results = []
+    for s in stocks:
+        results.append(_import_cookies_for_stock(s, src))
+
+    total = sum(r.get('imported', 0) for r in results)
+    return jsonify({'status': 'ok', 'total_imported': total, 'per_stock': results})
+
+
 @flask_app.route('/api/full-reset', methods=['POST'])
 def api_full_reset():
     """FULL wipe — like fresh install. Deletes:
