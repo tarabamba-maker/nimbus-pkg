@@ -2501,7 +2501,8 @@ def _parse_safari_binarycookies(filepath):
     for page_size in page_sizes:
         page = data[cur:cur+page_size]
         cur += page_size
-        if len(page) < 4 or struct.unpack('<I', page[:4])[0] != 0x00000100:
+        # Page magic is exactly 4 bytes 00 00 01 00 (NOT a number — endianness-agnostic byte sequence)
+        if len(page) < 4 or page[:4] != b'\x00\x00\x01\x00':
             continue
         n_cookies = struct.unpack('<I', page[4:8])[0]
         offsets = [struct.unpack('<I', page[8+i*4:12+i*4])[0] for i in range(n_cookies)]
