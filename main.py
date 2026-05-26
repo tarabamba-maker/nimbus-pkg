@@ -362,12 +362,52 @@ def _sync_log(msg: str):
 # ───────────────────────────────────────────────────────────
 
 _STEALTH_JS = """
+    // Hide webdriver flag
     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-    Object.defineProperty(navigator, 'languages', {get: () => ['uk-UA','uk','en-US','en']});
-    window.chrome = {runtime: {}};
+    // Realistic plugin shape (not just an array of numbers)
+    Object.defineProperty(navigator, 'plugins', {get: () => {
+        return [
+            {name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format'},
+            {name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: ''},
+            {name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: ''},
+            {name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: ''},
+            {name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: ''},
+        ];
+    }});
+    Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
     Object.defineProperty(navigator, 'platform', {get: () => 'MacIntel'});
     Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+    Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+    Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 0});
+    // chrome object
+    window.chrome = {
+        runtime: {},
+        loadTimes: function() {},
+        csi: function() {},
+        app: {}
+    };
+    // Permissions API spoof
+    if (navigator.permissions && navigator.permissions.query) {
+        const origQuery = navigator.permissions.query;
+        navigator.permissions.query = (p) => p.name === 'notifications'
+            ? Promise.resolve({state: Notification.permission})
+            : origQuery(p);
+    }
+    // WebGL vendor/renderer (real Mac M1/Intel values)
+    try {
+        const getParam = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(p) {
+            if (p === 37445) return 'Apple Inc.';                      // UNMASKED_VENDOR_WEBGL
+            if (p === 37446) return 'Apple M1';                        // UNMASKED_RENDERER_WEBGL
+            return getParam.call(this, p);
+        };
+    } catch (e) {}
+    // Hide CDP traces in console
+    try {
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+    } catch (e) {}
 """
 
 def _apply_stealth(ctx):
@@ -391,14 +431,17 @@ def _open_browser_context(p, profile_dir, headless, off_screen=False, channel=No
         user_agent=(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"),
+            "Chrome/130.0.0.0 Safari/537.36"),
         args=[
             "--disable-blink-features=AutomationControlled",
             "--disable-infobars",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-session-crashed-bubble",
+            "--disable-features=IsolateOrigins,site-per-process",
         ] + extra,
+        # Strip Playwright's automation flags that DataDome fingerprints on
+        ignore_default_args=["--enable-automation", "--enable-blink-features=IdleDetection"],
     )
     if channel:
         chrome_app = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -1508,7 +1551,12 @@ def _collect_one_stock_global(name, url):
                         "SELECT 1 FROM sales LIMIT 1").fetchone() is None
             except Exception:
                 pass
-            if _db_is_empty and name != "Microstock+":
+            # For empty DB: trigger login flow for ALL stocks including MS+.
+            # ms_library.json absence is the empty-state indicator for MS+.
+            _ms_empty = not os.path.exists(MS_LIBRARY_FILE)
+            _should_login = (_db_is_empty and name != "Microstock+") or \
+                            (name == "Microstock+" and _ms_empty)
+            if _should_login:
                 _sync_log(f"[{name}] 🖥️ перший запуск — видимий браузер, чекаю поки залогінишся")
                 # Force pre-login flow: opens visible browser, waits for user to close window
                 _do_login_flow_global(_p, stock_profile,
@@ -1516,6 +1564,7 @@ def _collect_one_stock_global(name, url):
                     else "https://submit.shutterstock.com/earnings" if name == "Shutterstock"
                     else "https://depositphotos.com/account/sales-history.html" if name == "Depositphotos"
                     else "https://accountmanagement.gettyimages.com/Reports/Export" if is_getty
+                    else "https://microstock.plus/myfiles" if name == "Microstock+"
                     else url,
                     name,
                     "networkidle" if name == "Shutterstock" else "domcontentloaded")
