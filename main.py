@@ -697,6 +697,169 @@ def _adobe_api_collect_global(pw_page):
     _sync_log(f"✅ Adobe (всього нових): {total_saved + hist_saved}")
 
 
+def _shutterstock_api_collect_direct():
+    """Pure-requests Shutterstock collector. NO Playwright.
+    Uses datadome trust cookie from Safari → bypasses anti-bot at full speed.
+    Returns True on success (caller skips Playwright fallback).
+
+    ⚠️ DO NOT TOUCH WITHOUT TESTING ON REAL SS ACCOUNT
+    History: SS via Playwright + page.evaluate() got DataDome-blocked because
+    browser fingerprinting + JS challenges. Direct API call with the user's
+    own session cookies (extracted from Safari binarycookies) works at 100/sec
+    without any rate limits, because the datadome cookie carries the trust
+    earned by the user's daily browsing.
+
+    Hard requirements that look removable but ARE required:
+    1. session.cookies.update(ss_cookies) — passing cookies as kwarg per-request
+       doesn't carry datadome properly across redirects.
+    2. User-Agent must look like real Safari (matches the browser that minted
+       the datadome cookie). Generic UA → 403.
+    3. x-end-app-name: contributor-web header — without it server returns HTML
+       login redirect instead of JSON.
+    4. consec_403 fallback — if datadome cookie expires mid-sync, we fall back
+       to Playwright so user can re-login and import cookies again.
+    5. The 'accts_contributor' cookie check (not just 'datadome') ensures the
+       user is actually logged in, not just has a trust token.
+    """
+    _sync_log("🚀 Shutterstock direct API: старт...")
+
+    safari_path = os.path.expanduser(
+        "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
+    if not os.path.exists(safari_path):
+        _sync_log("⚠️ Shutterstock direct: Safari cookies not found — fallback to Playwright")
+        return False
+    try:
+        all_cookies = _parse_safari_binarycookies(safari_path)
+    except PermissionError:
+        _sync_log("⚠️ Shutterstock direct: Full Disk Access не наданий — fallback")
+        return False
+    except Exception as e:
+        _sync_log(f"⚠️ Shutterstock direct: parse failed: {e} — fallback")
+        return False
+
+    ss_cookies = {c['name']: c['value'] for c in all_cookies
+                  if 'shutterstock.com' in c.get('domain', '')}
+    if 'datadome' not in ss_cookies or 'accts_contributor' not in ss_cookies:
+        _sync_log(f"⚠️ Shutterstock direct: required cookies missing "
+                  f"(have {len(ss_cookies)}) — fallback")
+        return False
+    _sync_log(f"🔑 Shutterstock direct: {len(ss_cookies)} cookies (datadome ✓)")
+
+    SS_CATEGORIES = [
+        "single_image_and_other", "25_a_day", "on_demand", "enhanced",
+        "footage_enhanced", "clip_packs", "unlimited_photo_commission",
+        "unlimited_video_commission",
+    ]
+    base_url = "https://submit.shutterstock.com"
+    session = req_lib.Session()
+    session.cookies.update(ss_cookies)
+    session.headers.update({
+        "Accept": "application/json",
+        "x-end-app-name": "contributor-web",
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                       "Version/17.5 Safari/605.1.15"),
+    })
+
+    def _get(path):
+        try:
+            r = session.get(base_url + path, timeout=15)
+            if r.status_code != 200:
+                return {"error": r.status_code}
+            return r.json()
+        except Exception as e:
+            return {"error": str(e)}
+
+    try:
+        with sqlite3.connect(DB_NAME, timeout=15) as _c:
+            _ss_count = _c.execute("SELECT COUNT(*) FROM sales WHERE stock='Shutterstock'").fetchone()[0]
+    except Exception:
+        _ss_count = 0
+
+    from datetime import date as _date
+    today = _date.today()
+
+    if _ss_count == 0:
+        scan_days = []
+        d = _date(2018, 1, 1)
+        while d <= today:
+            scan_days.append(d); d += timedelta(days=1)
+        scan_days = list(reversed(scan_days))
+        _sync_log(f"🔄 Shutterstock direct: повна історія 2018→сьогодні ({len(scan_days)} днів)")
+    else:
+        scan_days = [(today - timedelta(days=i)) for i in range(30)]
+        _sync_log(f"⏩ Shutterstock direct: інкрементальний 30 днів")
+
+    agg_cache = {}
+    def _day_cats(day):
+        ym = (day.year, day.month)
+        if ym not in agg_cache:
+            agg = _get(f"/api/next/v2/earnings/aggregate?aggregation_period=day&year={ym[0]}&month={ym[1]}")
+            agg_cache[ym] = {} if "error" in agg else \
+                {d.get("date","")[:10]: d for d in agg.get("days", [])}
+        info = agg_cache[ym].get(day.isoformat(), {})
+        return [cat for cat in SS_CATEGORIES
+                if isinstance(info.get(cat), dict) and info[cat].get("earnings", 0) > 0]
+
+    total_saved = 0
+    stop_early = False
+    consec_403 = 0
+    for scan_day in scan_days:
+        if stop_early or _sync_stop_flag[0]:
+            break
+        date_str = scan_day.isoformat()
+        active_cats = _day_cats(scan_day)
+        if not active_cats:
+            continue
+        day_new = 0; day_already = 0
+        for cat in active_cats:
+            page_n = 1
+            while True:
+                data = _get(f"/api/next/v2/earnings/media_stats/day"
+                           f"?display_column={cat}&date={date_str}&page={page_n}&per_page=100")
+                if "error" in data:
+                    if data['error'] == 403:
+                        consec_403 += 1
+                        if consec_403 >= 3:
+                            _sync_log("🛑 Shutterstock direct: 3× HTTP 403 — datadome cookie expired, fallback")
+                            return False
+                    else:
+                        _sync_log(f"  ⚠️ {date_str}/{cat} p{page_n}: {data['error']}")
+                    break
+                consec_403 = 0
+                items = data.get("media", [])
+                if not items:
+                    break
+                for item in items:
+                    asset_id = str(item.get("mediaId", ""))
+                    price    = float(item.get("total", 0))
+                    thumb    = (item.get("details") or {}).get("previewImageUrl", "")
+                    name     = (item.get("details") or {}).get("description", "") or asset_id
+                    if not asset_id or price == 0: continue
+                    if is_already_saved("Shutterstock", asset_id, price, date_str):
+                        day_already += 1; continue
+                    rec = {"asset_id": asset_id, "stock": "Shutterstock",
+                           "price": price, "thumb_url": thumb,
+                           "photo_name": name, "date": date_str}
+                    if thumb:
+                        load_img_async(asset_id, thumb, None, stock="Shutterstock")
+                    _http_executor.submit(
+                        lambda dd=rec: req_lib.post(
+                            f"http://127.0.0.1:{FLASK_PORT}/update", json=dd, timeout=5))
+                    day_new += 1; total_saved += 1
+                if page_n >= data.get("pages", 1): break
+                page_n += 1
+                time.sleep(0.1)   # gentle throttle, well below trigger
+        if day_new > 0 and total_saved % 200 < day_new:
+            _sync_log(f"  📆 {date_str}: +{day_new} (total {total_saved})")
+        if _ss_count > 0 and day_new == 0 and day_already > 0:
+            _sync_log(f"  ✅ {date_str}: caught up — stop")
+            stop_early = True
+
+    _sync_log(f"✅ Shutterstock direct API: {total_saved} нових записів")
+    return True
+
+
 def _shutterstock_api_collect_global(pw_page):
     """Збирає Shutterstock через aggregate API + media_stats/day per-photo."""
     _sync_log("🚀 Shutterstock API: старт...")
@@ -1500,6 +1663,22 @@ def _collect_one_stock_global(name, url):
     """Збирає один сток у власному sync_playwright контексті."""
     from playwright.sync_api import sync_playwright as _spw
     import shutil
+
+    # ⚠️ DO NOT REMOVE THIS FAST PATH — direct-API collectors using Safari cookies
+    # are 10-100x faster than Playwright. They bypass DataDome because the datadome
+    # trust token from the user's daily browsing carries over the request.
+    # If the fast path returns True, we MUST skip the Playwright fallback for this
+    # stock — otherwise we'd open a browser unnecessarily and risk re-triggering
+    # anti-bot detection on a clean session. Each fast-path collector internally
+    # falls back (returns False) if cookies missing/expired → Playwright kicks in.
+    if name == "Shutterstock":
+        try:
+            if _shutterstock_api_collect_direct():
+                return
+            _sync_log("[Shutterstock] direct API failed — fallback to Playwright")
+        except Exception as ex:
+            _sync_log(f"[Shutterstock] direct API exception: {ex} — fallback")
+
     is_getty   = name == "Getty Images"
     main_prof  = os.path.join(_BASE_DIR, "chrome_profile")
 
