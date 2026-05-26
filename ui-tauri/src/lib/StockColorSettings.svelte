@@ -174,7 +174,7 @@
   }
 
   async function doImportChromeCookies() {
-    if (!confirm('Спочатку повністю ЗАКРИЙ Google Chrome (Cmd+Q).\n\nПродовжити імпорт cookies?')) return;
+    if (!confirm('Імпортую cookies з твого дефолтного браузера (Safari/Chrome).\n\nВАЖЛИВО: спочатку повністю закрий цей браузер (Cmd+Q) — інакше cookies заблоковані.\n\nПродовжити?')) return;
     importingCookies = true; cookieStatus = 'Імпортую...';
     try {
       const r = await fetch(API_BASE + '/api/import-chrome-cookies', {
@@ -184,7 +184,7 @@
       if (r.status === 'ok') {
         const lines = (r.per_stock || []).map(s =>
           `  ${s.stock}: ${s.imported} cookies${s.msg ? ' — '+s.msg : ''}${s.error ? ' ✗ '+s.error : ''}`).join('\n');
-        cookieStatus = `✓ Total ${r.total_imported}\n${lines}`;
+        cookieStatus = `✓ Total ${r.total_imported} (from ${r.source || 'auto'})\n${lines}`;
       } else if (r.msg && r.msg.includes('Chrome зараз запущений')) {
         cookieStatus = `✗ ${r.msg}`;
       } else {

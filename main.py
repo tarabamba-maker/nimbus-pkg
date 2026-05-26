@@ -2479,6 +2479,101 @@ def _is_chrome_running():
         return False
 
 
+def _parse_safari_binarycookies(filepath):
+    """Parse Apple's binarycookies format. Returns list of cookie dicts."""
+    import struct
+    with open(filepath, 'rb') as f:
+        data = f.read()
+    if data[:4] != b'cook':
+        raise ValueError('Not a Safari Cookies.binarycookies file')
+
+    num_pages = struct.unpack('>I', data[4:8])[0]
+    page_sizes = []
+    off = 8
+    for _ in range(num_pages):
+        page_sizes.append(struct.unpack('>I', data[off:off+4])[0])
+        off += 4
+    # Skip checksum (uint32 BE) + footer (uint64 BE)
+    cookies = []
+    page_start = off + 4  # there's also a checksum block but offset may differ
+    # The robust way: just find each page by its magic 0x00000100 starting from off
+    cur = off
+    for page_size in page_sizes:
+        page = data[cur:cur+page_size]
+        cur += page_size
+        if len(page) < 4 or struct.unpack('<I', page[:4])[0] != 0x00000100:
+            continue
+        n_cookies = struct.unpack('<I', page[4:8])[0]
+        offsets = [struct.unpack('<I', page[8+i*4:12+i*4])[0] for i in range(n_cookies)]
+        for co in offsets:
+            try:
+                csize = struct.unpack('<I', page[co:co+4])[0]
+                cd = page[co:co+csize]
+                flags = struct.unpack('<I', cd[8:12])[0]
+                url_off  = struct.unpack('<I', cd[16:20])[0]
+                name_off = struct.unpack('<I', cd[20:24])[0]
+                path_off = struct.unpack('<I', cd[24:28])[0]
+                val_off  = struct.unpack('<I', cd[28:32])[0]
+                expiration = struct.unpack('<d', cd[40:48])[0]
+                def _rs(o):
+                    end = cd.index(b'\x00', o)
+                    return cd[o:end].decode('utf-8', errors='replace')
+                cookies.append({
+                    'domain': _rs(url_off),
+                    'name':   _rs(name_off),
+                    'value':  _rs(val_off),
+                    'path':   _rs(path_off) or '/',
+                    'expires': (expiration + 978307200) if expiration > 0 else -1,
+                    'secure':   bool(flags & 1),
+                    'httpOnly': bool(flags & 4),
+                })
+            except Exception:
+                continue
+    return cookies
+
+
+def _inject_cookies_via_playwright(stock_name, cookies):
+    """Open a brief headless Playwright context with the stock profile and
+    inject given cookies via the standard API. Cookies persist in profile."""
+    from playwright.sync_api import sync_playwright as _spw
+    safe = stock_name.replace(" ", "_")
+    stock_profile = os.path.join(_BASE_DIR, f"chrome_profile_{safe}")
+    os.makedirs(stock_profile, exist_ok=True)
+    # Normalize cookies for Playwright API
+    pw_cookies = []
+    for c in cookies:
+        d = c.get('domain', '')
+        if not d:
+            continue
+        # Playwright requires either url= or (domain= AND path=)
+        if not d.startswith('.') and '.' not in d.lstrip('.'):
+            continue
+        pw_cookies.append({
+            'name':   c.get('name', ''),
+            'value':  c.get('value', ''),
+            'domain': d,
+            'path':   c.get('path', '/') or '/',
+            'expires': float(c.get('expires', -1)),
+            'secure': bool(c.get('secure', False)),
+            'httpOnly': bool(c.get('httpOnly', False)),
+            'sameSite': c.get('sameSite', 'Lax') if c.get('sameSite') in ('Strict','Lax','None') else 'Lax',
+        })
+    if not pw_cookies:
+        return 0
+    try:
+        with _spw() as p:
+            ctx = _open_browser_context(p, stock_profile, headless=True,
+                                        channel='chrome' if stock_name == 'Shutterstock' else None)
+            try:
+                ctx.add_cookies(pw_cookies)
+            finally:
+                ctx.close()
+        return len(pw_cookies)
+    except Exception as e:
+        _app_log(f"[cookies] inject {stock_name} failed: {e}")
+        return 0
+
+
 # Domain patterns per stock for cookie filtering when importing from native Chrome
 _STOCK_COOKIE_DOMAINS = {
     "Adobe Stock":   ["adobe.com", "stock.adobe.com", "contributor.stock.adobe.com",
@@ -2545,29 +2640,113 @@ def _import_cookies_for_stock(stock_name, source_cookies_db):
     return {'stock': stock_name, 'imported': len(rows)}
 
 
+def _is_safari_running():
+    """Returns True if Safari is currently running."""
+    import subprocess
+    try:
+        r = subprocess.run(['pgrep', '-x', 'Safari'], capture_output=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _detect_default_browser():
+    """Detects macOS default browser via LaunchServices plist. Returns one of
+    'safari', 'chrome', 'edge', or None."""
+    import plistlib
+    plist_path = os.path.expanduser(
+        '~/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist')
+    if not os.path.exists(plist_path):
+        return None
+    try:
+        with open(plist_path, 'rb') as f:
+            data = plistlib.load(f)
+    except Exception:
+        return None
+    bundle = None
+    for h in data.get('LSHandlers', []):
+        if h.get('LSHandlerURLScheme') == 'http':
+            bundle = (h.get('LSHandlerRoleAll') or '').lower()
+            break
+    if not bundle:
+        return None
+    if 'safari' in bundle:        return 'safari'
+    if 'chrome' in bundle:        return 'chrome'
+    if 'edgemac' in bundle:       return 'edge'
+    if 'firefox' in bundle:       return 'firefox'
+    if 'thebrowser' in bundle:    return 'arc'
+    return None
+
+
 @flask_app.route('/api/import-chrome-cookies', methods=['POST'])
 def api_import_chrome_cookies():
-    """Imports cookies from user's native Chrome → all stock profiles. Chrome
-    MUST be closed (Cookies SQLite is exclusively locked by running Chrome).
-    Body: { "stocks": ["Adobe Stock", "Shutterstock", ...] }  — optional, defaults to all."""
-    if _is_chrome_running():
-        return jsonify({'status': 'error',
-                        'msg': 'Google Chrome зараз запущений — закрий його повністю (Cmd+Q) і спробуй знову'}), 409
-
-    src = os.path.expanduser("~/Library/Application Support/Google/Chrome/Default/Cookies")
-    if not os.path.exists(src):
-        return jsonify({'status': 'error',
-                        'msg': f'Native Chrome cookies not found at {src}'}), 404
-
+    """Imports cookies from user's native browser → all stock profiles.
+    Auto-detects source: prefers 'source' in body, else tries Safari (most users)
+    then Chrome. Source browser must be CLOSED.
+    Body: { "source": "safari"|"chrome", "stocks": ["Adobe Stock", ...] }."""
     data = request.get_json(force=True, silent=True) or {}
+    requested = (data.get('source') or '').lower()
     stocks = data.get('stocks') or list(_STOCK_COOKIE_DOMAINS.keys())
 
+    safari_cookies_path = os.path.expanduser(
+        "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
+    chrome_cookies_path = os.path.expanduser(
+        "~/Library/Application Support/Google/Chrome/Default/Cookies")
+
+    # Decide which source to use
+    if requested in ('safari', 'chrome'):
+        source = requested
+    else:
+        # Auto-detect: prefer macOS default browser, fallback to whatever exists
+        detected = _detect_default_browser()
+        if detected == 'safari' and os.path.exists(safari_cookies_path):
+            source = 'safari'
+        elif detected == 'chrome' and os.path.exists(chrome_cookies_path):
+            source = 'chrome'
+        elif detected in (None, 'edge', 'firefox', 'arc') and os.path.exists(safari_cookies_path):
+            # Unsupported default → try Safari first since most macOS users have it
+            source = 'safari'
+        elif os.path.exists(chrome_cookies_path):
+            source = 'chrome'
+        else:
+            return jsonify({'status': 'error',
+                            'msg': f'Default browser ({detected or "unknown"}) not supported. Only Safari/Chrome.'}), 404
+
+    if source == 'safari':
+        if _is_safari_running():
+            return jsonify({'status': 'error',
+                            'msg': 'Safari запущений — закрий повністю (Cmd+Q) і спробуй знову'}), 409
+        if not os.path.exists(safari_cookies_path):
+            return jsonify({'status': 'error',
+                            'msg': f'Safari cookies not found at {safari_cookies_path}'}), 404
+        try:
+            all_cookies = _parse_safari_binarycookies(safari_cookies_path)
+        except Exception as e:
+            return jsonify({'status': 'error', 'msg': f'Safari parse: {e}'}), 500
+
+        # Per-stock filter + inject via Playwright
+        results = []
+        for stock in stocks:
+            patterns = _STOCK_COOKIE_DOMAINS.get(stock, [])
+            filt = [c for c in all_cookies
+                    if any(p in c.get('domain', '') for p in patterns)]
+            n = _inject_cookies_via_playwright(stock, filt)
+            results.append({'stock': stock, 'imported': n,
+                           'msg': f'matched {len(filt)} from Safari'})
+        total = sum(r.get('imported', 0) for r in results)
+        return jsonify({'status': 'ok', 'source': 'safari',
+                        'total_imported': total, 'per_stock': results})
+
+    # source == 'chrome'
+    if _is_chrome_running():
+        return jsonify({'status': 'error',
+                        'msg': 'Google Chrome запущений — закрий повністю (Cmd+Q) і спробуй знову'}), 409
     results = []
     for s in stocks:
-        results.append(_import_cookies_for_stock(s, src))
-
+        results.append(_import_cookies_for_stock(s, chrome_cookies_path))
     total = sum(r.get('imported', 0) for r in results)
-    return jsonify({'status': 'ok', 'total_imported': total, 'per_stock': results})
+    return jsonify({'status': 'ok', 'source': 'chrome',
+                    'total_imported': total, 'per_stock': results})
 
 
 @flask_app.route('/api/full-reset', methods=['POST'])
