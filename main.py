@@ -4,6 +4,16 @@ from datetime import datetime, timedelta
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
+# Raise file descriptor limit — 5 parallel collectors + thread pools + Playwright
+# + Flask sockets + SQLite easily exceed macOS default soft limit of 256, causing
+# "OSError: [Errno 24] Too many open files" mid-sync. 4096 is plenty.
+try:
+    import resource as _res
+    _soft, _hard = _res.getrlimit(_res.RLIMIT_NOFILE)
+    _res.setrlimit(_res.RLIMIT_NOFILE, (min(_hard, 4096), _hard))
+except Exception:
+    pass
+
 # ── Логування у файл + термінал ──────────────────────────────
 _LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.log")
 _log_file_handle = open(_LOG_FILE, "a", encoding="utf-8", errors="replace", buffering=1)
