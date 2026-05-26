@@ -704,17 +704,31 @@ def _shutterstock_api_collect_global(pw_page):
     except Exception:
         _ss_count = 0
 
+    import random as _rnd
     if _ss_count == 0:
-        _sync_log(f"🔄 Shutterstock: БД пуста — повний історичний збір з 2018-01")
+        # Full history: 2018→today with HUMAN-LIKE pacing to avoid DataDome trip.
+        # Randomized pauses + occasional long breaks mimic actual user browsing.
+        # Estimated runtime ~4-8 hours for 7 years — perfect for overnight run.
+        _sync_log(f"🔄 Shutterstock: БД пуста — обережний збір повної історії з 2018 (рандомні паузи)")
         scan_days = []
         d = _date(2018, 1, 1)
         while d <= today:
             scan_days.append(d)
             d += timedelta(days=1)
-        recent_days = list(reversed(scan_days))  # newest first
+        recent_days = list(reversed(scan_days))
+        PAGE_SLEEP_RANGE  = (2.5, 5.5)      # between paginated category pages
+        DAY_SLEEP_RANGE   = (3.5, 9.0)      # between days
+        HEAVY_PAUSE_EVERY = 25              # every N days
+        HEAVY_PAUSE_RANGE = (45, 120)       # 45-120 sec break
+        SLOW_MODE = True
     else:
         recent_days = [(today - timedelta(days=i)) for i in range(30)]
         _sync_log(f"⏩ Shutterstock: інкрементальний збір — останні 30 днів...")
+        PAGE_SLEEP_RANGE  = (0.3, 0.8)
+        DAY_SLEEP_RANGE   = (0.0, 0.3)
+        HEAVY_PAUSE_EVERY = 9999
+        HEAVY_PAUSE_RANGE = (0, 0)
+        SLOW_MODE = False
     stop_early = False
 
     _agg_cache = {}
@@ -781,7 +795,7 @@ def _shutterstock_api_collect_global(pw_page):
                 if page_n >= data.get("pages", 1):
                     break
                 page_n += 1
-                time.sleep(0.3)
+                time.sleep(PAGE_SLEEP)
 
         if day_new > 0:
             _sync_log(f"  📆 {date_str}: +{day_new} нових")
@@ -1470,9 +1484,30 @@ def _collect_one_stock_global(name, url):
         with _spw() as _p:
             with _headless_lock:
                 headless = _headless_mode
+            # First-time/rebuild mode: force visible browser + login wait for ALL stocks.
+            # User just wiped DB → likely needs to verify logins everywhere.
+            _db_is_empty = False
+            try:
+                with sqlite3.connect(DB_NAME, timeout=15) as _c:
+                    _db_is_empty = _c.execute(
+                        "SELECT 1 FROM sales LIMIT 1").fetchone() is None
+            except Exception:
+                pass
+            if _db_is_empty and name != "Microstock+":
+                _sync_log(f"[{name}] 🖥️ перший запуск — видимий браузер, чекаю поки залогінишся")
+                # Force pre-login flow: opens visible browser, waits for user to close window
+                _do_login_flow_global(_p, stock_profile,
+                    "https://contributor.stock.adobe.com/en/insights/sales-earnings" if name == "Adobe Stock"
+                    else "https://submit.shutterstock.com/earnings" if name == "Shutterstock"
+                    else "https://depositphotos.com/account/sales-history.html" if name == "Depositphotos"
+                    else "https://accountmanagement.gettyimages.com/Reports/Export" if is_getty
+                    else url,
+                    name,
+                    "networkidle" if name == "Shutterstock" else "domcontentloaded")
+                headless = True  # after login confirmed, run actual sync headless
             # Getty: видимий тільки якщо сесія протухла (нема ccw cookie у профілі).
             # Якщо cookie валідна — синк у фоні (headless).
-            if is_getty:
+            if is_getty and not _db_is_empty:
                 cookies_db = os.path.join(stock_profile, "Default", "Cookies")
                 has_ccw = False
                 try:
