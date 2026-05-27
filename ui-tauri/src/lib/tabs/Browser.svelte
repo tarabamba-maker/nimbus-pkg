@@ -3,13 +3,15 @@
   import { onMount } from 'svelte';
   import { RefreshCw, StopCircle, Monitor, EyeOff, Search, X } from 'lucide-svelte';
   import { stockColors } from '$lib/stockColors.js';
-  import { notifySyncDone } from '$lib/stores/appState.js';
+  import { notifySyncDone, syncLog, syncRunning, syncProgress,
+           startSyncStream, stopSyncStream, clearSyncLog } from '$lib/stores/appState.js';
 
   let { onSyncDone } = $props();
 
-  let syncStatus = $state({ running: false, progress: '' });
-  let logs       = $state(/** @type {string[]} */ ([]));
-  let es         = $state(/** @type {EventSource|null} */ (null));
+  // Global sync state (persists across tab switches)
+  let logs       = $derived($syncLog);
+  let running    = $derived($syncRunning);
+  let progress   = $derived($syncProgress);
   let headless   = $state(true);
 
   // Inspector state
@@ -18,43 +20,29 @@
   let inspectorLogs    = $state(/** @type {string[]} */ ([]));
   let inspectorEs      = $state(/** @type {EventSource|null} */ (null));
 
-  const INSPECTOR_STOCKS = ['Depositphotos', 'Pond5', 'Envato'];
+  const INSPECTOR_STOCKS = ['Depositphotos', 'Pond5'];
 
   const STOCKS = ['Adobe Stock', 'Shutterstock', 'Getty Images', 'Depositphotos'];
   const STOCK_COLORS = $derived($stockColors);
 
-  async function checkStatus() {
-    try { syncStatus = await fetch(API_BASE + '/api/sync/status').then(r => r.json()); } catch {}
-  }
-
   /** @param {string|null} [stockName] */
   async function startStream(stockName = null) {
-    if (es) { es.close(); es = null; }
-    logs = [];
+    stopSyncStream();
+    clearSyncLog();
     const body = stockName ? JSON.stringify({ stock: stockName }) : undefined;
     const headers = stockName ? { 'Content-Type': 'application/json' } : undefined;
     const r = await fetch(API_BASE + '/api/sync/start', { method: 'POST', headers, body })
       .then(r => r.json()).catch(() => ({}));
-    if (r.ok === false) { logs = [r.msg || 'Already running']; return; }
-    const source = new EventSource(API_BASE + '/api/sync/stream');
-    es = source;
-    source.onmessage = (e) => {
-      const d = JSON.parse(e.data);
-      if (d.done) {
-        source.close(); es = null;
-        checkStatus(); onSyncDone?.();
-        notifySyncDone();  // broadcast to all tabs
-      } else {
-        logs = [...logs.slice(-199), d.msg];
-      }
-    };
-    source.onerror = () => { source.close(); es = null; checkStatus(); };
+    if (r.ok === false) {
+      syncLog.set([r.msg || 'Already running']);
+      return;
+    }
+    startSyncStream();  // global SSE — keeps streaming across tab switches
   }
 
   async function stopSync() {
-    if (es) { es.close(); es = null; }
+    stopSyncStream();
     await fetch(API_BASE + '/api/sync/stop', { method: 'POST' }).catch(() => {});
-    checkStatus();
   }
 
   /** @param {boolean} val */
@@ -92,9 +80,9 @@
   }
 
   onMount(() => {
-    checkStatus();
+    // Don't manage sync EventSource here — it lives in appState (global).
+    // Only clean up the inspector stream (which is local to this tab).
     return () => {
-      if (es) { es.close(); es = null; }
       if (inspectorEs) { inspectorEs.close(); inspectorEs = null; }
     };
   });
@@ -110,7 +98,7 @@
       <button class="ht-btn {!headless?'active':''}" onclick={() => toggleHeadless(false)}><Monitor size={12} strokeWidth={1.8} /> Visible</button>
     </div>
     <div class="btns">
-      {#if syncStatus.running || es}
+      {#if running}
         <button class="pill danger" onclick={stopSync}><StopCircle size={13} strokeWidth={1.8} /> Stop</button>
       {:else}
         <button class="action-pill" onclick={() => startStream()}><RefreshCw size={13} strokeWidth={1.8} /> Sync All</button>
@@ -124,7 +112,7 @@
       <button
         class="stock-btn"
         style="border-color:{STOCK_COLORS[s]}"
-        disabled={!!(syncStatus.running || es)}
+        disabled={running}
         onclick={() => startStream(s)}>
         <span class="stock-dot" style="background:{STOCK_COLORS[s]}"></span>
         {s}
@@ -132,19 +120,13 @@
     {/each}
   </div>
 
-  <!-- Status card -->
-  <div class="status-card card">
-    <div class="status-row">
-      <span class="status-dot {syncStatus.running || es ? 'running' : 'idle'}"></span>
-      <span class="status-text">{syncStatus.running || es ? 'Syncing…' : 'Ready'}</span>
-    </div>
-    {#if syncStatus.progress}
-      <div class="progress dim">{syncStatus.progress}</div>
-    {/if}
-  </div>
-
-  <!-- Log -->
+  <!-- Combined status + log (single panel, always reads global state) -->
   <div class="log-box card scroll-y">
+    <div class="log-header">
+      <span class="status-dot {running ? 'running' : 'idle'}"></span>
+      <span class="status-text">{running ? 'Syncing…' : 'Ready'}</span>
+      {#if progress}<span class="progress-inline dim">{progress}</span>{/if}
+    </div>
     {#each logs as line, i (i)}
       <div class="log-line {i === logs.length-1 ? 'last' : ''}">{line}</div>
     {/each}
@@ -245,6 +227,17 @@
     flex:1; overflow-y:auto; font-family:monospace; font-size:11px; padding:12px 14px;
     background: var(--glass); backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);
     border: 1px solid var(--glass-border); border-radius: var(--radius);
+  }
+  .log-header {
+    display:flex; align-items:center; gap:8px;
+    padding-bottom:8px; margin-bottom:8px;
+    border-bottom: 1px solid var(--sep);
+    font-family: -apple-system, sans-serif; font-size:12px;
+  }
+  .progress-inline {
+    flex:1; font-size:11px;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    font-family: monospace;
   }
   .log-line { color: var(--label3); line-height:1.7; }
   .log-line.last { color: var(--label); }

@@ -11,6 +11,7 @@
     matches, saveMatches, loadPhotoGroups, syncTick,
     toggleGroupMember, createGroup,
     groupsList, loadGroups, reloadGroups,
+    startSyncStream, clearSyncLog,
   } from '$lib/stores/appState.js';
   import { linkMatches } from '$lib/utils/matching.js';
 
@@ -27,6 +28,9 @@
   let rebuilding   = $state(false);
   let rebuildMsg   = $state('');
   let _rebuildTimer = /** @type {ReturnType<typeof setTimeout>|null} */ (null);
+  let matching     = $state(false);
+  let matchingInCard = $state(/** @type {string|null} */ (null));
+  let refreshingIstock = $state(false);
 
   // In-modal match mode
   let modalMatchPending = $state(/** @type {any} */ (null));
@@ -96,19 +100,82 @@
     }
   }
 
-  async function rebuild() {
-    if (_rebuildTimer) { clearTimeout(_rebuildTimer); _rebuildTimer = null; }
-    rebuilding = true; rebuildMsg = '';
+  // ⚠️ DO NOT REMOVE — group similarity merge per user spec 2026-05-27.
+  // Merges variant groups of same shoot: "23-02-01 woman street" + " cropped"
+  // + " p1/p2" + "(N)" → all collapsed into the shortest name. Recolor stays.
+  async function matchSimilar() {
+    if (matching) return;
+    matching = true;
     try {
-      const resp = await fetch(API_BASE + '/api/rebuild-matches', { method: 'POST' });
-      if (!resp.ok) { rebuildMsg = `Error ${resp.status}`; rebuilding = false; return; }
+      const resp = await fetch(API_BASE + '/api/groups/match-similar', { method: 'POST' });
       const r = await resp.json();
-      rebuildMsg = `✅ ${r.entries ?? 0} links · ${r.groups ?? 0} groups`;
+      rebuildMsg = `🔗 Merged ${r.merged_count || 0} group variants`;
       await load({ force: true });
       onGroupsChange?.();
     } catch (e) { rebuildMsg = `❌ ${e}`; }
+    matching = false;
+    setTimeout(() => rebuildMsg = '', 5000);
+  }
+
+  // ⚠️ DO NOT REMOVE — per-group pHash matching. Finds visually similar sales
+  // photos NOT in any group and adds them to this group. Used inside group cards.
+  /** @param {string} name */
+  async function matchWithinGroup(name) {
+    if (matchingInCard) return;
+    matchingInCard = name;
+    try {
+      const resp = await fetch(API_BASE + '/api/groups/match-within', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name })
+      });
+      const r = await resp.json();
+      rebuildMsg = `🔗 [${name}] +${r.added || 0} photos via pHash`;
+      await load({ force: true });
+      onGroupsChange?.();
+    } catch (e) { rebuildMsg = `❌ ${e}`; }
+    matchingInCard = null;
+    setTimeout(() => rebuildMsg = '', 5000);
+  }
+
+  // Re-fetches Getty ThumbnailUrl for iStock photos missing pHash
+  // (signed Getty URLs expire — without fresh thumbs we can't visually match iStock sales).
+  // After download triggers rebuild-matches automatically.
+  async function refreshIstockThumbs() {
+    if (refreshingIstock) return;
+    refreshingIstock = true;
+    rebuildMsg = 'iStock thumbs refresh…';
+    try {
+      const resp = await fetch(API_BASE + '/api/refresh-istock-thumbs', { method: 'POST' });
+      const r = await resp.json();
+      if (!resp.ok) { rebuildMsg = `❌ ${r.msg || resp.status}`; refreshingIstock = false; return; }
+      rebuildMsg = `🚀 ${r.msg || 'Запущено у фоні'} — слідкуй у Browser tab`;
+      clearSyncLog();
+      startSyncStream();
+    } catch (e) { rebuildMsg = `❌ ${e}`; }
+    refreshingIstock = false;
+    setTimeout(() => rebuildMsg = '', 8000);
+  }
+
+  async function rebuild() {
+    if (_rebuildTimer) { clearTimeout(_rebuildTimer); _rebuildTimer = null; }
+    if (!confirm('Повний rebuild: скине групи + список MS+ + усі MS+ thumbnails, заново зчитає з MS+, перематчить ВСІ продажі в групи через візуальний матчинг.\n\nЗайме 5-15 хв. Продовжити?')) return;
+    rebuilding = true; rebuildMsg = 'Rebuild groups…';
+    try {
+      const resp = await fetch(API_BASE + '/api/rebuild-groups', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: 'REBUILD' })
+      });
+      if (!resp.ok) { rebuildMsg = `Error ${resp.status}`; rebuilding = false; return; }
+      const r = await resp.json();
+      rebuildMsg = `🚀 ${r.msg || 'Запущено у фоні'} — слідкуй у Browser tab`;
+      // Open global SSE stream so log is visible in Browser tab when user switches there
+      clearSyncLog();
+      startSyncStream();
+      onGroupsChange?.();
+    } catch (e) { rebuildMsg = `❌ ${e}`; }
     rebuilding = false;
-    _rebuildTimer = setTimeout(() => rebuildMsg = '', 4000);
+    _rebuildTimer = setTimeout(() => rebuildMsg = '', 8000);
   }
 
   let filtered = $derived((() => {
@@ -338,8 +405,8 @@
     <input class="search-input" placeholder="Search group…" bind:value={search} />
     <div style="flex:1"></div>
     <button class="action-pill {rebuilding?'busy':''}" onclick={rebuild} disabled={rebuilding}>
-      <span class:spin={rebuilding}><RefreshCw size={13} strokeWidth={2} /></span>
-      {rebuilding ? 'Updating…' : 'Refresh'}
+      <span class:spin={rebuilding}><RotateCcw size={13} strokeWidth={2} /></span>
+      {rebuilding ? 'Rebuilding…' : 'Rebuild'}
     </button>
     {#if rebuildMsg}<span class="rebuild-msg">{rebuildMsg}</span>{/if}
   </div>
@@ -400,6 +467,10 @@
           </div>
           <!-- Card actions (visible on hover) -->
           <div class="card-actions">
+            <button class="card-act" title="Match more photos via pHash" disabled={matchingInCard === g.name}
+                    onclick={(e) => { e.stopPropagation(); matchWithinGroup(g.name); }}>
+              <Link size={11} strokeWidth={2} />
+            </button>
             <button class="card-act" title="Rename" onclick={(e) => { e.stopPropagation(); renaming = g.name; renameVal = g.name; }}>
               <Pencil size={11} strokeWidth={2} />
             </button>

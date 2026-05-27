@@ -8,7 +8,8 @@
   import FilterPills from '$lib/components/FilterPills.svelte';
   import { stockColors } from '$lib/stockColors.js';
   import { get } from 'svelte/store';
-  import { photoGroups, stockList, loadStockList, notifySyncDone, syncTick, currentPeriod, appReady, downloadsCache } from '$lib/stores/appState.js';
+  import { photoGroups, stockList, loadStockList, notifySyncDone, syncTick, currentPeriod, appReady, downloadsCache,
+           startSyncStream, stopSyncStream, clearSyncLog, syncRunning, syncProgress } from '$lib/stores/appState.js';
 
   let { onRefresh, onStockChange } = $props();
 

@@ -11,7 +11,7 @@
   import StockColorSettings from '$lib/StockColorSettings.svelte';
   import UpdateBanner from '$lib/components/UpdateBanner.svelte';
   import { stockColors, loadStockColors, STOCK_ABBR } from '$lib/stockColors.js';
-  import { loadPhotoGroups, loadStockList, loadMatches, currentPeriod, appReady } from '$lib/stores/appState.js';
+  import { loadPhotoGroups, loadStockList, loadMatches, currentPeriod, appReady, resumeSyncIfRunning, startSyncPoller } from '$lib/stores/appState.js';
 
   let activeTab      = $state(0);
   let tabDir         = $state(1);
@@ -176,6 +176,10 @@
       loadStockList(),
       loadMatches(),
     ]);
+    // Resume sync log stream if a sync was already running (survives UI reload)
+    resumeSyncIfRunning();
+    // Auto-detect syncs started elsewhere (e.g. via curl or rebuild-groups)
+    startSyncPoller();
   });
 </script>
 

@@ -99,6 +99,85 @@ export function notifySyncDone() {
   syncTick.update(n => n + 1);
 }
 
+// ── Global sync log — persists across tab switches.
+//    Populated by a SINGLE app-level EventSource (in +page.svelte) so the
+//    log keeps streaming regardless of which tab is open. Tabs subscribe
+//    via $syncLog / $syncRunning to display state.
+export const syncLog = writable(/** @type {string[]} */ ([]));
+export const syncRunning = writable(false);
+export const syncProgress = writable('');  // latest line shown in status pills
+
+let _syncEs = /** @type {EventSource|null} */ (null);
+
+/** Open SSE connection to /api/sync/stream and pump messages into stores.
+ *  Idempotent — does nothing if connection already open. */
+export function startSyncStream() {
+  if (_syncEs) return;
+  syncRunning.set(true);
+  try {
+    _syncEs = new EventSource(API_BASE + '/api/sync/stream');
+    _syncEs.onmessage = (e) => {
+      try {
+        const d = JSON.parse(e.data);
+        if (d.done) {
+          stopSyncStream();
+          notifySyncDone();
+        } else if (d.msg) {
+          syncLog.update(arr => [...arr.slice(-499), d.msg]);
+          syncProgress.set(d.msg);
+        }
+      } catch {}
+    };
+    _syncEs.onerror = () => stopSyncStream();
+  } catch (e) {
+    console.error('[appState] startSyncStream failed', e);
+    syncRunning.set(false);
+  }
+}
+
+export function stopSyncStream() {
+  if (_syncEs) { try { _syncEs.close(); } catch {} _syncEs = null; }
+  syncRunning.set(false);
+}
+
+export function clearSyncLog() {
+  syncLog.set([]);
+  syncProgress.set('');
+}
+
+/** Poll /api/sync/status on app startup — if a sync is already running
+ *  (e.g. user reloaded app mid-sync), open the SSE stream to resume. */
+export async function resumeSyncIfRunning() {
+  try {
+    const s = await fetch(API_BASE + '/api/sync/status').then(r => r.json());
+    if (s?.running) {
+      // Pre-fill log from current state
+      if (Array.isArray(s.log)) syncLog.set(s.log.slice(-500));
+      if (s.progress) syncProgress.set(s.progress);
+      startSyncStream();
+    }
+  } catch {}
+}
+
+/** Background poller — checks every 3s if a sync started elsewhere (e.g. via
+ *  /api/rebuild-groups triggered from Groups tab) and auto-opens the SSE
+ *  stream so the log shows up in Browser tab without manual intervention. */
+let _pollTimer = /** @type {any} */ (null);
+export function startSyncPoller() {
+  if (_pollTimer) return;
+  _pollTimer = setInterval(async () => {
+    if (_syncEs) return;  // stream already open
+    try {
+      const s = await fetch(API_BASE + '/api/sync/status').then(r => r.json());
+      if (s?.running) {
+        if (Array.isArray(s.log)) syncLog.set(s.log.slice(-500));
+        if (s.progress) syncProgress.set(s.progress);
+        startSyncStream();
+      }
+    } catch {}
+  }, 3000);
+}
+
 // ── Currently selected time period — shared by all tabs and stat boxes.
 //    Top stat boxes drive this; Downloads/BestSellers read it and reload data.
 //    Values: 'All-time' | 'Today' | 'Week' | 'Month' | 'Year'

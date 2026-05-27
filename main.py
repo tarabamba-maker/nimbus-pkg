@@ -4,13 +4,20 @@ from datetime import datetime, timedelta
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
-# Raise file descriptor limit — 5 parallel collectors + thread pools + Playwright
-# + Flask sockets + SQLite easily exceed macOS default soft limit of 256, causing
-# "OSError: [Errno 24] Too many open files" mid-sync. 4096 is plenty.
+# Raise file descriptor limit. macOS default soft limit is 256, hard is
+# "unlimited" but actually capped at OPEN_MAX (typically 10240 or higher).
+# With 5 parallel direct-API collectors each holding HTTPS connection pool +
+# SQLite connections + img_executor threads, 4096 wasn't enough → "Too many
+# open files" mid-sync killed Getty's DB writes. Try 65536, fall back stepwise.
 try:
     import resource as _res
-    _soft, _hard = _res.getrlimit(_res.RLIMIT_NOFILE)
-    _res.setrlimit(_res.RLIMIT_NOFILE, (min(_hard, 4096), _hard))
+    _, _hard = _res.getrlimit(_res.RLIMIT_NOFILE)
+    for _target in (65536, 32768, 16384, 8192, 4096):
+        try:
+            _res.setrlimit(_res.RLIMIT_NOFILE, (_target, _hard if _hard >= _target else _target))
+            break
+        except Exception:
+            continue
 except Exception:
     pass
 
@@ -481,6 +488,341 @@ def _do_login_flow_global(p, profile_dir, target_url, stock_label, wait_cond):
         try: vis.close()
         except Exception: pass
     _sync_log(f"✅ {stock_label}: браузер закрито, продовжую збір...")
+
+
+def _adobe_collect_direct():
+    """Adobe Stock via direct requests + Safari cookies. NO Playwright.
+    Calls contributor.stock.adobe.com/en/insights/sales-earnings with Adobe
+    session cookies extracted from Safari. Returns True on success.
+
+    ⚠️ DO NOT TOUCH — works at 100x speed. Headers `accept: application/json` +
+    `x-requested-with: XMLHttpRequest` are mandatory (without them server
+    returns HTML login page, not JSON)."""
+    _sync_log("🚀 Adobe direct: старт...")
+
+    safari_path = os.path.expanduser(
+        "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
+    if not os.path.exists(safari_path):
+        _sync_log("⚠️ Adobe direct: Safari cookies missing — fallback")
+        return False
+    try:
+        all_cookies = _parse_safari_binarycookies(safari_path)
+    except Exception as e:
+        _sync_log(f"⚠️ Adobe direct: parse failed: {e} — fallback")
+        return False
+
+    adobe_cookies = {c['name']: c['value'] for c in all_cookies
+                     if 'adobe.com' in c.get('domain', '').lower()
+                     or 'adobelogin.com' in c.get('domain', '').lower()}
+    if 'RDC' not in adobe_cookies and 'ftauth_token' not in adobe_cookies and 'IMS' not in str(adobe_cookies):
+        _sync_log(f"⚠️ Adobe direct: no session cookie (have {len(adobe_cookies)}) — fallback")
+        return False
+    _sync_log(f"🔑 Adobe direct: {len(adobe_cookies)} cookies")
+
+    base = "https://contributor.stock.adobe.com"
+    session = req_lib.Session()
+    session.cookies.update(adobe_cookies)
+    session.headers.update({
+        "Accept": "application/json",
+        "x-requested-with": "XMLHttpRequest",
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                       "Version/17.5 Safari/605.1.15"),
+    })
+
+    def _get_page(path):
+        try:
+            r = session.get(base + path, timeout=20)
+            if r.status_code != 200:
+                return {"error": r.status_code}
+            try:
+                return r.json()
+            except Exception:
+                txt = r.text[:200]
+                if any(x in txt.lower() for x in ['sign-in', 'login', 'ims-na1', 'adobelogin']):
+                    return {"error": "not_json", "preview": txt, "needs_login": True}
+                return {"error": "not_json", "preview": txt}
+        except Exception as e:
+            return {"error": str(e)}
+
+    # Pass 1: recent sales (pages 1..N, no date filter)
+    total_saved = 0
+    page1 = _get_page(f"/en/insights/sales-earnings?limit=1000&page=1&pv={int(time.time()*1000)}")
+    if "error" in page1:
+        if page1.get('needs_login'):
+            _sync_log("⚠️ Adobe direct: сесія expired в Safari — fallback to Playwright")
+        else:
+            _sync_log(f"⚠️ Adobe direct: page 1 error {page1.get('error')} — fallback")
+        return False
+    pagination = page1.get("view", {}).get("pagination", {})
+    total_pages = pagination.get("pages", 1)
+    total_items = pagination.get("total", 0)
+    _sync_log(f"   → recent: {total_pages} стор., {total_items} записів")
+
+    for pg in range(1, total_pages + 1):
+        if _sync_stop_flag[0]: return True
+        data = page1 if pg == 1 else _get_page(
+            f"/en/insights/sales-earnings?limit=1000&page={pg}&pv={int(time.time()*1000)}")
+        if "error" in data:
+            _sync_log(f"  ⚠️ page={pg}: {data['error']}")
+            continue
+        history = data.get("sales", {}).get("history", [])
+        page_old = 0
+        for item in history:
+            asset_id = str(item.get("id", ""))
+            price    = float(item.get("commissionAmount", 0))
+            thumb    = item.get("thumbnailUrl", "")
+            sale_full = item.get("saleDate", "")
+            if not asset_id or not sale_full[:10]: continue
+            if is_already_saved("Adobe Stock", asset_id, price, sale_full):
+                page_old += 1
+                if pg == 1 and page_old >= 100:
+                    _sync_log("⏹ Adobe direct: 100 saved on p1 — stop early"); break
+                continue
+            photo_name = item.get("title") or item.get("originalName") or asset_id
+            orig = item.get("originalName") or ""
+            fname = orig.rsplit(".", 1)[0] if orig and "." in orig else orig
+            rec = {"asset_id": asset_id, "photo_name": photo_name, "stock": "Adobe Stock",
+                   "price": price, "thumb_url": thumb, "date": sale_full, "filename": fname}
+            if thumb:
+                load_img_async(asset_id, thumb, None, is_adobe=True, stock="Adobe Stock")
+            _http_executor.submit(
+                lambda dd=rec: req_lib.post(
+                    f"http://127.0.0.1:{FLASK_PORT}/update", json=dd, timeout=5))
+            total_saved += 1
+        if pg < total_pages:
+            time.sleep(0.1)
+
+    _sync_log(f"✅ Adobe direct recent: +{total_saved}")
+
+    # Pass 2: historical 90-day chunks back 10 years
+    proc_file = os.path.join(RECIPES_DIR, "_processed_dates.json")
+    try:
+        with open(proc_file) as f:
+            all_proc = json.load(f)
+    except Exception:
+        all_proc = {}
+    adobe_done = set(all_proc.get("Adobe Stock", []))
+
+    def _months_in_range(start, end):
+        months = set()
+        d = start.replace(day=1)
+        while d <= end:
+            months.add(d.strftime("%Y-%m"))
+            d = d.replace(month=d.month % 12 + 1) if d.month < 12 else d.replace(year=d.year+1, month=1)
+        return months
+
+    now = datetime.now()
+    chunk_end = now - timedelta(days=1)
+    cutoff    = now - timedelta(days=365 * 10)
+    hist_saved = 0
+    while chunk_end > cutoff:
+        if _sync_stop_flag[0]: break
+        chunk_start = max(chunk_end - timedelta(days=89), cutoff)
+        months = _months_in_range(chunk_start, chunk_end)
+        if months.issubset(adobe_done):
+            chunk_end = chunk_start - timedelta(days=1); continue
+        s_str = chunk_start.strftime("%Y-%m-%d")
+        e_str = chunk_end.strftime("%Y-%m-%d")
+        _sync_log(f"📅 Adobe direct: {s_str} → {e_str}")
+
+        ts = int(time.time() * 1000)
+        d0 = _get_page(f"/en/insights/sales-earnings"
+                      f"?end_date={e_str}&start_date={s_str}"
+                      f"&time_range=day&timestamp={ts}&pv={ts}&limit=1000&page=1")
+        if "error" in d0:
+            _sync_log(f"  ⚠️ {d0['error']} — skip chunk")
+            chunk_end = chunk_start - timedelta(days=1); continue
+
+        range_pages = d0.get("view", {}).get("pagination", {}).get("pages", 1)
+        range_total = d0.get("view", {}).get("pagination", {}).get("total", 0)
+        _sync_log(f"   → {range_total} records, {range_pages} pages")
+
+        chunk_new = 0
+        for pg in range(1, range_pages + 1):
+            if _sync_stop_flag[0]: break
+            ts = int(time.time() * 1000)
+            d = d0 if pg == 1 else _get_page(
+                f"/en/insights/sales-earnings"
+                f"?end_date={e_str}&start_date={s_str}"
+                f"&time_range=day&timestamp={ts}&pv={ts}&limit=1000&page={pg}")
+            if "error" in d:
+                _sync_log(f"  ⚠️ page={pg}: {d['error']}"); continue
+            for item in d.get("sales", {}).get("history", []):
+                asset_id = str(item.get("id", ""))
+                price    = float(item.get("commissionAmount", 0))
+                thumb    = item.get("thumbnailUrl", "")
+                sale_full = item.get("saleDate", "")
+                if not asset_id or not sale_full[:10]: continue
+                if is_already_saved("Adobe Stock", asset_id, price, sale_full): continue
+                photo_name = item.get("title") or item.get("originalName") or asset_id
+                orig = item.get("originalName") or ""
+                fname = orig.rsplit(".", 1)[0] if orig and "." in orig else orig
+                rec = {"asset_id": asset_id, "photo_name": photo_name, "stock": "Adobe Stock",
+                       "price": price, "thumb_url": thumb, "date": sale_full, "filename": fname}
+                if thumb:
+                    load_img_async(asset_id, thumb, None, is_adobe=True, stock="Adobe Stock")
+                _http_executor.submit(
+                    lambda dd=rec: req_lib.post(
+                        f"http://127.0.0.1:{FLASK_PORT}/update", json=dd, timeout=5))
+                chunk_new += 1; hist_saved += 1
+            if pg < range_pages: time.sleep(0.1)
+
+        if chunk_new > 0:
+            _sync_log(f"   ✚ {chunk_new} new")
+        adobe_done.update(months)
+        all_proc["Adobe Stock"] = sorted(adobe_done)
+        try:
+            with open(proc_file, "w") as f: json.dump(all_proc, f, indent=2)
+        except Exception: pass
+        chunk_end = chunk_start - timedelta(days=1)
+        time.sleep(0.2)
+
+    _sync_log(f"✅ Adobe direct ВСЬОГО: {total_saved + hist_saved}")
+    return True
+
+
+def _depositphotos_collect_direct():
+    """Depositphotos via direct requests + Safari cookies + HTML scrape.
+    NO Playwright. Returns True on success.
+
+    ⚠️ DO NOT TOUCH — depositphotos.com responds to HTML/AJAX requests with
+    user's session cookies, no anti-bot challenge. /sales.html (page 1) +
+    /sales/pageN.html?ajax=true (later pages)."""
+    _sync_log("🚀 Depositphotos direct: старт...")
+    from bs4 import BeautifulSoup
+
+    safari_path = os.path.expanduser(
+        "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
+    if not os.path.exists(safari_path):
+        _sync_log("⚠️ Deposit direct: Safari cookies missing — fallback")
+        return False
+    try:
+        all_cookies = _parse_safari_binarycookies(safari_path)
+    except Exception as e:
+        _sync_log(f"⚠️ Deposit direct: parse failed: {e} — fallback")
+        return False
+
+    dp_cookies = {c['name']: c['value'] for c in all_cookies
+                  if 'depositphotos.com' in c.get('domain', '').lower()}
+    if not dp_cookies or 'ART' not in dp_cookies:
+        _sync_log(f"⚠️ Deposit direct: no ART cookie (have {len(dp_cookies)}) — fallback")
+        return False
+    _sync_log(f"🔑 Deposit direct: {len(dp_cookies)} cookies")
+
+    base = "https://depositphotos.com"
+    session = req_lib.Session()
+    session.cookies.update(dp_cookies)
+    session.headers.update({
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                       "Version/17.5 Safari/605.1.15"),
+        "Accept": "text/html, */*; q=0.01",
+        "x-requested-with": "XMLHttpRequest",
+    })
+
+    # Determine page cap
+    try:
+        with sqlite3.connect(DB_NAME, timeout=15) as _c:
+            _dp_count = _c.execute("SELECT COUNT(*) FROM sales WHERE stock='Depositphotos'").fetchone()[0]
+    except Exception:
+        _dp_count = 0
+    PAGE_CAP = 500 if _dp_count == 0 else 30
+
+    # Date parsers from existing HTML scrape
+    import re as _re
+    MONTH_MAP = {"Jan":"01","Feb":"02","Mar":"03","Apr":"04","May":"05","Jun":"06",
+                 "Jul":"07","Aug":"08","Sep":"09","Oct":"10","Nov":"11","Dec":"12"}
+    def _pdate(s):
+        m = _re.match(r"(\w+)\.(\d+),\s*(\d+)", s.strip())
+        if not m: return None
+        return f"{m.group(3)}-{MONTH_MAP.get(m.group(1),'00')}-{m.group(2).zfill(2)}"
+    def _pprice(s):
+        try: return float(s.strip().lstrip("$"))
+        except: return 0.0
+
+    def _extract_rows(html):
+        if "%%%%" in html:
+            html = html.split("%%%%")[-1]
+        soup = BeautifulSoup(html, "html.parser")
+        rows = []
+        for tr in soup.select("table tr"):
+            tds = tr.find_all("td")
+            if len(tds) < 9:
+                continue
+            img = tds[0].find("img")
+            link = tds[1].find("a")
+            if not link: continue
+            href = link.get("href", "")
+            # href can be "/565981674" or "/565981674/title" — match either
+            m = _re.search(r"/(\d+)(?:/|$)", href)
+            if not m: continue
+            asset_id = m.group(1)
+            title    = link.get_text(strip=True)
+            date     = _pdate(tds[3].get_text(strip=True))
+            price    = _pprice(tds[8].get_text(strip=True))
+            if not date: continue
+            rows.append({"asset_id": asset_id, "title": title,
+                         "date": date, "price": price,
+                         "thumb": img.get("src", "") if img else ""})
+        return rows
+
+    total_saved = 0
+    page_num = 1
+    streak = 0
+    last_known = ''
+    try:
+        with sqlite3.connect(DB_NAME, timeout=15) as _c:
+            r = _c.execute("SELECT MAX(date) FROM sales WHERE stock='Depositphotos'").fetchone()
+            last_known = (r[0] or '')[:10] if r else ''
+    except Exception: pass
+
+    while not _sync_stop_flag[0] and page_num <= PAGE_CAP:
+        url = "/sales.html" if page_num == 1 else f"/sales/page{page_num}.html?ajax=true"
+        try:
+            r = session.get(base + url, timeout=30)
+            if r.status_code != 200:
+                _sync_log(f"  ⚠️ Deposit p{page_num}: HTTP {r.status_code}")
+                if r.status_code == 403:
+                    _sync_log("🛑 Deposit direct: 403 — fallback")
+                    return False
+                break
+            html = r.text
+        except Exception as e:
+            _sync_log(f"  ⚠️ Deposit p{page_num}: {e}")
+            break
+
+        rows = _extract_rows(html)
+        if not rows:
+            _sync_log(f"  ✓ Deposit p{page_num}: empty — done")
+            break
+
+        new_in_page = 0
+        page_max = ''
+        for row in rows:
+            if row["date"] > page_max: page_max = row["date"]
+            if is_already_saved("Depositphotos", row["asset_id"], row["price"], row["date"]):
+                continue
+            save_to_db({"stock": "Depositphotos", "asset_id": row["asset_id"],
+                        "price": row["price"], "date": row["date"],
+                        "title": row["title"], "thumb_url": row["thumb"]})
+            if row["thumb"]:
+                load_img_async(row["asset_id"], row["thumb"], None, False, stock="Depositphotos")
+            new_in_page += 1; total_saved += 1
+
+        _sync_log(f"  📄 Deposit p{page_num}: +{new_in_page} new (max date {page_max})")
+        if new_in_page == 0:
+            streak += 1
+            if streak >= 2 or (last_known and page_max and page_max <= last_known):
+                _sync_log("  ✓ Deposit: caught up — stopping")
+                break
+        else:
+            streak = 0
+        page_num += 1
+        time.sleep(0.3)
+
+    _sync_log(f"✅ Deposit direct: +{total_saved}")
+    return True
 
 
 def _adobe_api_collect_global(pw_page):
@@ -1191,6 +1533,249 @@ def _depositphotos_collect(pw_page):
     _sync_log(f"✅ Depositphotos: {total_saved} new records saved")
 
 
+def _getty_collect_direct():
+    """Getty/iStock via direct requests + Safari cookies.
+    NO Playwright. NO login dance for accountmanagement.
+    Reads ccw + accountmanagement cookies from Safari, fetches CSRF token from
+    /Reports/Export HTML, then POSTs to /Reports/Export per month period
+    to download TSV statements. Returns True on success."""
+    _sync_log("🚀 Getty direct: старт...")
+
+    safari_path = os.path.expanduser(
+        "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
+    if not os.path.exists(safari_path):
+        _sync_log("⚠️ Getty direct: Safari cookies missing — fallback")
+        return False
+    try:
+        all_cookies = _parse_safari_binarycookies(safari_path)
+    except Exception as e:
+        _sync_log(f"⚠️ Getty direct: parse failed: {e} — fallback")
+        return False
+
+    g_cookies = {c['name']: c['value'] for c in all_cookies
+                 if 'gettyimages' in c.get('domain', '').lower()}
+    if 'ccw' not in g_cookies:
+        _sync_log("⚠️ Getty direct: no ccw cookie — login потрібен у Safari, fallback")
+        return False
+
+    import urllib.parse as _up
+    session = req_lib.Session()
+    session.cookies.update(g_cookies)
+    session.headers.update({
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                       "Version/17.5 Safari/605.1.15"),
+    })
+
+    # Step 1: GET /Reports/Export → CSRF + verify auth
+    am_base = "https://accountmanagement.gettyimages.com"
+    try:
+        r = session.get(f"{am_base}/Reports/Export", timeout=20, allow_redirects=False)
+    except Exception as e:
+        _sync_log(f"⚠️ Getty direct: connect failed: {e} — fallback")
+        return False
+    if r.status_code != 200:
+        _sync_log(f"⚠️ Getty direct: accountmanagement not logged in (HTTP {r.status_code}). "
+                  f"Залогінься в Safari на https://accountmanagement.gettyimages.com → fallback")
+        return False
+    csrf_match = re.search(r'name="__RequestVerificationToken"[^>]+value="([^"]+)"', r.text)
+    if not csrf_match:
+        _sync_log("⚠️ Getty direct: CSRF token not found in HTML — fallback")
+        return False
+    csrf = csrf_match.group(1)
+    # Contract ID lives in HTML too; extract or use stored
+    cid_match = re.search(r'(?:contractId|data-contract[\w-]*)["\s=:]+["\']?(\d+:True)', r.text)
+    contract_id = cid_match.group(1) if cid_match else "8368474:True"
+    _sync_log(f"🔑 Getty direct: CSRF + contract={contract_id}")
+
+    # Step 2: list available periods
+    session.headers["Accept"] = "application/json"
+    try:
+        ar = session.get(f"{am_base}/Reports/AvailableStatementPeriod", timeout=20)
+        avail = ar.json()
+    except Exception as e:
+        _sync_log(f"⚠️ Getty direct: AvailableStatementPeriod failed: {e} — fallback")
+        return False
+    raw_periods = (avail.get("Options") or {}).get("AvailableStatementPeriods", [])
+    periods = []
+    for p_obj in raw_periods:
+        val = p_obj.get("Value", "")
+        if len(val) >= 7:
+            periods.append((val[:4], val[5:7]))
+    _sync_log(f"📋 Getty direct: {len(periods)} statements available")
+
+    # Step 3: parse + import TSV per period
+    import csv as _csv, io as _io
+    total_saved = total_skipped = 0
+    MONTH_MAP = {"jan":"01","feb":"02","mar":"03","apr":"04","may":"05","jun":"06",
+                 "jul":"07","aug":"08","sep":"09","oct":"10","nov":"11","dec":"12"}
+    def _parse_d(s):
+        parts = s.strip().split("-")
+        if len(parts) == 3:
+            d, m, y = parts
+            return f"{y}-{MONTH_MAP.get(m.lower(),'01')}-{d.zfill(2)} 00:00:00"
+        return s
+
+    session.headers["Content-Type"] = "application/x-www-form-urlencoded"
+    for year, month in periods:
+        if _sync_stop_flag[0]:
+            break
+        label = f"{year}-{month}"
+        body = (f"reportTypes=monthly&Years={year}&Months={month}"
+                f"&contractId={_up.quote(contract_id)}&exportFormat=tsv"
+                f"&__RequestVerificationToken={_up.quote(csrf)}")
+        try:
+            tr = session.post(f"{am_base}/Reports/Export", data=body, timeout=60)
+        except Exception as e:
+            _sync_log(f"  ⚠️ {label}: {e}")
+            continue
+        if tr.status_code != 200:
+            _sync_log(f"  ⚠️ {label}: HTTP {tr.status_code}")
+            continue
+        content = tr.text
+        if not content or "Asset Number" not in content:
+            continue
+        reader = _csv.DictReader(_io.StringIO(content), delimiter="\t")
+        before = total_saved
+        # Use higher timeout (60s) — under heavy parallel load other collectors
+        # may hold the SQLite write lock; without retry, this whole month would
+        # be skipped and ESP thumbs step would also never run.
+        try:
+            _conn = sqlite3.connect(DB_NAME, timeout=60)
+        except Exception as e:
+            _sync_log(f"  ⚠️ {label}: db open failed: {e}")
+            continue
+        try:
+            for row in reader:
+                asset_id = row.get("Asset Number", "").strip()
+                filename = row.get("Alternate Asset Number", "").strip()
+                title    = row.get("Asset Description", "").strip()
+                coll     = row.get("Collection", "").strip()
+                date_raw = row.get("Sales Date", "").strip()
+                price_s  = row.get("Gross Royalty in USD", "0").strip()
+                if not asset_id or not date_raw:
+                    continue
+                stock = "iStockphoto" if "premium" in coll.lower() else "iStock"
+                price = float(price_s) if price_s else 0.0
+                date  = _parse_d(date_raw)
+                day   = date[:10]
+                exists = _conn.execute(
+                    'SELECT 1 FROM sales WHERE stock=? AND asset_id=? AND price=? AND date LIKE ?',
+                    (stock, asset_id, price, day + '%')).fetchone()
+                if exists:
+                    total_skipped += 1; continue
+                fname_no_ext = filename.rsplit(".", 1)[0] if filename and "." in filename else filename
+                _conn.execute(
+                    'INSERT INTO sales (asset_id,photo_name,stock,price,thumb_url,date,filename) VALUES (?,?,?,?,?,?,?)',
+                    (asset_id, title or filename or asset_id, stock, price, None, date, fname_no_ext or ""))
+                total_saved += 1
+            try: _conn.commit()
+            except Exception as e: _sync_log(f"  ⚠️ {label}: commit failed: {e}")
+        except Exception as e:
+            _sync_log(f"  ⚠️ {label}: import error (continuing): {e}")
+        finally:
+            try: _conn.close()
+            except Exception: pass
+        added = total_saved - before
+        if added:
+            _sync_log(f"  📆 {label}: +{added} нових")
+        time.sleep(0.3)
+
+    _sync_log(f"✅ Getty direct: +{total_saved} нових, {total_skipped} дублікатів")
+
+    # Step 4: fetch ESP thumbnails and pair with stored asset_ids.
+    # TSV gives sales rows without thumbs. ESP API
+    # /api/account/v1/statistics/downloads_for_search returns MasterId + ThumbnailUrl
+    # so we match by MasterId == asset_id and update sales.thumb_url.
+    try:
+        ccw_raw = g_cookies.get('ccw', '')
+        b64 = _up.unquote(ccw_raw).split("|")[0]
+        b64 += "=" * (4 - len(b64) % 4)
+        sts_token = json.loads(base64.b64decode(b64))["sts_token"]
+    except Exception as e:
+        _sync_log(f"⚠️ Getty direct: sts_token: {e} — skipping thumbs")
+        sts_token = None
+
+    if sts_token:
+        _sync_log("🖼️ Getty direct: тягну thumbnails з ESP API")
+        esp_base = "https://esp.gettyimages.com"
+        esp_headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {sts_token}",
+            "User-Agent": session.headers.get("User-Agent"),
+        }
+        import calendar as _cal
+        from datetime import date as _date_g, datetime as _dt_g
+        now_g = _dt_g.now()
+        thumb_updated = 0
+        for offset_m in range(60):   # up to 5 years of monthly thumb data
+            if _sync_stop_flag[0]: break
+            m_i = now_g.month - offset_m
+            y_i = now_g.year
+            while m_i <= 0:
+                m_i += 12; y_i -= 1
+            from_date = f"{y_i}-{m_i:02d}-01"
+            last_d = _cal.monthrange(y_i, m_i)[1]
+            to_date = f"{y_i}-{m_i:02d}-{last_d:02d}"
+            if y_i == now_g.year and m_i == now_g.month:
+                to_date = now_g.strftime("%Y-%m-%d")
+            page_n = 1
+            while True:
+                url = (f"{esp_base}/api/account/v1/statistics/downloads_for_search"
+                       f"?orderResultsBy=LastDownloadDate&sortDirection=Descending"
+                       f"&page={page_n}&pageSize=50"
+                       f"&fromDate={from_date}&toDate={to_date}"
+                       f"&primaryDatePeriod=by_month")
+                try:
+                    r = req_lib.get(url, headers=esp_headers, cookies=g_cookies, timeout=20)
+                    if r.status_code != 200:
+                        break
+                    data = r.json()
+                except Exception as ex:
+                    _sync_log(f"  ⚠️ ESP thumbs {y_i}-{m_i:02d} p{page_n}: {ex}")
+                    break
+                items = data.get("AssetDownloadSummaries", []) or []
+                if not items:
+                    break
+                with sqlite3.connect(DB_NAME, timeout=15) as _c:
+                    for item in items:
+                        asset_id = str(item.get("MasterId", ""))
+                        thumb = item.get("ThumbnailUrl", "")
+                        if not asset_id or not thumb:
+                            continue
+                        _c.execute(
+                            "UPDATE sales SET thumb_url=? WHERE asset_id=? "
+                            "AND stock IN ('iStock','iStockphoto') AND (thumb_url IS NULL OR thumb_url='')",
+                            (thumb, asset_id))
+                        if _c.execute("SELECT changes()").fetchone()[0]:
+                            thumb_updated += 1
+                            load_img_async(asset_id, thumb, None, stock="iStock")
+                    _c.commit()
+                total_pages = (data.get("TotalAssetCount", 0) + 49) // 50
+                if page_n >= total_pages:
+                    break
+                page_n += 1
+                time.sleep(0.1)
+        _sync_log(f"✅ Getty direct thumbs: оновлено для {thumb_updated} активів")
+
+    # Mark month as done so we don't refetch next time
+    proc_file = os.path.join(RECIPES_DIR, "_processed_dates.json")
+    try:
+        try:
+            with open(proc_file) as _f: pd = json.load(_f)
+        except Exception:
+            pd = {}
+        from datetime import date as _date
+        pd["Getty_auto_month"] = _date.today().strftime("%Y-%m")
+        with open(proc_file, "w") as _f:
+            json.dump(pd, _f, indent=2)
+    except Exception:
+        pass
+    return True
+
+
 def _getty_api_collect_global(pw_page, force=False):
     """Збирає Getty/iStock через ESP stats API + завантажує TSV виписки."""
     from datetime import date as _date
@@ -1485,6 +2070,196 @@ def _getty_api_collect_global(pw_page, force=False):
     _app_log(f"[Getty] last_sync recorded: {_pd2['Getty/iStock_last_sync']}")
 
 
+def _ms_plus_collect_direct():
+    """MS+ via direct requests + Safari cookies — bypasses Playwright cookie sync
+    issues. Returns True on success (caller skips Playwright fallback).
+
+    ⚠️ DO NOT TOUCH — works reliably when Safari MS+ session is valid.
+    Tested: 163 folders + paginated photos returned in <1 minute."""
+    _sync_log("🚀 Microstock+ direct: старт...")
+
+    safari_path = os.path.expanduser(
+        "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
+    if not os.path.exists(safari_path):
+        _sync_log("⚠️ MS+ direct: Safari cookies missing — fallback")
+        return False
+    try:
+        all_cookies = _parse_safari_binarycookies(safari_path)
+    except Exception as e:
+        _sync_log(f"⚠️ MS+ direct: parse failed: {e} — fallback")
+        return False
+
+    ms_cookies = {c['name']: c['value'] for c in all_cookies
+                  if 'microstock.plus' in c.get('domain', '')}
+    if 'koa.sid' not in ms_cookies and 'session_debug' not in ms_cookies:
+        _sync_log("⚠️ MS+ direct: no session cookie — fallback")
+        return False
+
+    base = "https://microstock.plus"
+    session = req_lib.Session()
+    session.cookies.update(ms_cookies)
+    session.headers.update({
+        "Accept": "application/json",
+        "x-requested-with": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                       "Version/17.5 Safari/605.1.15"),
+    })
+
+    # Step 1: list directories
+    try:
+        r = session.post(f"{base}/contentdb/directories/getfulllist", data="", timeout=20)
+        dirs_resp = r.json()
+    except Exception as e:
+        _sync_log(f"⚠️ MS+ direct: getfulllist exception: {e} — fallback")
+        return False
+    if not dirs_resp.get("isOk"):
+        msg = dirs_resp.get("message", "unknown")
+        if "сессия" in msg.lower() or "session" in msg.lower():
+            _sync_log("⚠️ MS+ direct: session expired in Safari — залогінься на microstock.plus у Safari, перезапусти sync")
+        else:
+            _sync_log(f"⚠️ MS+ direct: getfulllist failed: {msg} — fallback")
+        return False
+
+    dirs = [d for d in dirs_resp.get("list", []) if d.get("filestotal", 0) > 0]
+    _sync_log(f"📁 MS+ direct: {len(dirs)} папок з файлами")
+
+    # Full agency list — even if we don't track sales for some, we want their
+    # stockids for cross-matching coverage.
+    AGENCIES = ["shutterstock", "esp", "adobestock", "dreamstime", "yaymicro",
+                "123rf", "depositphotos", "alamy", "pixta", "pond5", "vecteezy",
+                "photodune", "eyeem", "bigstockphoto", "freepik", "canva"]
+    # ⚠️ MS+ API expects useragencyids as URL-encoded JSON array, NOT PHP-style
+    # repeated key. The old "useragencyids[]=foo&useragencyids[]=bar" syntax
+    # returns HTTP 500 from the server. Verified 2026-05-26.
+    import urllib.parse as _up
+    import json as _json
+    agencies_param = "useragencyids=" + _up.quote(_json.dumps(AGENCIES))
+
+    library = {}
+    total_files = 0
+    for dir_idx, dr in enumerate(dirs, 1):
+        if _sync_stop_flag[0]:
+            _sync_log("⛔ MS+ direct: зупинено")
+            break
+        path = dr.get("path", "")
+        if not path:
+            continue
+        path_enc = _up.quote(path, safe='')
+        skip = 0
+        while True:
+            body = (f"skip={skip}&limit=250&directory={path_enc}"
+                    f"&{agencies_param}&searchtext=&archive=0")
+            try:
+                r = session.post(f"{base}/contentdb/content/contentlist",
+                                data=body, timeout=20)
+                resp = r.json()
+            except Exception as ex:
+                _sync_log(f"  ⚠️ {path} skip={skip}: {ex}")
+                break
+            if not resp.get("isOk"):
+                _sync_log(f"  ⚠️ {path} skip={skip}: {resp.get('message','?')}")
+                break
+            items = resp.get("list", [])
+            if not items:
+                break
+            for it in items:
+                basepath = it.get("basepath", "")
+                if not basepath:
+                    continue
+                # ⚠️ Key by basepath (unique across folders) — NOT just filename.
+                # Camera reuses names like "B94A1234" every 10k shots, so multiple
+                # different MS+ entries can share filename across different shoot
+                # folders. Keying by filename loses ~40% of photos to silent dedup.
+                filename = basepath.split("/")[-1]
+                stockids = it.get("stockids") or {}
+                stockids = {k: str(v) for k, v in stockids.items() if v}
+                thumb_url = it.get("thumbnailurl", "") or it.get("previewurl", "")
+                title = (it.get("metadata") or {}).get("basic", {}).get("title", "")
+                # Group = LAST folder of MS+ directory path, drop year/month prefix.
+                # "/2021/21-03 March/210110 Tanabash Office" → "210110 Tanabash Office"
+                dir_path = (it.get("directory") or "").rstrip("/")
+                group_name = dir_path.split("/")[-1] if dir_path else ""
+                library[basepath] = {
+                    "filename": filename,
+                    "group":    group_name,
+                    "stockids": stockids,
+                    "basepath": basepath,
+                    "thumb":    thumb_url,
+                    "title":    title,
+                }
+                total_files += 1
+            if len(items) < 250:
+                break
+            skip += 250
+            time.sleep(0.1)
+        if dir_idx % 20 == 0 or dir_idx == len(dirs):
+            _sync_log(f"  📦 {dir_idx}/{len(dirs)} папок, всього {total_files} фото")
+
+    # Merge with existing ms_library.json by basepath (unique key).
+    # MS+ is master — if user moved a photo to a different folder in MS+,
+    # the new group name wins. Local edits via UI are not preserved across
+    # MS+ syncs (use manual overrides for permanent local-only group choices).
+    existing = load_ms_library()
+    existing_by_bp = {e.get("basepath", ""): e for e in existing if e.get("basepath")}
+    moved = 0
+    for bp, rec in library.items():
+        old = existing_by_bp.get(bp, {})
+        if old.get("group") and old["group"] != rec["group"]:
+            moved += 1
+        existing_by_bp[bp] = rec
+    merged = list(existing_by_bp.values())
+    if moved:
+        _sync_log(f"📦 MS+ direct: {moved} фото перенесено в інші групи (MS+ master)")
+    save_ms_library(merged)
+    _sync_log(f"✅ MS+ direct: {total_files} записів, ms_library.json = {len(merged)} (unique basepaths)")
+
+    # Step 4: download MS+ reference thumbnails to img_cache_ms/.
+    # These serve as ground-truth pHash for matching sales photos against MS+
+    # groups when sales asset_ids aren't in stockids (visual fallback path).
+    _sync_log("🖼️ MS+ direct: завантажую reference thumbnails в img_cache_ms/")
+    dl_count = skip_count = 0
+    img_session = req_lib.Session()
+    img_session.cookies.update(ms_cookies)
+    img_session.headers.update({"User-Agent": session.headers["User-Agent"]})
+    for rec in merged:
+        if _sync_stop_flag[0]: break
+        bp = rec.get("basepath", "")
+        thumb = rec.get("thumb", "")
+        if not bp or not thumb: continue
+        # Disk filename derived from basepath (unique across same-filename camera shots)
+        # Example: /2022/22-04-17 business coworkers/B94A9730-flipHorizontal
+        # → 2022__22-04-17_business_coworkers__B94A9730-flipHorizontal.jpg
+        safe_fn = bp.lstrip("/").replace("/", "__").replace("\\", "__")
+        dest = os.path.join(MS_CACHE_DIR, f"{safe_fn}.jpg")
+        if os.path.exists(dest):
+            skip_count += 1; continue
+        try:
+            r = img_session.get(thumb, timeout=15)
+            if r.status_code == 200 and r.content[:2] == b'\xff\xd8':
+                # Normalize to 400x400 JPEG 88 — same form as load_img() saves
+                # sales thumbs, so pHash computation is consistent.
+                img = Image.open(BytesIO(r.content)).convert('RGB')
+                img = ImageOps.fit(img, (400, 400), Image.Resampling.LANCZOS)
+                img.save(dest, 'JPEG', quality=88)
+                dl_count += 1
+        except Exception:
+            pass
+        if (dl_count + skip_count) % 200 == 0:
+            _sync_log(f"  📥 {dl_count} new, {skip_count} skipped (cached)")
+    _sync_log(f"✅ MS+ thumbnails: {dl_count} new downloaded, {skip_count} cached")
+
+    # Compute pHash for new thumbnails so visual matching can use them
+    try:
+        with flask_app.test_request_context():
+            api_compute_ms_hashes()
+        _sync_log("✅ MS+ ms_meta pHashes computed")
+    except Exception as ex:
+        _sync_log(f"⚠️ ms_meta compute failed: {ex}")
+    return True
+
+
 def _ms_plus_collect_global(pw_page):
     """Microstock+ → оновлює ms_library.json (stockids для крос-стокового матчингу).
     Не зберігає продажі — це reference-source. Викликає 2 ендпоінти:
@@ -1533,10 +2308,14 @@ def _ms_plus_collect_global(pw_page):
     dirs = [d for d in dirs_resp.get("list", []) if d.get("filestotal", 0) > 0]
     _sync_log(f"📁 Microstock+: {len(dirs)} папок з файлами")
 
-    # Step 2: for each directory, fetch contentlist with pagination
+    # Step 2: for each directory, fetch contentlist with pagination.
+    # ⚠️ MS+ API expects useragencyids as URL-encoded JSON array, NOT PHP-style
+    # repeated key. Old "useragencyids[]=..." syntax returns HTTP 500.
     AGENCIES = ["shutterstock", "esp", "adobestock", "dreamstime", "yaymicro",
                 "123rf", "depositphotos", "alamy", "pixta", "pond5", "vecteezy"]
-    agencies_param = "&".join([f"useragencyids[]={a}" for a in AGENCIES])
+    import urllib.parse as _up2
+    import json as _json2
+    agencies_param = "useragencyids=" + _up2.quote(_json2.dumps(AGENCIES))
 
     library = {}    # filename → record
     total_files = 0
@@ -1573,9 +2352,10 @@ def _ms_plus_collect_global(pw_page):
                 stockids = {k: str(v) for k, v in stockids.items() if v}
                 if not stockids:
                     continue
+                dir_path = (it.get("directory") or "").rstrip("/")
                 library[filename] = {
                     "filename": filename,
-                    "group":    it.get("directory", "").lstrip("/"),
+                    "group":    dir_path.split("/")[-1] if dir_path else "",
                     "stockids": stockids,
                     "basepath": basepath,
                 }
@@ -1671,6 +2451,20 @@ def _collect_one_stock_global(name, url):
     # stock — otherwise we'd open a browser unnecessarily and risk re-triggering
     # anti-bot detection on a clean session. Each fast-path collector internally
     # falls back (returns False) if cookies missing/expired → Playwright kicks in.
+    if name == "Adobe Stock":
+        try:
+            if _adobe_collect_direct():
+                return
+            _sync_log("[Adobe Stock] direct API failed — fallback to Playwright")
+        except Exception as ex:
+            _sync_log(f"[Adobe Stock] direct API exception: {ex} — fallback")
+    if name == "Depositphotos":
+        try:
+            if _depositphotos_collect_direct():
+                return
+            _sync_log("[Depositphotos] direct failed — fallback to Playwright")
+        except Exception as ex:
+            _sync_log(f"[Depositphotos] direct exception: {ex} — fallback")
     if name == "Shutterstock":
         try:
             if _shutterstock_api_collect_direct():
@@ -1678,6 +2472,25 @@ def _collect_one_stock_global(name, url):
             _sync_log("[Shutterstock] direct API failed — fallback to Playwright")
         except Exception as ex:
             _sync_log(f"[Shutterstock] direct API exception: {ex} — fallback")
+    if name == "Microstock+":
+        try:
+            if _ms_plus_collect_direct():
+                return
+            _sync_log("[Microstock+] direct API failed — fallback to Playwright")
+        except Exception as ex:
+            _sync_log(f"[Microstock+] direct API exception: {ex} — fallback")
+    if name == "Getty Images":
+        # Getty has the 21st-of-month gate (no point running before then)
+        from datetime import date as _date_g
+        if _date_g.today().day < 21:
+            _sync_log(f"📅 [Getty Images] skipped — available from the 21st (today {_date_g.today().day})")
+            return
+        try:
+            if _getty_collect_direct():
+                return
+            _sync_log("[Getty Images] direct API failed — fallback to Playwright")
+        except Exception as ex:
+            _sync_log(f"[Getty Images] direct API exception: {ex} — fallback")
 
     is_getty   = name == "Getty Images"
     main_prof  = os.path.join(_BASE_DIR, "chrome_profile")
@@ -1784,7 +2597,15 @@ def _collect_one_stock_global(name, url):
 
 
 def _sync_all_global():
-    """Parallel collection from all stocks. Called from Flask /api/sync/start."""
+    """Sequential collection from all stocks. Called from Flask /api/sync/start.
+
+    ⚠️ Sequential by design (not parallel). With 5 collectors each holding
+    HTTPS connection pools + SQLite connections + image-download workers,
+    parallel hits fd-exhaustion and SQLite lock contention. Sequential keeps
+    resource usage flat — each stock gets full resources, no contention.
+
+    Order: MS+ first (needed by rebuild-matches), then heaviest stocks last
+    so user sees fast progress on stat boxes before the long Adobe history."""
     if _sync_all_active[0]:
         _sync_log("⚠️ Sync already running!")
         return
@@ -1792,26 +2613,24 @@ def _sync_all_global():
     _sync_stop_flag[0]  = False
     _sync_state["running"] = True
     _sync_state["log"]     = []
-    _sync_log("🚀 Parallel sync from all stocks...")
-    COLLECTABLE = {"Adobe Stock", "Shutterstock", "Getty Images", "Depositphotos", "Microstock+"}
+    _sync_log("🚀 Sequential sync from all stocks...")
+
+    # Order matters: MS+ first (lib needed by matching), then small ones, then heaviest
+    ORDER = ["Microstock+", "Depositphotos", "Getty Images", "Shutterstock", "Adobe Stock"]
+
     try:
-        threads = []
-        for name, url in STOCK_URLS.items():
-            if name not in COLLECTABLE:
-                continue
+        for name in ORDER:
             if _sync_stop_flag[0]:
                 break
-            t = threading.Thread(target=_collect_one_stock_global, args=(name, url), daemon=True)
-            t.name = f"collector-{name}"
-            t.start()
-            threads.append((name, t))
-        # Per-collector watchdog: max 10 min each. If a thread hangs (e.g. DataDome
-        # blocks a fetch), we move on instead of locking the sync forever.
-        WATCHDOG_SECONDS = 600
-        for name, t in threads:
-            t.join(timeout=WATCHDOG_SECONDS)
-            if t.is_alive():
-                _sync_log(f"[{name}] ⏱ watchdog timeout ({WATCHDOG_SECONDS}s) — moving on (browser may still be open)")
+            url = STOCK_URLS.get(name)
+            if not url:
+                continue
+            _sync_log(f"━━━ [{name}] start ━━━")
+            try:
+                _collect_one_stock_global(name, url)
+                _sync_log(f"━━━ [{name}] finished ━━━")
+            except Exception as ex:
+                _sync_log(f"━━━ [{name}] ⚠️ exception: {ex} — continuing to next stock ━━━")
         if not _sync_stop_flag[0]:
             _sync_log("✅ All stocks collected")
             # Auto-trigger rebuild-matches: pHash for newly downloaded thumbs is
@@ -1854,7 +2673,7 @@ def api_sales():
 
     with sqlite3.connect(DB_NAME, timeout=15) as conn:
         params = []
-        where  = ["stock != 'Envato Elements'"]
+        where  = []
         if period in cutoffs:
             where.append("date >= ?"); params.append(cutoffs[period])
         if stock != 'All':
@@ -1927,7 +2746,7 @@ def api_feed():
 
     with sqlite3.connect(DB_NAME, timeout=15) as conn:
         params = []
-        where  = ["stock != 'Envato Elements'"]
+        where  = []
         if period in cutoffs:
             where.append("date >= ?"); params.append(cutoffs[period])
         if stock != 'All':
@@ -1963,7 +2782,7 @@ def api_feed():
             ph2 = ','.join('?' * len(exp_list))
             agg = conn2.execute(
                 f"SELECT asset_id, stock, SUM(price), COUNT(*), MIN(date) FROM sales"
-                f" WHERE asset_id IN ({ph2}) AND stock != 'Envato Elements'"
+                f" WHERE asset_id IN ({ph2})"
                 f" GROUP BY asset_id, stock", exp_list).fetchall()
 
         # Raw per-id earnings
@@ -2003,7 +2822,7 @@ def api_stats():
         base_where  = "stock = ?"
         base_params = [stock_filter]
     else:
-        base_where  = "stock != 'Envato Elements'"
+        base_where  = "1=1"
         base_params = []
 
     spans = {
@@ -2054,7 +2873,7 @@ def api_stats():
 
         # all-time per-stock for legend
         by_stock = conn.execute(
-            "SELECT stock, SUM(price), COUNT(*) FROM sales WHERE stock != 'Envato Elements' GROUP BY stock"
+            "SELECT stock, SUM(price), COUNT(*) FROM sales GROUP BY stock"
         ).fetchall()
         result['by_stock'] = [{"stock": r[0], "total": round(float(r[1] or 0), 2),
                                 "count": r[2]} for r in by_stock]
@@ -2062,10 +2881,10 @@ def api_stats():
 
 @flask_app.route('/api/stock-list', methods=['GET'])
 def api_stock_list():
-    """Повертає список стоків (без Envato Elements)."""
+    """Повертає список стоків."""
     with sqlite3.connect(DB_NAME, timeout=15) as conn:
         rows = conn.execute(
-            "SELECT DISTINCT stock FROM sales WHERE stock != 'Envato Elements' AND stock IS NOT NULL ORDER BY stock"
+            "SELECT DISTINCT stock FROM sales WHERE stock IS NOT NULL ORDER BY stock"
         ).fetchall()
     stocks = [r[0] for r in rows if r[0]]
     # Ensure the three main stocks are always present in a consistent order
@@ -2227,7 +3046,7 @@ def _query_earnings_batch(ids_iterable):
             phs = ','.join('?' * len(chunk))
             rows = conn.execute(
                 f"SELECT asset_id, stock, SUM(price), COUNT(*), MAX(thumb_url) FROM sales"
-                f" WHERE asset_id IN ({phs}) AND stock != 'Envato Elements'"
+                f" WHERE asset_id IN ({phs})"
                 f" GROUP BY asset_id, stock",
                 chunk,
             ).fetchall()
@@ -2588,6 +3407,186 @@ def api_photo_groups_rename():
     groups[new] = groups.pop(old)
     save_groups(groups)
     return jsonify({"status": "ok"})
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ⚠️ MATCHING & GROUPING LOGIC — APPROVED 2026-05-27. DO NOT TOUCH WITHOUT USER OK.
+# ═════════════════════════════════════════════════════════════════════════════
+# This block (the next ~200 lines through api_match_within_group, plus the
+# direct-API collectors above, plus api_rebuild_matches) implements the
+# user's approved cross-stock matching pipeline. Tested end-to-end on real
+# data after 2 days of iteration. Same pattern applies to any future stock:
+#
+#   1. Collector (per stock) fetches sales via Safari cookies → direct HTTPS
+#      request (NOT Playwright). Saves rows with thumb_url. Each thumb
+#      download triggers _save_asset_meta (pHash+RGB) via load_img_async(stock=).
+#      For Adobe: clean thumb from img_cache_match/, NOT watermarked img_cache/.
+#   2. MS+ collector populates ms_library.json (basepath-keyed, full stockids,
+#      thumb downloaded to img_cache_ms/ + pHash via api_compute_ms_hashes).
+#      Group name = LAST folder component (strip /2021/ prefix).
+#   3. api_rebuild_matches runs 8 passes:
+#        Pass 0: load _manual_overrides.json
+#        Pass A: pHash+RGB cross-stock clustering (PRIMARY — works on clean thumbs)
+#        Pass B: ms_library stockids FALLBACK (adds links pHash missed)
+#        Pass C: filename fallback (camera-name collisions verified by pHash)
+#        Pass D: sync ms_library.group → photo_groups (primary stockid per photo)
+#        Pass E: auto-propagate groups via match clusters
+#        Pass F: MS+ visual matching (img_cache_ms/ pHash ↔ sales asset_meta)
+#        Pass G: dedup
+#        Pass H: apply manual overrides (always win)
+#   4. UI "Match Groups" button → api_match_similar_groups merges variant groups
+#      (cropped/p1/p2/(N)) into canonical shortest name. Recolor stays separate.
+#   5. UI per-card "Match more" button → api_match_within_group runs pHash
+#      against one group's members to find ungrouped sales photos that fit.
+#
+# When adding a new stock, follow steps 1-2; rebuild-matches handles the rest.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _group_base_key(name: str) -> tuple:
+    """⚠️ DO NOT TOUCH — group similarity matching rule (per user spec 2026-05-27).
+    Extract a canonical key from group name so variants of the same shoot match.
+
+    Match: '23-02-01 woman street' == '23-02-01 woman street cropped'
+                                    == '23-02-01 woman street p1'
+                                    == '23-02-01 woman street (159)'
+                                    == '23-02-01 woman street p2 cropped'
+    DON'T match: '23-02-01 woman street recolor' (recolor is intentionally different)
+
+    Returns: (date_prefix, name_words_tuple) — None if no date prefix found.
+    Two groups match iff their base keys are equal."""
+    import re as _re
+    if 'recolor' in name.lower():
+        return None  # recolor variants stay separate
+    # Date prefix: YYMMDD or YY-MM-DD at start (allowing optional leading path)
+    # Examples: "23-02-01 woman street", "210510 Africa p1", "21-08-05 friends"
+    s = name.strip()
+    m = _re.match(r'(?:.*?[\\/])?(\d{2}-?\d{2}-?\d{2})\s+(.+?)$', s)
+    if not m:
+        return None
+    date_norm = m.group(1).replace('-', '')   # 23-02-01 → 230201
+    rest = m.group(2).lower()
+    # Strip suffix variants: cropped, p1, p2, p3, (N)
+    rest = _re.sub(r'\s*\((\d+)\)\s*', ' ', rest)         # remove "(159)"
+    rest = _re.sub(r'\s+p\d+\b', '', rest)                # remove " p1", " p2"
+    rest = _re.sub(r'\s+cropped\b', '', rest)             # remove " cropped"
+    rest = _re.sub(r'\s+resize\b', '', rest)              # remove " resize"
+    rest = _re.sub(r'\s+colour\b', '', rest)              # remove " colour"
+    rest = _re.sub(r'\s+rec\b', '', rest)                 # remove trailing " rec"
+    rest = _re.sub(r'\s+', ' ', rest).strip()             # collapse whitespace
+    if not rest:
+        return None
+    return (date_norm, tuple(rest.split()))
+
+
+@flask_app.route('/api/groups/match-similar', methods=['POST'])
+def api_match_similar_groups():
+    """⚠️ DO NOT TOUCH — merges variant groups of same shoot into canonical one.
+
+    Per user spec (2026-05-27): groups like '23-02-01 woman street' +
+    '23-02-01 woman street cropped' + '23-02-01 woman street p1' share the
+    same shoot, must merge. Recolor stays separate (different processing).
+
+    Logic:
+      1. Compute _group_base_key for every group in photo_groups.json
+      2. Bucket groups by identical base key
+      3. For each bucket with ≥2 groups: pick canonical (shortest name, has no
+         'cropped'/'p1'/etc suffix), merge others into it via existing merge.
+
+    Does NOT touch ms_library — only photo_groups.json + matches."""
+    groups = load_groups()
+    buckets = {}
+    for name in list(groups.keys()):
+        key = _group_base_key(name)
+        if not key: continue
+        buckets.setdefault(key, []).append(name)
+
+    merged_pairs = []
+    skipped_recolor = 0
+    for key, names in buckets.items():
+        if len(names) < 2: continue
+        # Pick canonical = shortest (most likely the original "23-02-01 woman street"
+        # without "cropped"/"p1" suffix). Among equal-length: alphabetical first.
+        names.sort(key=lambda n: (len(n), n))
+        canonical = names[0]
+        for src in names[1:]:
+            # Merge src → canonical via existing logic (collects ms_library + user IDs)
+            try:
+                with flask_app.test_request_context(
+                    json={'source': src, 'target': canonical}, method='POST'):
+                    api_photo_groups_merge()
+                merged_pairs.append((src, canonical))
+            except Exception as ex:
+                _app_log(f"[match-similar] merge {src}→{canonical} failed: {ex}")
+
+    return jsonify({'status': 'ok',
+                    'merged_count': len(merged_pairs),
+                    'pairs': merged_pairs[:50],   # truncate for UI
+                    'recolor_kept_separate': skipped_recolor})
+
+
+@flask_app.route('/api/groups/match-within', methods=['POST'])
+def api_match_within_group():
+    """⚠️ DO NOT TOUCH — pHash matches all sales photos to a single group's
+    visual reference. For each photo already in the group, find visually similar
+    sales photos NOT yet in any group and add them in. Used by per-group "Match
+    more" button in the card.
+
+    Body: { "name": "group name" }
+    Match thresholds: same as global _hash_based_matches (hamming ≤ 8, RGB ≤ 90)."""
+    data = request.get_json(force=True, silent=True) or {}
+    gname = (data.get('name') or '').strip()
+    if not gname:
+        return jsonify({'status': 'error', 'msg': 'missing name'}), 400
+
+    groups = load_groups()
+    if gname not in groups:
+        return jsonify({'status': 'error', 'msg': 'group not found'}), 404
+
+    member_ids = set(str(a) for a in groups[gname])
+    if not member_ids:
+        return jsonify({'status': 'ok', 'added': 0})
+
+    # Build a set of all photos in ANY group (so we never poach grouped photos)
+    all_grouped = set()
+    for ids in groups.values():
+        all_grouped.update(str(a) for a in ids)
+
+    # Get pHash for member assets
+    with sqlite3.connect(DB_NAME, timeout=15) as c:
+        placeholders = ",".join(["?"] * len(member_ids))
+        member_meta = c.execute(
+            f"SELECT asset_id, thumb_hash, aspect_ratio, r, g, b FROM asset_meta "
+            f"WHERE asset_id IN ({placeholders}) AND thumb_hash IS NOT NULL",
+            list(member_ids)).fetchall()
+        # All sales photos with pHash that are NOT in any group
+        all_meta = c.execute(
+            "SELECT stock, asset_id, thumb_hash, aspect_ratio, r, g, b FROM asset_meta "
+            "WHERE thumb_hash IS NOT NULL").fetchall()
+
+    if not member_meta:
+        return jsonify({'status': 'ok', 'added': 0, 'msg': 'no member pHashes'})
+
+    # Compare each ungrouped sales photo against EACH member's pHash
+    member_ints = [(h, int(h, 16), ar, r, g, b) for h, ar, r, g, b
+                   in [(m[1], m[2], m[3], m[4], m[5]) for m in member_meta]]
+    added = []
+    for stock, aid, ha, ar, r, g, b in all_meta:
+        aid_s = str(aid)
+        if aid_s in all_grouped: continue
+        try: ha_int = int(ha, 16)
+        except Exception: continue
+        for mh, mh_int, mar, mr, mg, mb in member_ints:
+            if ar and mar and abs(ar - mar) > 0.15: continue
+            if bin(ha_int ^ mh_int).count('1') > 8: continue
+            if (isinstance(r, int) and isinstance(mr, int) and
+                abs(r - mr) + abs(g - mg) + abs(b - mb) > 90): continue
+            added.append(aid_s); all_grouped.add(aid_s); break
+
+    if added:
+        groups[gname] = list(dict.fromkeys(list(groups[gname]) + added))
+        save_groups(groups)
+
+    return jsonify({'status': 'ok', 'added': len(added), 'group': gname})
+
 
 @flask_app.route('/api/photo-groups/merge', methods=['POST'])
 def api_photo_groups_merge():
@@ -3066,6 +4065,17 @@ def api_rebuild_groups():
             try: os.remove(fp)
             except Exception: pass
 
+    # 1b. Wipe MS+ thumbnail cache + ms_meta so fresh sync re-downloads & re-hashes
+    if os.path.isdir(MS_CACHE_DIR):
+        for f in os.listdir(MS_CACHE_DIR):
+            try: os.remove(os.path.join(MS_CACHE_DIR, f))
+            except Exception: pass
+    try:
+        with sqlite3.connect(DB_NAME, timeout=15) as _c:
+            _c.execute("DELETE FROM ms_meta")
+            _c.commit()
+    except Exception: pass
+
     # 2. Trigger MS+ sync in background (re-fetches ms_library, then rebuild-matches)
     def _run():
         try:
@@ -3300,7 +4310,7 @@ def api_group_names():
     return jsonify(sorted(ms_names | user_names))
 
 
-def _hash_based_matches(existing_matches, threshold=8):
+def _hash_based_matches(existing_matches, threshold=4):
     """
     Augment existing matches with perceptual-hash-based pairs.
     For all (stock, asset_id) in asset_meta, find visually similar across stocks
@@ -3333,16 +4343,18 @@ def _hash_based_matches(existing_matches, threshold=8):
             sb, hb, arb, rb, gb, bb = by_aid[aid_b]
             if sa == sb:
                 continue  # same stock, can't be cross-stock match
-            if ara and arb and abs(ara - arb) > 0.15:
+            # ⚠️ STRICT — false positives between similar but different shoots
+            # were polluting clusters (office workers landing in beauty group etc.)
+            if ara and arb and abs(ara - arb) > 0.05:
                 continue  # aspect ratios too different
             if _hamming_hex(ha, hb) > threshold:
                 continue
-            # Dominant-color check: total RGB distance must be ≤ 90 (≈30 per channel)
+            # Dominant-color check: total RGB distance must be ≤ 45 (≈15 per channel)
             try:
                 if (isinstance(ra, int) and isinstance(rb, int) and
                     isinstance(ga, int) and isinstance(gb, int) and
                     isinstance(ba, int) and isinstance(bb, int) and
-                    (abs(ra - rb) + abs(ga - gb) + abs(ba - bb)) > 90):
+                    (abs(ra - rb) + abs(ga - gb) + abs(ba - bb)) > 45):
                     continue
             except Exception:
                 pass  # Don't let bad data block matching
@@ -3368,6 +4380,143 @@ def _hash_based_matches(existing_matches, threshold=8):
                 aid_to_group_key[aid_b] = aid_a
             new_pairs += 1
     return existing_matches, new_pairs
+
+
+@flask_app.route('/api/refresh-istock-thumbs', methods=['POST'])
+def api_refresh_istock_thumbs():
+    """Re-fetch ThumbnailUrl from ESP API for iStock asset_ids missing pHash.
+    Getty signed URLs expire — sales records may have stale/empty thumb_url and
+    no cached file in img_cache/. This walks the ESP downloads_for_search API
+    monthly windows, finds matches against our missing-pHash set, downloads
+    fresh thumbs into img_cache/ (which also computes pHash via _save_asset_meta),
+    then triggers rebuild-matches.
+
+    Body: {} — no params. Reads Safari ccw cookie for auth.
+    """
+    import urllib.parse as _up
+    import base64
+
+    # Build target set: iStock aids in sales without pHash
+    with sqlite3.connect(DB_NAME, timeout=15) as c:
+        all_istock = set(r[0] for r in c.execute(
+            "SELECT DISTINCT asset_id FROM sales "
+            "WHERE stock IN ('iStock','iStockphoto') AND asset_id IS NOT NULL"
+        ) if r[0])
+        hashed = set(r[0] for r in c.execute(
+            "SELECT asset_id FROM asset_meta WHERE stock='iStock' "
+            "AND thumb_hash IS NOT NULL AND thumb_hash != ''"
+        ) if r[0])
+    target = all_istock - hashed
+    if not target:
+        return jsonify({'status': 'ok', 'msg': 'no iStock aids missing pHash', 'updated': 0})
+
+    safari_path = os.path.expanduser(
+        "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
+    if not os.path.exists(safari_path):
+        return jsonify({'status': 'error', 'msg': 'Safari cookies missing'}), 400
+    try:
+        all_cookies = _parse_safari_binarycookies(safari_path)
+    except Exception as e:
+        return jsonify({'status': 'error', 'msg': f'cookie parse failed: {e}'}), 500
+
+    g_cookies = {c['name']: c['value'] for c in all_cookies
+                 if 'gettyimages' in c.get('domain', '').lower()}
+    if 'ccw' not in g_cookies:
+        return jsonify({'status': 'error', 'msg': 'no ccw cookie — login to Getty in Safari'}), 401
+
+    try:
+        ccw_raw = g_cookies['ccw']
+        b64 = _up.unquote(ccw_raw).split("|")[0]
+        b64 += "=" * (4 - len(b64) % 4)
+        sts_token = json.loads(base64.b64decode(b64))["sts_token"]
+    except Exception as e:
+        return jsonify({'status': 'error', 'msg': f'sts_token decode: {e}'}), 500
+
+    def _run():
+        _sync_state["running"] = True
+        _sync_state["log"] = []
+        _sync_stop_flag[0] = False
+        _sync_log(f"🚀 iStock thumb refresh: {len(target)} aids потребують pHash")
+
+        esp_base = "https://esp.gettyimages.com"
+        esp_headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {sts_token}",
+            "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                           "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                           "Version/17.5 Safari/605.1.15"),
+        }
+        import calendar as _cal
+        from datetime import datetime as _dt
+        now = _dt.now()
+        remaining = set(target)
+        updated = 0
+        try:
+            for offset_m in range(60):  # up to 5 years
+                if _sync_stop_flag[0] or not remaining:
+                    break
+                m_i = now.month - offset_m
+                y_i = now.year
+                while m_i <= 0:
+                    m_i += 12; y_i -= 1
+                from_date = f"{y_i}-{m_i:02d}-01"
+                last_d = _cal.monthrange(y_i, m_i)[1]
+                to_date = f"{y_i}-{m_i:02d}-{last_d:02d}"
+                if y_i == now.year and m_i == now.month:
+                    to_date = now.strftime("%Y-%m-%d")
+                page_n = 1
+                while True:
+                    if _sync_stop_flag[0] or not remaining: break
+                    url = (f"{esp_base}/api/account/v1/statistics/downloads_for_search"
+                           f"?orderResultsBy=LastDownloadDate&sortDirection=Descending"
+                           f"&page={page_n}&pageSize=50"
+                           f"&fromDate={from_date}&toDate={to_date}"
+                           f"&primaryDatePeriod=by_month")
+                    try:
+                        r = req_lib.get(url, headers=esp_headers, cookies=g_cookies, timeout=20)
+                        if r.status_code != 200:
+                            _sync_log(f"  ⚠️ ESP {y_i}-{m_i:02d} p{page_n}: HTTP {r.status_code}")
+                            break
+                        data = r.json()
+                    except Exception as ex:
+                        _sync_log(f"  ⚠️ ESP {y_i}-{m_i:02d} p{page_n}: {ex}")
+                        break
+                    items = data.get("AssetDownloadSummaries", []) or []
+                    if not items: break
+                    for item in items:
+                        aid = str(item.get("MasterId", ""))
+                        thumb = item.get("ThumbnailUrl", "")
+                        if not aid or not thumb or aid not in remaining:
+                            continue
+                        # Remove cached file first if it exists with no hash (rare)
+                        cached = os.path.join(CACHE_DIR, f"{aid}.jpg")
+                        if os.path.exists(cached):
+                            try: os.remove(cached)
+                            except Exception: pass
+                        path = load_img(aid, thumb, stock="iStock")
+                        if path:
+                            updated += 1
+                            remaining.discard(aid)
+                    total_pages = (data.get("TotalAssetCount", 0) + 49) // 50
+                    if page_n >= total_pages: break
+                    page_n += 1
+                    time.sleep(0.1)
+                _sync_log(f"  📦 {y_i}-{m_i:02d}: оновлено {updated}, лишилось {len(remaining)}")
+            _sync_log(f"✅ iStock thumbs: оновлено {updated} з {len(target)} (лишилось {len(remaining)})")
+
+            # Trigger rebuild-matches to use new pHashes
+            try:
+                with flask_app.test_request_context():
+                    resp = api_rebuild_matches()
+                _sync_log(f"✅ rebuild-matches: {resp.get_json()}")
+            except Exception as ex:
+                _sync_log(f"⚠️ rebuild-matches: {ex}")
+        finally:
+            _sync_state["running"] = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({'status': 'ok', 'msg': f'iStock refresh started for {len(target)} aids',
+                    'targeted': len(target)})
 
 
 @flask_app.route('/api/compute-hashes', methods=['POST'])
@@ -3492,11 +4641,15 @@ def _ms_fname_to_libentry(disk_base, lib_filenames):
     return None
 
 
-def _ms_visual_matches(aid_to_group, strict_hamming=8, loose_hamming=12, loose_rgb_max=30):
+def _ms_visual_matches(aid_to_group, strict_hamming=4, loose_hamming=8, loose_rgb_max=20):
     """
-    Two-tier MS+ visual matching for sales aids without a group:
-      - strict tier:  hamming ≤ strict_hamming   + RGB distance ≤ 90
-      - loose tier:   hamming ≤ loose_hamming    + RGB distance ≤ loose_rgb_max
+    Two-tier MS+ visual matching for sales aids without a group.
+    ⚠️ STRICT thresholds — both sides are clean (no watermark) thumbnails of
+    the SAME source photo. Identical photos give hamming 0-2; 4 accommodates
+    JPEG/resize artifacts. Old 8/12 was catching false positives between
+    similar-but-different shoots (office vs beauty).
+      - strict tier:  hamming ≤ 4 + RGB distance ≤ 30 (identical photo)
+      - loose tier:   hamming ≤ 8 + RGB distance ≤ 20 (same shoot variant)
                       (catches near-duplicates from same shoot with slightly
                        different crop/edit — only accepted when colors are
                        near-identical, ruling out false positives)
@@ -3505,14 +4658,23 @@ def _ms_visual_matches(aid_to_group, strict_hamming=8, loose_hamming=12, loose_r
     Returns: {gname: [new_aids...]} additions to apply to photo_groups.
     """
     lib = load_ms_library()
-    # Build base-filename -> group map
-    fname_to_group = {}
+    # NEW: build basepath-based lookup. Disk filenames are derived from basepath
+    # as "/A/B/file" → "A__B__file.jpg", so we map back the same way. Falls back
+    # to filename for legacy disk entries from older builds.
+    bp_to_group = {}
+    fname_to_group = {}  # legacy fallback
+    bp_to_disk = {}      # basepath → expected disk base name (no .jpg)
     for p in lib:
+        bp = (p.get('basepath') or '').strip()
         fn = (p.get('filename') or '').strip()
         gn = (p.get('group') or '').strip()
+        if bp and gn:
+            bp_to_group[bp] = gn
+            disk_base = bp.lstrip("/").replace("/", "__").replace("\\", "__")
+            bp_to_disk[disk_base] = bp
         if fn and gn:
             fname_to_group[fn] = gn
-    if not fname_to_group:
+    if not bp_to_group and not fname_to_group:
         return {}
 
     lib_filenames = set(fname_to_group.keys())
@@ -3530,13 +4692,17 @@ def _ms_visual_matches(aid_to_group, strict_hamming=8, loose_hamming=12, loose_r
     if not ms_rows:
         return {}
 
-    # Resolve each disk fname → group (skip files whose base isn't in ms_library)
+    # Resolve each disk fname → group. First try basepath-derived disk name
+    # (new format), fall back to legacy filename lookup.
     ms_resolved = []
     for fname, h, ar, r, g, b in ms_rows:
-        base = _ms_fname_to_libentry(fname, lib_filenames)
-        if not base:
-            continue
-        gn = fname_to_group.get(base)
+        gn = None
+        if fname in bp_to_disk:
+            gn = bp_to_group.get(bp_to_disk[fname])
+        if not gn:
+            base = _ms_fname_to_libentry(fname, lib_filenames)
+            if base:
+                gn = fname_to_group.get(base)
         if not gn:
             continue
         ms_resolved.append((gn, h, int(h, 16), ar, r, g, b))
@@ -3567,9 +4733,9 @@ def _ms_visual_matches(aid_to_group, strict_hamming=8, loose_hamming=12, loose_r
                     rgb_dist = abs(ra - rb) + abs(ga - gb) + abs(ba - bb)
             except Exception:
                 rgb_dist = None
-            # Tiered acceptance:
+            # Tiered acceptance — both clean, identical photos give hamming 0-2
             if d <= strict_hamming:
-                if rgb_dist is not None and rgb_dist > 90:
+                if rgb_dist is not None and rgb_dist > 30:
                     continue
             else:
                 # loose tier — only accept if colors are near-identical
@@ -3586,7 +4752,7 @@ def _ms_visual_matches(aid_to_group, strict_hamming=8, loose_hamming=12, loose_r
     return additions
 
 
-def _filename_fallback_matches(matches, lib, threshold_hamming=8, threshold_rgb=90):
+def _filename_fallback_matches(matches, lib, threshold_hamming=4, threshold_rgb=30):
     """Pass C: filename fallback.
     For each asset NOT yet in any cluster, look up ms_library entries with the
     same filename basename. Candidates from ms_library.stockids are VERIFIED via
@@ -3645,7 +4811,9 @@ def _filename_fallback_matches(matches, lib, threshold_hamming=8, threshold_rgb=
                 c_stock, ch, car, cr, cg, cb = meta
                 if c_stock == stock:
                     continue
-                if ar and car and abs(ar - car) > 0.15:
+                # Stricter aspect_ratio — camera filename collisions across shoots
+                # can pass loose pHash; aspect must match closely too.
+                if ar and car and abs(ar - car) > 0.05:
                     continue
                 if _hamming_hex(h, ch) > threshold_hamming:
                     continue
@@ -3767,19 +4935,38 @@ def api_rebuild_matches():
     _save_matches(matches)
 
     # ── Pass D: sync ms_library groups → photo_groups.json ───────────────
+    # MS+ is master: build authoritative {primary_id → gname} from current MS+
+    # state. Then PURGE any MS+-managed aid (primary + cluster siblings) from
+    # ALL existing groups before re-adding. This makes MS+ folder moves propagate
+    # to local groups: if a photo was moved between MS+ folders, the old local
+    # group loses it and the new one gains it (instead of duplicating).
     groups = load_groups()
-    photos_synced = 0
+    ms_authoritative = {}   # primary_id → gname
     for photo in lib:
-        gname = photo.get('group', '').strip()
+        gname = (photo.get('group') or '').strip()
         if not gname:
             continue
-        stockids = photo.get('stockids', {})
-        ids = [str(v) for k, v in stockids.items() if k in _RELEVANT_STOCKS and v]
-        if not ids:
-            continue
+        stockids = photo.get('stockids') or {}
         primary = _pick_primary(stockids)
         if not primary:
             continue
+        ms_authoritative[primary] = gname
+
+    # Purge: collect all aids managed by MS+ (primary + their match cluster
+    # siblings), then strip them from every existing group.
+    aid_to_key_purge = {m: k for k, members in matches.items() for m in members}
+    purge_aids = set()
+    for primary in ms_authoritative:
+        purge_aids.add(primary)
+        ck = aid_to_key_purge.get(primary)
+        if ck:
+            purge_aids.update(matches.get(ck, []))
+    if purge_aids:
+        for gname in list(groups.keys()):
+            groups[gname] = [a for a in groups[gname] if a not in purge_aids]
+
+    photos_synced = 0
+    for primary, gname in ms_authoritative.items():
         if gname not in groups:
             groups[gname] = []
         if primary not in groups[gname]:
@@ -3922,9 +5109,27 @@ def api_sync_start():
         return jsonify({"ok": False, "msg": "already running"})
     data  = request.get_json(force=True, silent=True) or {}
     stock = data.get('stock', '').strip()
+
+    def _run_single(name, u):
+        # Properly manage sync state so UI sees correct running/done flow
+        _sync_all_active[0]    = True
+        _sync_stop_flag[0]     = False
+        _sync_state["running"] = True
+        _sync_state["log"]     = []
+        try:
+            _sync_log(f"🚀 Single-stock sync: {name}")
+            _collect_one_stock_global(name, u)
+            _sync_log(f"✅ {name}: done")
+        except Exception as ex:
+            _sync_log(f"🛑 {name}: {ex}")
+        finally:
+            _sync_all_active[0]    = False
+            _sync_stop_flag[0]     = False
+            _sync_state["running"] = False
+
     if stock and stock in STOCK_URLS:
         url = STOCK_URLS[stock]
-        threading.Thread(target=_collect_one_stock_global, args=(stock, url), daemon=True).start()
+        threading.Thread(target=_run_single, args=(stock, url), daemon=True).start()
     else:
         threading.Thread(target=_sync_all_global, daemon=True).start()
     return jsonify({"ok": True})
@@ -4307,8 +5512,10 @@ def load_match_thumb(asset_id, thumb_url):
         r = req_lib.get(clean_url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code == 200:
             img = Image.open(BytesIO(r.content)).convert("RGB")
-            img = ImageOps.fit(img, (200, 200), Image.Resampling.LANCZOS)
-            img.save(path, "JPEG", quality=85)
+            # 400x400 JPEG 88 — same form as load_img() and MS+ thumbs.
+            # Consistent input → consistent pHash → reliable cross-matching.
+            img = ImageOps.fit(img, (400, 400), Image.Resampling.LANCZOS)
+            img.save(path, "JPEG", quality=88)
             # Adobe pHash MUST come from the clean version, not the watermarked img_cache one.
             _save_asset_meta("Adobe Stock", asset_id, path)
             return path
@@ -4362,10 +5569,19 @@ def load_ms_library() -> list:
         return []
 
 def save_ms_library(photos: list):
+    """⚠️ Dedup by basepath — UNIQUE per MS+ photo. The previous
+    (directory, filename) key was buggy: my new MS+ direct stores 'group' not
+    'directory', so dedup key became ('', filename) → all photos with same
+    camera filename collapsed → lost 40% of records (15K→9K)."""
     global _ms_library_cache, _ms_library_mtime
     seen = set(); deduped = []
     for p in photos:
-        k = (p.get("directory",""), p.get("filename",""))
+        # Prefer basepath (unique), fall back to legacy (directory, filename)
+        bp = p.get("basepath", "").strip()
+        if bp:
+            k = ("bp", bp)
+        else:
+            k = ("legacy", p.get("directory",""), p.get("filename",""))
         if k not in seen:
             seen.add(k); deduped.append(p)
     with open(MS_LIBRARY_FILE, "w", encoding="utf-8") as f:
