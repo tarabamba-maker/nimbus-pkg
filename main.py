@@ -1541,6 +1541,28 @@ def _getty_collect_direct():
     to download TSV statements. Returns True on success."""
     _sync_log("🚀 Getty direct: старт...")
 
+    # Once-per-month gate: Getty publishes statements monthly (around the 21st).
+    # Skip entire collector if already ran this calendar month, UNLESS today is
+    # past the 21st and last run was before the 21st (new statement just dropped).
+    from datetime import date as _date_gt
+    today = _date_gt.today()
+    proc_file_gt = os.path.join(RECIPES_DIR, "_processed_dates.json")
+    try:
+        with open(proc_file_gt) as _f: _pd_gt = json.load(_f)
+    except Exception:
+        _pd_gt = {}
+    last_run_str = _pd_gt.get("Getty_last_run", "")
+    try:
+        from datetime import datetime as _dt_gt
+        last_run = _dt_gt.strptime(last_run_str, "%Y-%m-%d").date() if last_run_str else None
+    except Exception:
+        last_run = None
+    if last_run and last_run.strftime("%Y-%m") == today.strftime("%Y-%m"):
+        # Same month — only re-run if statement-release window crossed (21st).
+        if not (today.day >= 21 and last_run.day < 21):
+            _sync_log(f"⏭️  Getty: вже синкався {last_run_str} (раз на місяць досить) — skip")
+            return True
+
     safari_path = os.path.expanduser(
         "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
     if not os.path.exists(safari_path):
@@ -1793,16 +1815,17 @@ def _getty_collect_direct():
                 time.sleep(0.1)
         _sync_log(f"✅ Getty direct thumbs: оновлено для {thumb_updated} активів")
 
-    # Mark month as done so we don't refetch next time
-    proc_file = os.path.join(RECIPES_DIR, "_processed_dates.json")
+    # Mark Getty fully synced today — collector will skip until next month
+    # (or until day-21 statement release if last run was earlier in same month).
     try:
         try:
-            with open(proc_file) as _f: pd = json.load(_f)
+            with open(proc_file_gt) as _f: pd = json.load(_f)
         except Exception:
             pd = {}
         from datetime import date as _date
         pd["Getty_auto_month"] = _date.today().strftime("%Y-%m")
-        with open(proc_file, "w") as _f:
+        pd["Getty_last_run"]  = _date.today().strftime("%Y-%m-%d")
+        with open(proc_file_gt, "w") as _f:
             json.dump(pd, _f, indent=2)
     except Exception:
         pass
