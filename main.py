@@ -1606,6 +1606,30 @@ def _getty_collect_direct():
             periods.append((val[:4], val[5:7]))
     _sync_log(f"📋 Getty direct: {len(periods)} statements available")
 
+    # Early-stop: skip statements we've already fully imported.
+    # Past months (NOT current month) don't change retroactively, so once
+    # downloaded + parsed they're frozen. Re-fetching them wastes ~5-10 min
+    # per sync. Current month always re-fetched (new sales may appear).
+    proc_file = os.path.join(RECIPES_DIR, "_processed_dates.json")
+    try:
+        with open(proc_file) as _f: _pd = json.load(_f)
+    except Exception:
+        _pd = {}
+    done_statements = set(_pd.get("Getty_statements", []))
+    from datetime import date as _date_g
+    cur_ym = _date_g.today().strftime("%Y-%m")
+    skipped_periods = 0
+    periods_to_fetch = []
+    for year, month in periods:
+        label = f"{year}-{month}"
+        if label != cur_ym and label in done_statements:
+            skipped_periods += 1
+            continue
+        periods_to_fetch.append((year, month))
+    if skipped_periods:
+        _sync_log(f"⏭️  Getty: пропущено {skipped_periods} уже оброблених statements")
+    periods = periods_to_fetch
+
     # Step 3: parse + import TSV per period
     import csv as _csv, io as _io
     total_saved = total_skipped = 0
@@ -1681,7 +1705,16 @@ def _getty_collect_direct():
         added = total_saved - before
         if added:
             _sync_log(f"  📆 {label}: +{added} нових")
+        # Mark statement as processed (skip on next sync if not current month).
+        # Current month is intentionally NOT added so it stays refetched.
+        if label != cur_ym:
+            done_statements.add(label)
         time.sleep(0.3)
+
+    _pd["Getty_statements"] = sorted(done_statements)
+    try:
+        with open(proc_file, "w") as _f: json.dump(_pd, _f, indent=2)
+    except Exception: pass
 
     _sync_log(f"✅ Getty direct: +{total_saved} нових, {total_skipped} дублікатів")
 
