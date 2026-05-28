@@ -221,6 +221,16 @@ _STOCK_KEY = {
 
 def init_db():
     with sqlite3.connect(DB_NAME, timeout=15) as c:
+        # Concurrency + speed PRAGMAs. WAL lets readers run in parallel with
+        # writers; synchronous=NORMAL is safe with WAL and 2-5× faster than
+        # FULL on heavy insert sessions. journal_mode is persistent on the DB
+        # file, but cheap to set every startup.
+        try:
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA synchronous=NORMAL")
+            c.execute("PRAGMA temp_store=MEMORY")
+            c.execute("PRAGMA mmap_size=268435456")
+        except Exception: pass
         c.execute('''CREATE TABLE IF NOT EXISTS sales (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             asset_id TEXT, photo_name TEXT,
@@ -230,6 +240,10 @@ def init_db():
             filename TEXT)''')
         try: c.execute("ALTER TABLE sales ADD COLUMN filename TEXT")
         except Exception: pass
+        # Covers is_already_saved() (stock+asset_id+date prefix) and feed/stats
+        # range scans by date. Without this each dedup check is a full table scan.
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sales_dedup ON sales(stock, asset_id, date)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sales_date  ON sales(date)")
 
         # Per-asset perceptual hash + dominant RGB + aspect_ratio for visual matching.
         c.execute('''CREATE TABLE IF NOT EXISTS asset_meta (
@@ -4409,23 +4423,34 @@ def api_group_names():
     return jsonify(sorted(ms_names | user_names))
 
 
-def _hash_based_matches(existing_matches, threshold=4):
+def _hash_based_matches(existing_matches, threshold=4, incremental_from_rowid=None):
     """
     Augment existing matches with perceptual-hash-based pairs.
-    For all (stock, asset_id) in asset_meta, find visually similar across stocks
-    (Hamming distance ≤ threshold) and merge into existing match groups.
-    Returns merged matches dict + count of new pairs found.
+
+    Full mode (incremental_from_rowid=None): compare all × all asset_meta rows.
+    Incremental mode: only compare pairs where at least ONE side has rowid >
+    incremental_from_rowid. Pairs of two "old" rows were already processed in
+    a prior rebuild and merged into `existing_matches` — reprocessing them is
+    wasted work. Same matching threshold, same merge logic. Drops from O(n²)
+    to O(n·k) where k = count of new rows.
+
+    Returns (matches, new_pairs, max_rowid).
     """
     with sqlite3.connect(DB_NAME, timeout=15) as c:
         rows = c.execute(
-            "SELECT stock, asset_id, thumb_hash, aspect_ratio, r, g, b FROM asset_meta "
+            "SELECT rowid, stock, asset_id, thumb_hash, aspect_ratio, r, g, b FROM asset_meta "
             "WHERE thumb_hash IS NOT NULL AND thumb_hash != ''"
         ).fetchall()
     if not rows:
-        return existing_matches, 0
+        return existing_matches, 0, 0
 
-    # Index: aid -> (stock, hash, ar, r, g, b)
-    by_aid = {aid: (stock, h, ar, r, g, b) for stock, aid, h, ar, r, g, b in rows}
+    max_rowid = max(r[0] for r in rows)
+    by_aid = {aid: (stock, h, ar, r, g, b)
+              for _rid, stock, aid, h, ar, r, g, b in rows}
+    new_aids = (
+        {aid for rid, _s, aid, *_ in rows if rid > incremental_from_rowid}
+        if incremental_from_rowid is not None else None
+    )
 
     # Build aid -> set(group members) from existing matches for fast merging
     aid_to_group_key = {}
@@ -4435,50 +4460,58 @@ def _hash_based_matches(existing_matches, threshold=4):
 
     new_pairs = 0
     aids = list(by_aid.keys())
-    # O(n^2) is OK for ≤ ~10k assets. For larger, would need LSH.
-    for i, aid_a in enumerate(aids):
+
+    def _pair_iter():
+        if new_aids is None:
+            for i, a in enumerate(aids):
+                for b in aids[i+1:]:
+                    yield a, b
+            return
+        new_list = [a for a in aids if a in new_aids]
+        old_list = [a for a in aids if a not in new_aids]
+        for i, na in enumerate(new_list):
+            for nb in new_list[i+1:]:
+                yield na, nb
+            for ob in old_list:
+                yield na, ob
+
+    for aid_a, aid_b in _pair_iter():
         sa, ha, ara, ra, ga, ba = by_aid[aid_a]
-        for aid_b in aids[i+1:]:
-            sb, hb, arb, rb, gb, bb = by_aid[aid_b]
-            if sa == sb:
-                continue  # same stock, can't be cross-stock match
-            # ⚠️ STRICT — false positives between similar but different shoots
-            # were polluting clusters (office workers landing in beauty group etc.)
-            if ara and arb and abs(ara - arb) > 0.05:
-                continue  # aspect ratios too different
-            if _hamming_hex(ha, hb) > threshold:
+        sb, hb, arb, rb, gb, bb = by_aid[aid_b]
+        if sa == sb:
+            continue
+        if ara and arb and abs(ara - arb) > 0.05:
+            continue
+        if _hamming_hex(ha, hb) > threshold:
+            continue
+        try:
+            if (isinstance(ra, int) and isinstance(rb, int) and
+                isinstance(ga, int) and isinstance(gb, int) and
+                isinstance(ba, int) and isinstance(bb, int) and
+                (abs(ra - rb) + abs(ga - gb) + abs(ba - bb)) > 45):
                 continue
-            # Dominant-color check: total RGB distance must be ≤ 45 (≈15 per channel)
-            try:
-                if (isinstance(ra, int) and isinstance(rb, int) and
-                    isinstance(ga, int) and isinstance(gb, int) and
-                    isinstance(ba, int) and isinstance(bb, int) and
-                    (abs(ra - rb) + abs(ga - gb) + abs(ba - bb)) > 45):
-                    continue
-            except Exception:
-                pass  # Don't let bad data block matching
-            # Found a visual match. Merge groups.
-            ga = aid_to_group_key.get(aid_a)
-            gb = aid_to_group_key.get(aid_b)
-            if ga and gb:
-                if ga == gb: continue
-                # merge gb into ga
-                existing_matches[ga] = sorted(set(existing_matches.get(ga, []) + existing_matches.get(gb, [])))
-                for m in existing_matches.get(gb, []):
-                    aid_to_group_key[m] = ga
-                existing_matches.pop(gb, None)
-            elif ga:
-                existing_matches[ga] = sorted(set(existing_matches[ga] + [aid_b]))
-                aid_to_group_key[aid_b] = ga
-            elif gb:
-                existing_matches[gb] = sorted(set(existing_matches[gb] + [aid_a]))
-                aid_to_group_key[aid_a] = gb
-            else:
-                existing_matches[aid_a] = sorted([aid_a, aid_b])
-                aid_to_group_key[aid_a] = aid_a
-                aid_to_group_key[aid_b] = aid_a
-            new_pairs += 1
-    return existing_matches, new_pairs
+        except Exception:
+            pass
+        ga = aid_to_group_key.get(aid_a)
+        gb = aid_to_group_key.get(aid_b)
+        if ga and gb:
+            if ga == gb: continue
+            existing_matches[ga] = sorted(set(existing_matches.get(ga, []) + existing_matches.get(gb, [])))
+            for m in existing_matches.get(gb, []):
+                aid_to_group_key[m] = ga
+            existing_matches.pop(gb, None)
+        elif ga:
+            existing_matches[ga] = sorted(set(existing_matches[ga] + [aid_b]))
+            aid_to_group_key[aid_b] = ga
+        elif gb:
+            existing_matches[gb] = sorted(set(existing_matches[gb] + [aid_a]))
+            aid_to_group_key[aid_a] = gb
+        else:
+            existing_matches[aid_a] = sorted([aid_a, aid_b])
+            aid_to_group_key[aid_a] = aid_a
+            aid_to_group_key[aid_b] = aid_a
+        new_pairs += 1
+    return existing_matches, new_pairs, max_rowid
 
 
 @flask_app.route('/api/refresh-istock-thumbs', methods=['POST'])
@@ -4999,7 +5032,18 @@ def api_rebuild_matches():
         return None
 
     # ── Pass A: pHash+RGB clustering (PRIMARY) ───────────────────────────
-    matches, hash_pairs = _hash_based_matches({})
+    # Incremental: skip pairs of old × old rows (already processed last time).
+    _state_file = os.path.join(RECIPES_DIR, '_matches_state.json')
+    try:
+        with open(_state_file) as _f:
+            _last_rowid = json.load(_f).get('last_asset_meta_rowid')
+    except Exception:
+        _last_rowid = None
+    if _last_rowid is None:
+        matches, hash_pairs, _new_max_rowid = _hash_based_matches({}, incremental_from_rowid=None)
+    else:
+        matches, hash_pairs, _new_max_rowid = _hash_based_matches(
+            _load_matches(), incremental_from_rowid=_last_rowid)
 
     # ── Pass B: ms_library stockids (FALLBACK) ───────────────────────────
     aid_to_key = {m: k for k, members in matches.items() for m in members}
@@ -5119,6 +5163,13 @@ def api_rebuild_matches():
     # ── Pass H: apply manual overrides (always wins) ────────────────────
     matches, override_changes = _apply_manual_overrides(matches, overrides)
     _save_matches(matches)
+
+    # Persist incremental cursor — next rebuild will skip rows ≤ this rowid.
+    try:
+        with open(_state_file, 'w') as _f:
+            json.dump({'last_asset_meta_rowid': _new_max_rowid}, _f)
+    except Exception:
+        pass
 
     return jsonify({'status': 'ok',
                     'entries': len(matches),
@@ -5592,7 +5643,7 @@ def load_img(asset_id, url, stock=None):
     return None
 
 from concurrent.futures import ThreadPoolExecutor as _TPE
-_img_executor  = _TPE(max_workers=5)
+_img_executor  = _TPE(max_workers=14)
 _http_executor = _TPE(max_workers=8)
 atexit.register(lambda: (_img_executor.shutdown(wait=False), _http_executor.shutdown(wait=False)))
 

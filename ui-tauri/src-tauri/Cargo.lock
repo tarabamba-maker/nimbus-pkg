@@ -4373,7 +4373,7 @@ dependencies = [
 
 [[package]]
 name = "ui-tauri"
-version = "0.9.34"
+version = "0.9.35"
 dependencies = [
  "dirs-next",
  "serde",
