@@ -4809,16 +4809,18 @@ def _ms_fname_to_libentry(disk_base, lib_filenames):
     return None
 
 
-def _ms_visual_matches(aid_to_group, strict_hamming=4, loose_hamming=8, loose_rgb_max=20,
-                       last_asset_meta_rowid=None, last_ms_meta_rowid=None):
+def _ms_visual_matches(aid_to_group, strict_hamming=4, loose_hamming=8, loose_rgb_max=20):
     """
     Two-tier MS+ visual matching for sales aids without a group.
-
-    Incremental mode: if either cursor is set, a pair (sale × ms) is processed
-    only when at least ONE side has rowid > last cursor. Pairs of two "old"
-    rows were already evaluated in a prior rebuild — their outcome is
-    deterministic (thresholds + hash values are immutable), so reprocessing
-    them yields the same verdict. Drops from 60M comparisons to k*15k+10k*j.
+    ⚠️ STRICT thresholds — both sides are clean (no watermark) thumbnails of
+    the SAME source photo. Identical photos give hamming 0-2; 4 accommodates
+    JPEG/resize artifacts. Old 8/12 was catching false positives between
+    similar-but-different shoots (office vs beauty).
+      - strict tier:  hamming ≤ 4 + RGB distance ≤ 30 (identical photo)
+      - loose tier:   hamming ≤ 8 + RGB distance ≤ 20 (same shoot variant)
+                      (catches near-duplicates from same shoot with slightly
+                       different crop/edit — only accepted when colors are
+                       near-identical, ruling out false positives)
 
     aid_to_group: existing {aid -> gname} map (mutated for new assignments)
     Returns: {gname: [new_aids...]} additions to apply to photo_groups.
@@ -4847,24 +4849,13 @@ def _ms_visual_matches(aid_to_group, strict_hamming=4, loose_hamming=8, loose_rg
 
     with sqlite3.connect(DB_NAME, timeout=15) as c:
         sales_rows = c.execute(
-            "SELECT rowid, stock, asset_id, thumb_hash, aspect_ratio, r, g, b FROM asset_meta "
+            "SELECT stock, asset_id, thumb_hash, aspect_ratio, r, g, b FROM asset_meta "
             "WHERE thumb_hash IS NOT NULL AND thumb_hash != ''"
         ).fetchall()
         ms_rows = c.execute(
-            "SELECT rowid, fname, thumb_hash, aspect_ratio, r, g, b FROM ms_meta "
+            "SELECT fname, thumb_hash, aspect_ratio, r, g, b FROM ms_meta "
             "WHERE thumb_hash IS NOT NULL AND thumb_hash != ''"
         ).fetchall()
-    new_sale_aids = (
-        {str(aid) for rid, _s, aid, *_ in sales_rows if rid > last_asset_meta_rowid}
-        if last_asset_meta_rowid is not None else None
-    )
-    new_ms_fnames = (
-        {fn for rid, fn, *_ in ms_rows if rid > last_ms_meta_rowid}
-        if last_ms_meta_rowid is not None else None
-    )
-    # Strip rowid from rows for downstream code (was originally 7/6 columns).
-    sales_rows = [(s, a, h, ar, r, g, b) for _rid, s, a, h, ar, r, g, b in sales_rows]
-    ms_rows    = [(fn, h, ar, r, g, b)    for _rid, fn, h, ar, r, g, b in ms_rows]
 
     if not ms_rows:
         return {}
@@ -4882,25 +4873,19 @@ def _ms_visual_matches(aid_to_group, strict_hamming=4, loose_hamming=8, loose_rg
                 gn = fname_to_group.get(base)
         if not gn:
             continue
-        is_new_ms = (new_ms_fnames is None) or (fname in new_ms_fnames)
-        ms_resolved.append((gn, h, int(h, 16), ar, r, g, b, is_new_ms))
+        ms_resolved.append((gn, h, int(h, 16), ar, r, g, b))
 
     additions = {}
     for stock, aid, ha, ara, ra, ga, ba in sales_rows:
         aid = str(aid)
         if aid in aid_to_group:
             continue  # already grouped — skip
-        is_new_sale = (new_sale_aids is None) or (aid in new_sale_aids)
         try:
             ha_int = int(ha, 16)
         except Exception:
             continue
         best = None  # (hamming, gname)
-        for gn, hb, hb_int, arb, rb, gb, bb, is_new_ms in ms_resolved:
-            # Incremental: skip if BOTH sides are old (already evaluated in
-            # a previous rebuild — same hashes + same thresholds → same verdict).
-            if not is_new_sale and not is_new_ms:
-                continue
+        for gn, hb, hb_int, arb, rb, gb, bb in ms_resolved:
             if ara and arb and abs(ara - arb) > 0.15:
                 continue
             # fast hamming via xor + popcount
@@ -5060,20 +5045,17 @@ def _apply_manual_overrides(matches, overrides):
 def api_rebuild_matches():
     """Rebuild cross-stock matches + sync ms_library groups into photo_groups.json.
 
-    Pass order:
-      A. pHash+RGB clustering — INCREMENTAL (skip OLD×OLD pairs)
-      B. ms_library stockids — SKIP when ms_library unchanged
-      C. Filename fallback (cheap, always)
-      D. Sync MS+ groups → photo_groups — DIFF-BASED (snapshot)
-      E. Auto-propagate via clusters (cheap, always)
-      F. MS+ visual matching — INCREMENTAL (cursors both sides)
+    Pass order (approved with user):
+      0. Load manual overrides
+      A. pHash+RGB clustering (PRIMARY)
+      B. ms_library stockids (FALLBACK — adds links pHash missed)
+      C. Filename fallback (ms_library candidates verified via pHash+RGB)
+      D. Sync MS+ groups → photo_groups
+      E. Auto-propagate groups via match clusters
+      F. MS+ visual matching (img_cache_ms references)
       G. Dedup
-      H. Apply manual overrides
-
-    Early-exit: if asset_meta + ms_meta rowids AND ms_library fingerprint all
-    unchanged since last rebuild, return cached counts without running passes.
+      H. Apply manual overrides (always wins)
     """
-    import hashlib
     lib = load_ms_library()
     overrides = _load_overrides()
     _PRIMARY_PRIORITY = ['adobestock', 'shutterstock', 'istock', 'esp', 'depositphotos']
@@ -5081,155 +5063,96 @@ def api_rebuild_matches():
     def _pick_primary(stockids):
         for key in _PRIMARY_PRIORITY:
             v = stockids.get(key)
-            if v: return str(v)
+            if v:
+                return str(v)
         return None
 
-    # ── State + change detection ─────────────────────────────────────────
-    _state_file    = os.path.join(RECIPES_DIR, '_matches_state.json')
-    _snapshot_file = os.path.join(RECIPES_DIR, '_ms_group_snapshot.json')
+    # ── Pass A: pHash+RGB clustering (PRIMARY) ───────────────────────────
+    # Incremental: skip pairs of old × old rows (already processed last time).
+    _state_file = os.path.join(RECIPES_DIR, '_matches_state.json')
     try:
-        with open(_state_file) as _f: _state = json.load(_f)
+        with open(_state_file) as _f:
+            _last_rowid = json.load(_f).get('last_asset_meta_rowid')
     except Exception:
-        _state = {}
-    _last_am_rowid = _state.get('last_asset_meta_rowid')
-    _last_mm_rowid = _state.get('last_ms_meta_rowid')
-    _last_lib_fp   = _state.get('last_ms_lib_fingerprint')
-
-    with sqlite3.connect(DB_NAME, timeout=15) as _c:
-        _r = _c.execute("SELECT MAX(rowid) FROM asset_meta WHERE thumb_hash IS NOT NULL AND thumb_hash != ''").fetchone()
-        _cur_am_rowid = _r[0] or 0
-        _r = _c.execute("SELECT MAX(rowid) FROM ms_meta WHERE thumb_hash IS NOT NULL AND thumb_hash != ''").fetchone()
-        _cur_mm_rowid = _r[0] or 0
-
-    _h = hashlib.sha1()
-    for p in sorted(lib, key=lambda x: x.get('basepath', '')):
-        _h.update(repr((p.get('basepath', ''), p.get('group', ''),
-                        tuple(sorted((p.get('stockids') or {}).items())))).encode())
-    _cur_lib_fp = _h.hexdigest()
-
-    am_unchanged  = (_last_am_rowid == _cur_am_rowid)
-    mm_unchanged  = (_last_mm_rowid == _cur_mm_rowid)
-    lib_unchanged = (_last_lib_fp == _cur_lib_fp)
-
-    # ── Early exit ───────────────────────────────────────────────────────
-    matches_path = os.path.join(RECIPES_DIR, '_cross_stock_matches.json')
-    if (am_unchanged and mm_unchanged and lib_unchanged
-            and _last_am_rowid is not None and os.path.exists(matches_path)):
-        cur_matches = _load_matches()
-        cur_groups  = load_groups()
-        return jsonify({'status': 'ok', 'cached': True,
-                        'entries': len(cur_matches),
-                        'photos': 0, 'groups': len(cur_groups),
-                        'hash_pairs': 0, 'ms_lib_pairs': 0,
-                        'filename_pairs': 0, 'auto_grouped': 0,
-                        'ms_visual_grouped': 0, 'override_changes': 0})
-
-    # ── Pass A: pHash+RGB clustering (incremental) ───────────────────────
-    if _last_am_rowid is None:
-        matches, hash_pairs, _new_am_rowid = _hash_based_matches({}, incremental_from_rowid=None)
+        _last_rowid = None
+    if _last_rowid is None:
+        matches, hash_pairs, _new_max_rowid = _hash_based_matches({}, incremental_from_rowid=None)
     else:
-        matches, hash_pairs, _new_am_rowid = _hash_based_matches(
-            _load_matches(), incremental_from_rowid=_last_am_rowid)
+        matches, hash_pairs, _new_max_rowid = _hash_based_matches(
+            _load_matches(), incremental_from_rowid=_last_rowid)
 
-    # ── Pass B: ms_library stockids — skip when lib unchanged ────────────
+    # ── Pass B: ms_library stockids (FALLBACK) ───────────────────────────
     aid_to_key = {m: k for k, members in matches.items() for m in members}
     ms_added_pairs = 0
-    if not lib_unchanged or _last_lib_fp is None:
-        for photo in lib:
-            stockids = photo.get('stockids', {})
-            ids = [str(v) for k, v in stockids.items() if k in _RELEVANT_STOCKS and v]
-            if len(ids) < 2: continue
-            existing_keys = {aid_to_key[i] for i in ids if i in aid_to_key}
-            if existing_keys:
-                target = sorted(existing_keys)[0]
-                combined = set(matches.get(target, []))
-                for k in existing_keys - {target}:
-                    combined.update(matches.pop(k, []))
-                combined.update(ids)
-                matches[target] = sorted(combined)
-                for m in matches[target]:
-                    aid_to_key[m] = target
-            else:
-                primary = _pick_primary(stockids) or ids[0]
-                matches[primary] = sorted(set(ids))
-                for m in ids:
-                    aid_to_key[m] = primary
-                ms_added_pairs += len(ids) - 1
+    for photo in lib:
+        stockids = photo.get('stockids', {})
+        ids = [str(v) for k, v in stockids.items() if k in _RELEVANT_STOCKS and v]
+        if len(ids) < 2:
+            continue
+        # Merge these ids into a single cluster, picking primary by priority.
+        # If any of these ids is already in a pHash cluster, merge into that.
+        existing_keys = {aid_to_key[i] for i in ids if i in aid_to_key}
+        if existing_keys:
+            target = sorted(existing_keys)[0]   # deterministic merge target
+            combined = set(matches.get(target, []))
+            for k in existing_keys - {target}:
+                combined.update(matches.pop(k, []))
+            combined.update(ids)
+            matches[target] = sorted(combined)
+            for m in matches[target]:
+                aid_to_key[m] = target
+        else:
+            primary = _pick_primary(stockids) or ids[0]
+            matches[primary] = sorted(set(ids))
+            for m in ids:
+                aid_to_key[m] = primary
+            ms_added_pairs += len(ids) - 1
 
     # ── Pass C: filename fallback ────────────────────────────────────────
     matches, fn_pairs = _filename_fallback_matches(matches, lib)
+
     _save_matches(matches)
 
-    # ── Pass D: sync MS+ groups → photo_groups (DIFF-BASED) ──────────────
-    # Build current MS+ authoritative {primary → group}.
+    # ── Pass D: sync ms_library groups → photo_groups.json ───────────────
+    # MS+ is master: build authoritative {primary_id → gname} from current MS+
+    # state. Then PURGE any MS+-managed aid (primary + cluster siblings) from
+    # ALL existing groups before re-adding. This makes MS+ folder moves propagate
+    # to local groups: if a photo was moved between MS+ folders, the old local
+    # group loses it and the new one gains it (instead of duplicating).
     groups = load_groups()
-    ms_authoritative = {}
+    ms_authoritative = {}   # primary_id → gname
     for photo in lib:
         gname = (photo.get('group') or '').strip()
-        if not gname: continue
+        if not gname:
+            continue
         stockids = photo.get('stockids') or {}
         primary = _pick_primary(stockids)
-        if not primary: continue
+        if not primary:
+            continue
         ms_authoritative[primary] = gname
 
-    # Load previous snapshot. First-time run: full processing.
-    try:
-        with open(_snapshot_file) as _f: _snapshot = json.load(_f)
-    except Exception:
-        _snapshot = {}
-
+    # Purge: collect all aids managed by MS+ (primary + their match cluster
+    # siblings), then strip them from every existing group.
     aid_to_key_purge = {m: k for k, members in matches.items() for m in members}
+    purge_aids = set()
+    for primary in ms_authoritative:
+        purge_aids.add(primary)
+        ck = aid_to_key_purge.get(primary)
+        if ck:
+            purge_aids.update(matches.get(ck, []))
+    if purge_aids:
+        for gname in list(groups.keys()):
+            groups[gname] = [a for a in groups[gname] if a not in purge_aids]
+
     photos_synced = 0
+    for primary, gname in ms_authoritative.items():
+        if gname not in groups:
+            groups[gname] = []
+        if primary not in groups[gname]:
+            groups[gname].append(primary)
+            photos_synced += 1
 
-    if not _snapshot:
-        # First run after migration / fresh DB — do classic full Pass D so that
-        # initial state is consistent. Subsequent runs use diff-based path below.
-        purge_aids = set()
-        for primary in ms_authoritative:
-            purge_aids.add(primary)
-            ck = aid_to_key_purge.get(primary)
-            if ck:
-                purge_aids.update(matches.get(ck, []))
-        if purge_aids:
-            for gname in list(groups.keys()):
-                groups[gname] = [a for a in groups[gname] if a not in purge_aids]
-        for primary, gname in ms_authoritative.items():
-            if gname not in groups: groups[gname] = []
-            if primary not in groups[gname]:
-                groups[gname].append(primary)
-                photos_synced += 1
-    else:
-        # Diff against last snapshot: only touch primaries whose MS+ assignment
-        # actually changed. Primaries that MS+ didn't move stay wherever the
-        # user put them — this is how user UI moves survive across rebuilds.
-        diff_added = {p: g for p, g in ms_authoritative.items() if p not in _snapshot}
-        diff_moved = {p: g for p, g in ms_authoritative.items()
-                      if p in _snapshot and _snapshot[p] != g}
-
-        # Apply moved: purge primary+siblings from OLD MS+ group only, add to NEW.
-        for primary, new_gname in diff_moved.items():
-            old_gname = _snapshot.get(primary, '')
-            purge_set = {primary}
-            ck = aid_to_key_purge.get(primary)
-            if ck:
-                purge_set.update(matches.get(ck, []))
-            if old_gname in groups:
-                groups[old_gname] = [a for a in groups[old_gname] if a not in purge_set]
-            if new_gname not in groups:
-                groups[new_gname] = []
-            if primary not in groups[new_gname]:
-                groups[new_gname].append(primary)
-                photos_synced += 1
-
-        # Apply added: new primary appears for the first time — place in MS+ group.
-        for primary, gname in diff_added.items():
-            if gname not in groups:
-                groups[gname] = []
-            if primary not in groups[gname]:
-                groups[gname].append(primary)
-                photos_synced += 1
-
-    # ── Pass E: auto-propagate via match clusters ────────────────────────
+    # ── Pass E: auto-propagate groups via match clusters ────────────────
     aid_to_group = {}
     for gname, aids in groups.items():
         for aid in aids:
@@ -5244,30 +5167,25 @@ def api_rebuild_matches():
     for gname in list(groups.keys()):
         for aid in list(groups[gname]):
             mkey = aid_to_matchkey.get(aid)
-            if not mkey: continue
+            if not mkey:
+                continue
             for sib in matches.get(mkey, []):
-                if sib == aid or sib in aid_to_group: continue
+                if sib == aid or sib in aid_to_group:
+                    continue
                 groups[gname].append(sib)
                 aid_to_group[sib] = gname
                 auto_added += 1
 
-    # ── Pass F: MS+ visual matching (incremental) ────────────────────────
+    # ── Pass F: MS+ visual matching against img_cache_ms/ reference ─────
     ms_added = 0
-    if am_unchanged and mm_unchanged and _last_am_rowid is not None:
-        ms_additions = {}
-    else:
-        ms_additions = _ms_visual_matches(
-            aid_to_group,
-            last_asset_meta_rowid=_last_am_rowid,
-            last_ms_meta_rowid=_last_mm_rowid,
-        )
+    ms_additions = _ms_visual_matches(aid_to_group)
     for gname, aids in ms_additions.items():
         if gname not in groups:
             groups[gname] = []
         groups[gname].extend(aids)
         ms_added += len(aids)
 
-    # ── Pass G: dedup ────────────────────────────────────────────────────
+    # ── Pass G: dedup group lists ───────────────────────────────────────
     for gname in list(groups.keys()):
         seen: set = set()
         deduped = []
@@ -5278,23 +5196,16 @@ def api_rebuild_matches():
         groups[gname] = deduped
     save_groups(groups)
 
-    # ── Pass H: apply manual overrides ───────────────────────────────────
+    # ── Pass H: apply manual overrides (always wins) ────────────────────
     matches, override_changes = _apply_manual_overrides(matches, overrides)
     _save_matches(matches)
 
-    # ── Persist state ────────────────────────────────────────────────────
+    # Persist incremental cursor — next rebuild will skip rows ≤ this rowid.
     try:
         with open(_state_file, 'w') as _f:
-            json.dump({
-                'last_asset_meta_rowid':   _cur_am_rowid,
-                'last_ms_meta_rowid':      _cur_mm_rowid,
-                'last_ms_lib_fingerprint': _cur_lib_fp,
-            }, _f)
-    except Exception: pass
-    try:
-        with open(_snapshot_file, 'w') as _f:
-            json.dump(ms_authoritative, _f)
-    except Exception: pass
+            json.dump({'last_asset_meta_rowid': _new_max_rowid}, _f)
+    except Exception:
+        pass
 
     return jsonify({'status': 'ok',
                     'entries': len(matches),

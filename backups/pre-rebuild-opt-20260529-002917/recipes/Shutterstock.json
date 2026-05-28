@@ -1,0 +1,118 @@
+{
+  "stock": "Shutterstock",
+  "url": "https://submit.shutterstock.com/earnings",
+  "actions": [
+    {
+      "type": "click",
+      "selector": "[data-testid=\"MonetizationOnOutlinedIcon\"]"
+    },
+    {
+      "type": "click",
+      "selector": "div:nth-child(5) > div:nth-child(3) > ul:nth-child(4) > li:nth-child(1) > a:nth-child(1) > div:nth-child(2) > span:nth-child(1)"
+    },
+    {
+      "type": "click",
+      "selector": "div:nth-child(1) > div:nth-child(2) > div:nth-child(2) > header:nth-child(1) > div:nth-child(1) > div:nth-child(2) > div:nth-child(1) > div:nth-child(1) > a:nth-child(1) > p:nth-child(1)"
+    },
+    {
+      "type": "click",
+      "selector": "[data-testid=\"DateLinkCell-2026-04-01\"]"
+    },
+    {
+      "type": "click",
+      "selector": "div:nth-child(6) > div:nth-child(3) > div:nth-child(1) > div:nth-child(1) > div:nth-child(2) > div:nth-child(1) > div:nth-child(3) > div:nth-child(1) > table:nth-child(1) > tbody:nth-child(2) > tr:nth-child(1)"
+    },
+    {
+      "type": "click",
+      "selector": "div:nth-child(6) > div:nth-child(3) > div:nth-child(1) > div:nth-child(1) > div:nth-child(2) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(4) > button:nth-child(1) > p:nth-child(1)"
+    },
+    {
+      "type": "click",
+      "selector": "[data-testid=\"KeyboardArrowRightIcon\"]"
+    },
+    {
+      "type": "click",
+      "selector": "[data-testid=\"KeyboardArrowRightIcon\"]"
+    },
+    {
+      "type": "click",
+      "selector": "[data-testid=\"table-pagination\"]"
+    },
+    {
+      "type": "click",
+      "selector": "div:nth-child(6) > div:nth-child(3) > div:nth-child(1) > div:nth-child(1) > h2:nth-child(1) > button:nth-child(2) > svg:nth-child(1) > path:nth-child(1)"
+    },
+    {
+      "type": "click",
+      "selector": "[data-testid=\"DateLinkCell-2026-04-02\"]"
+    },
+    {
+      "type": "click",
+      "selector": "[data-testid=\"KeyboardArrowRightIcon\"]"
+    },
+    {
+      "type": "click",
+      "selector": "div:nth-child(6) > div:nth-child(3) > div:nth-child(1) > div:nth-child(1) > div:nth-child(2) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(4) > button:nth-child(1) > p:nth-child(1)"
+    },
+    {
+      "type": "click",
+      "selector": "[data-testid=\"KeyboardArrowRightIcon\"]"
+    },
+    {
+      "type": "click",
+      "selector": "[data-testid=\"KeyboardArrowRightIcon\"]"
+    },
+    {
+      "type": "click",
+      "selector": "div:nth-child(6) > div:nth-child(3) > div:nth-child(1) > div:nth-child(1) > h2:nth-child(1) > button:nth-child(2) > svg:nth-child(1) > path:nth-child(1)"
+    },
+    {
+      "type": "click",
+      "selector": "[data-testid=\"DateLinkCell-2026-04-03\"]"
+    },
+    {
+      "type": "click",
+      "selector": "div:nth-child(6) > div:nth-child(3) > div:nth-child(1) > div:nth-child(1) > div:nth-child(2) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(4) > button:nth-child(1) > p:nth-child(1)"
+    },
+    {
+      "type": "click",
+      "selector": "[data-testid=\"KeyboardArrowRightIcon\"]"
+    },
+    {
+      "type": "click",
+      "selector": "div:nth-child(6) > div:nth-child(3) > div:nth-child(1) > div:nth-child(1) > h2:nth-child(1) > button:nth-child(2) > svg:nth-child(1) > path:nth-child(1)"
+    },
+    {
+      "type": "click",
+      "selector": ""
+    },
+    {
+      "type": "click",
+      "selector": "[data-testid=\"Март\"]"
+    },
+    {
+      "type": "click",
+      "selector": "[data-testid=\"DateLinkCell-2026-03-03\"]"
+    },
+    {
+      "type": "click",
+      "selector": "div:nth-child(6) > div:nth-child(3) > div:nth-child(1) > div:nth-child(1) > div:nth-child(2) > div:nth-child(1) > div:nth-child(2) > div:nth-child(1) > button:nth-child(3) > p:nth-child(1) > svg:nth-child(1) > path:nth-child(1)"
+    },
+    {
+      "type": "click",
+      "selector": "div:nth-child(6) > div:nth-child(3) > div:nth-child(1) > div:nth-child(1) > div:nth-child(2) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(4) > button:nth-child(1) > p:nth-child(1)"
+    },
+    {
+      "type": "click",
+      "selector": "[data-testid=\"KeyboardArrowRightIcon\"]"
+    },
+    {
+      "type": "click",
+      "selector": "[data-testid=\"KeyboardArrowRightIcon\"]"
+    },
+    {
+      "type": "click",
+      "selector": "[data-testid=\"KeyboardArrowRightIcon\"]"
+    }
+  ]
+}
