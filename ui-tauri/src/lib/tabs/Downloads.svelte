@@ -9,6 +9,7 @@
   import { stockColors } from '$lib/stockColors.js';
   import { get } from 'svelte/store';
   import { photoGroups, stockList, loadStockList, notifySyncDone, syncTick, currentPeriod, appReady, downloadsCache,
+           newSaleKeys,
            startSyncStream, stopSyncStream, clearSyncLog, syncRunning, syncProgress } from '$lib/stores/appState.js';
 
   let { onRefresh, onStockChange } = $props();
@@ -35,24 +36,26 @@
   // mirror central stockList store
   $effect(() => { stocks = $stockList; });
 
+  /** Key used in newSaleKeys store to mark a sale as "new since last Refresh". */
+  /** @param {any} it */
+  function _k(it) { return `${it.asset_id}|${it.date}|${it.stock}|${(it.price||0).toFixed(2)}`; }
+
   /**
    * @param {boolean} [reset]
-   * @param {number|null} [prevMaxId] - if set, items with id > prevMaxId are marked _isNew
-   * @param {boolean} [skipCache] - if true, always fetch (used after sync)
+   * @param {boolean} [skipCache]
    */
-  async function load(reset = false, prevMaxId = null, skipCache = false) {
+  async function load(reset = false, skipCache = false) {
     if (loading) return;
     const _period  = get(currentPeriod);
     const _stock   = stock;
 
-    // Restore from cache on first load (reset=true, no new-item highlighting)
-    if (reset && prevMaxId === null && !skipCache) {
+    if (reset && !skipCache) {
       const cached = downloadsCache.read();
       if (cached && cached.period === _period && cached.stock === _stock) {
         items = cached.items;
         totalCount = cached.totalCount;
         page = Math.ceil(cached.items.length / perPage) || 1;
-        return;  // instant — no fetch needed
+        return;
       }
     }
 
@@ -64,25 +67,15 @@
       const qs = `period=${_period}&stock=${encodeURIComponent(_stock)}&page=${_page}&per_page=${_perPage}`;
       const d  = await fetch(API_BASE + `/api/feed?${qs}`).then(r => r.json());
       const incoming = d.items ?? [];
-      if (reset) {
-        items = incoming.map((/** @type {any} */ it) => ({
-          ...it,
-          _isNew: prevMaxId !== null && (it.id || 0) > prevMaxId,
-        }));
-      } else {
-        items = [...items, ...incoming.map((/** @type {any} */ it) => ({ ...it, _isNew: false }))];
-      }
+      items = reset ? incoming : [...items, ...incoming];
       totalCount = d.total_count ?? 0;
       lastSync = new Date().toLocaleString('uk', {
         day: 'numeric', month: 'short', year: 'numeric',
         hour: '2-digit', minute: '2-digit'
       });
-      // Persist to cache. Preserve _isNew when this is a post-sync load (prevMaxId set)
-      // so blues survive tab switches. Strip them on plain loads (no prevMaxId).
       if (reset || page === 1) {
         downloadsCache.write({
-          items: items.map(it => ({ ...it, _isNew: prevMaxId !== null ? it._isNew : false })),
-          totalCount, period: _period, stock: _stock,
+          items, totalCount, period: _period, stock: _stock,
         });
       }
     } catch (e) { console.error(e); }
@@ -109,27 +102,35 @@
     if (syncing) return;
     syncing = true;
     syncLog = 'Starting sync…';
-    const prevMaxId = items.length ? Math.max(...items.map((/** @type {any} */ it) => it.id || 0)) : 0;
+    // Snapshot existing sales BEFORE sync. After sync, any items not in this
+    // set are "new" → painted blue. Survives tab switches via newSaleKeys store.
+    const before = new Set(items.map(_k));
 
     const finish = async () => {
       if (_syncEs) { _syncEs.close(); _syncEs = null; }
       await loadStockList();
-      await load(true, prevMaxId);  // marks newly-arrived items _isNew (blue)
-      // AWAIT rebuild-matches — running it in parallel with other tabs' reloads
-      // hammers SQLite for ~80s and freezes Groups/BestSellers. Better to delay
-      // notifySyncDone() until Flask is free.
+      // Force a fresh fetch (skip cache) so items reflect the post-sync DB.
+      _lastTick++;        // pre-bump so syncTick $effect won't re-fetch
+      await load(true, true);
+      // Compute "new" keys — diff fresh items vs pre-sync snapshot.
+      const fresh = new Set();
+      for (const it of items) {
+        const k = _k(it);
+        if (!before.has(k)) fresh.add(k);
+      }
+      newSaleKeys.set(fresh);
+      // Re-cache items (just in case notifySyncDone wipes it below).
+      downloadsCache.write({
+        items, totalCount, period: get(currentPeriod), stock,
+      });
       syncLog = 'Rebuilding matches…';
       try { await fetch(API_BASE + '/api/rebuild-matches', { method: 'POST' }); }
       catch {}
       onRefresh?.();
-      // Pre-bump _lastTick so the syncTick $effect below won't re-run load() and wipe the highlights.
-      _lastTick++;
       notifySyncDone();
-      // notifySyncDone() clears the downloads cache. Re-write it so tab switches
-      // preserve blue _isNew highlights until the next Refresh.
+      // notifySyncDone clears cache — re-write after.
       downloadsCache.write({
-        items: items.map(/** @param {any} it */ it => ({ ...it })),
-        totalCount, period: get(currentPeriod), stock,
+        items, totalCount, period: get(currentPeriod), stock,
       });
       syncing = false;
       syncLog = '';
@@ -174,7 +175,7 @@
   // Refresh when any sync (e.g. from Browser tab) completes — skip cache, data is stale
   $effect(() => {
     const t = $syncTick;
-    if (t > 0 && t !== _lastTick) { _lastTick = t; untrack(() => load(true, null, true)); }
+    if (t > 0 && t !== _lastTick) { _lastTick = t; untrack(() => load(true, true)); }
   });
 
   // Reload when period changes OR when backend becomes ready.
@@ -183,7 +184,7 @@
     const period = $currentPeriod;
     const ready  = $appReady;
     if (!ready) return;
-    untrack(() => load(true, null));
+    untrack(() => load(true));
   });
 </script>
 
@@ -192,7 +193,7 @@
   <div class="filters">
     <div class="filter-row">
       <FilterPills label="Stock:" options={stocks}
-        value={stock} onSelect={(s) => { stock=s; load(true, null); onStockChange?.(s); }} />
+        value={stock} onSelect={(s) => { stock=s; load(true); onStockChange?.(s); }} />
       <button class="action-pill refresh-btn {syncing?'busy':''}" onclick={doRefresh} disabled={syncing}>
         <span class="refresh-icon {syncing?'spin':''}"><RefreshCw size={13} strokeWidth={2} /></span>
         {syncing ? syncLog.slice(0,22) || 'Syncing…' : 'Refresh'}
@@ -203,7 +204,7 @@
   <!-- Tile grid with infinite scroll -->
   <div class="grid scroll-y">
     {#each items as item (item.id ?? item.asset_id + item.date)}
-      {@const isNew       = item._isNew === true}
+      {@const isNew       = $newSaleKeys.has(_k(item))}
       {@const isFirstSale = Object.values(item.by_stock||{}).reduce((/** @type {number} */ s, /** @type {any} */ d) => s + d.count, 0) === 1}
       {@const inGroups    = Object.entries($photoGroups).filter(([,ids]) => ids.includes(item.asset_id)).map(([n]) => n)}
       <div class="card {isNew ? 'is-new' : ''}"

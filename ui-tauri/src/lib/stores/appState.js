@@ -91,6 +91,13 @@ export const appReady = writable(false);
 //    Subscribing components refresh their data when this changes.
 export const syncTick = writable(0);
 
+// ── New-sale keys — Set of "asset_id|date" strings that were inserted by the
+//    most recent Refresh. Survives tab switches (it's a top-level store).
+//    Cleared and rewritten on each Refresh: previous "new" becomes white,
+//    only sales added in the latest sync stay blue.
+/** @type {import('svelte/store').Writable<Set<string>>} */
+export const newSaleKeys = writable(new Set());
+
 export function notifySyncDone() {
   // Invalidate tab caches — sync brings new data, tabs must refetch.
   _dlMem = null; _lsClear(_DL_KEY);
