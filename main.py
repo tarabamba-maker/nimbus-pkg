@@ -2673,7 +2673,22 @@ def _sync_all_global():
     _sync_stop_flag[0]  = False
     _sync_state["running"] = True
     _sync_state["log"]     = []
-    _sync_log("🚀 Parallel sync: sales stocks first, then MS+...")
+    # First-run safeguard: empty DB → sequential mode. From-scratch sync hits
+    # the full backfill path in every collector (Adobe = 2900+ pages, SS = days
+    # since 2018, Getty = all 63 statements + ESP thumbs). 4 parallel doing
+    # backfill at once exhausts fds / saturates SQLite / rate-limits stocks.
+    # Once DB has data, incremental syncs are tiny and parallel is safe.
+    try:
+        with sqlite3.connect(DB_NAME, timeout=15) as _c:
+            _sales_count = _c.execute("SELECT COUNT(*) FROM sales").fetchone()[0]
+    except Exception:
+        _sales_count = 0
+    parallel = _sales_count > 1000   # arbitrary threshold — well past any cold start
+
+    if parallel:
+        _sync_log("🚀 Parallel sync: 4 sales stocks at once, then MS+...")
+    else:
+        _sync_log(f"🚀 Sequential sync (DB has {_sales_count} rows — cold start safeguard)")
 
     SALES_STOCKS = ["Depositphotos", "Getty Images", "Shutterstock", "Adobe Stock"]
 
@@ -2691,13 +2706,18 @@ def _sync_all_global():
             _sync_log(f"━━━ [{name}] ⚠️ exception: {ex} ━━━")
 
     try:
-        # Phase 1: sales stocks in parallel
-        from concurrent.futures import ThreadPoolExecutor as _SyncTPE
-        with _SyncTPE(max_workers=4) as pool:
-            futures = [pool.submit(_run_one, n) for n in SALES_STOCKS]
-            for f in futures:
-                try: f.result()
-                except Exception as ex: _sync_log(f"⚠️ sales worker: {ex}")
+        # Phase 1: sales stocks (parallel if warm DB, sequential if cold)
+        if parallel:
+            from concurrent.futures import ThreadPoolExecutor as _SyncTPE
+            with _SyncTPE(max_workers=4) as pool:
+                futures = [pool.submit(_run_one, n) for n in SALES_STOCKS]
+                for f in futures:
+                    try: f.result()
+                    except Exception as ex: _sync_log(f"⚠️ sales worker: {ex}")
+        else:
+            for n in SALES_STOCKS:
+                if _sync_stop_flag[0]: break
+                _run_one(n)
 
         # Phase 2: MS+ (slow, runs alone, needed before matching)
         if not _sync_stop_flag[0]:
