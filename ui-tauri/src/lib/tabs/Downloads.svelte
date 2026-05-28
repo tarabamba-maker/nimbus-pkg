@@ -125,6 +125,12 @@
       // Pre-bump _lastTick so the syncTick $effect below won't re-run load() and wipe the highlights.
       _lastTick++;
       notifySyncDone();
+      // notifySyncDone() clears the downloads cache. Re-write it so tab switches
+      // preserve blue _isNew highlights until the next Refresh.
+      downloadsCache.write({
+        items: items.map(/** @param {any} it */ it => ({ ...it })),
+        totalCount, period: get(currentPeriod), stock,
+      });
       syncing = false;
       syncLog = '';
     };
