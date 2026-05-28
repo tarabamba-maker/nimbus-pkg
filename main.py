@@ -2199,6 +2199,24 @@ def _ms_plus_collect_direct():
     dirs = [d for d in dirs_resp.get("list", []) if d.get("filestotal", 0) > 0]
     _sync_log(f"📁 MS+ direct: {len(dirs)} папок з файлами")
 
+    # Skip-unchanged: getfulllist gives filestotal per dir; if unchanged since
+    # last successful sync, the dir's contents haven't been touched on MS+ side
+    # (uploads/deletes change filestotal). Only fetch contentlist for changed dirs.
+    _ms_state_file = os.path.join(RECIPES_DIR, "_ms_dirs_state.json")
+    try:
+        with open(_ms_state_file) as _f:
+            _prev_filestotal = json.load(_f)
+    except Exception:
+        _prev_filestotal = {}
+    _cur_filestotal = {d.get("path", ""): d.get("filestotal", 0) for d in dirs if d.get("path")}
+    changed_dirs = [d for d in dirs
+                    if _prev_filestotal.get(d.get("path", "")) != d.get("filestotal", 0)]
+    if _prev_filestotal:
+        _sync_log(f"⏩ MS+ direct: {len(changed_dirs)}/{len(dirs)} папок змінилось — фетч лише їх")
+    else:
+        _sync_log(f"🆕 MS+ direct: перший повний синк — {len(dirs)} папок")
+        changed_dirs = dirs
+
     # Full agency list — even if we don't track sales for some, we want their
     # stockids for cross-matching coverage.
     AGENCIES = ["shutterstock", "esp", "adobestock", "dreamstime", "yaymicro",
@@ -2213,7 +2231,7 @@ def _ms_plus_collect_direct():
 
     library = {}
     total_files = 0
-    for dir_idx, dr in enumerate(dirs, 1):
+    for dir_idx, dr in enumerate(changed_dirs, 1):
         if _sync_stop_flag[0]:
             _sync_log("⛔ MS+ direct: зупинено")
             break
@@ -2268,8 +2286,8 @@ def _ms_plus_collect_direct():
                 break
             skip += 250
             time.sleep(0.1)
-        if dir_idx % 20 == 0 or dir_idx == len(dirs):
-            _sync_log(f"  📦 {dir_idx}/{len(dirs)} папок, всього {total_files} фото")
+        if dir_idx % 20 == 0 or dir_idx == len(changed_dirs):
+            _sync_log(f"  📦 {dir_idx}/{len(changed_dirs)} папок, всього {total_files} фото")
 
     # Merge with existing ms_library.json by basepath (unique key).
     # MS+ is master — if user moved a photo to a different folder in MS+,
@@ -2278,9 +2296,12 @@ def _ms_plus_collect_direct():
     existing = load_ms_library()
     existing_by_bp = {e.get("basepath", ""): e for e in existing if e.get("basepath")}
     moved = 0
+    new_basepaths = set()
     for bp, rec in library.items():
         old = existing_by_bp.get(bp, {})
-        if old.get("group") and old["group"] != rec["group"]:
+        if not old:
+            new_basepaths.add(bp)
+        elif old.get("group") and old["group"] != rec["group"]:
             moved += 1
         existing_by_bp[bp] = rec
     merged = list(existing_by_bp.values())
@@ -2292,12 +2313,18 @@ def _ms_plus_collect_direct():
     # Step 4: download MS+ reference thumbnails to img_cache_ms/.
     # These serve as ground-truth pHash for matching sales photos against MS+
     # groups when sales asset_ids aren't in stockids (visual fallback path).
-    _sync_log("🖼️ MS+ direct: завантажую reference thumbnails в img_cache_ms/")
+    # Iterate only NEW basepaths (added this sync) — old ones are already cached.
+    if not new_basepaths:
+        _sync_log("✅ MS+ thumbnails: нічого нового — skip")
+        thumb_iter = []
+    else:
+        _sync_log(f"🖼️ MS+ direct: {len(new_basepaths)} нових мініатюр")
+        thumb_iter = [r for r in merged if r.get("basepath") in new_basepaths]
     dl_count = skip_count = 0
     img_session = req_lib.Session()
     img_session.cookies.update(ms_cookies)
     img_session.headers.update({"User-Agent": session.headers["User-Agent"]})
-    for rec in merged:
+    for rec in thumb_iter:
         if _sync_stop_flag[0]: break
         bp = rec.get("basepath", "")
         thumb = rec.get("thumb", "")
@@ -2324,13 +2351,22 @@ def _ms_plus_collect_direct():
             _sync_log(f"  📥 {dl_count} new, {skip_count} skipped (cached)")
     _sync_log(f"✅ MS+ thumbnails: {dl_count} new downloaded, {skip_count} cached")
 
-    # Compute pHash for new thumbnails so visual matching can use them
+    # Compute pHash only when there were new thumbnails (api_compute_ms_hashes
+    # already short-circuits cached rows, but iterating 15k files is wasteful).
+    if dl_count > 0:
+        try:
+            with flask_app.test_request_context():
+                api_compute_ms_hashes()
+            _sync_log("✅ MS+ ms_meta pHashes computed")
+        except Exception as ex:
+            _sync_log(f"⚠️ ms_meta compute failed: {ex}")
+
+    # Persist filestotal-per-dir cursor for next incremental sync.
     try:
-        with flask_app.test_request_context():
-            api_compute_ms_hashes()
-        _sync_log("✅ MS+ ms_meta pHashes computed")
-    except Exception as ex:
-        _sync_log(f"⚠️ ms_meta compute failed: {ex}")
+        with open(_ms_state_file, 'w') as _f:
+            json.dump(_cur_filestotal, _f)
+    except Exception:
+        pass
     return True
 
 
