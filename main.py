@@ -305,11 +305,15 @@ def is_already_saved(stock, asset_id, price, date_str):
                 ).fetchone()
                 if row:
                     return True
-            # Pass 2: price+day fallback for old date-only records
+            # Pass 2: price + day fallback — matches records stored in ANY
+            # date format ("2026-04-29" or "2026-04-29 00:00:00") since SS/
+            # Deposit collectors pass date-only strings while existing rows
+            # are mixed-format. Old LENGTH(date)=10 restriction caused all
+            # SS daily aggregates to be re-inserted as duplicates every sync.
             row = c.execute(
-                'SELECT 1 FROM sales WHERE stock=? AND asset_id=? AND date LIKE ? '
-                'AND LENGTH(date)=10 AND ABS(price - ?) < 0.005',
-                (stock, str(asset_id), day + '%', p)
+                'SELECT 1 FROM sales WHERE stock=? AND asset_id=? '
+                'AND substr(date,1,10)=? AND ABS(price - ?) < 0.005',
+                (stock, str(asset_id), day, p)
             ).fetchone()
         return row is not None
     except Exception:
