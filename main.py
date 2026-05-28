@@ -2657,15 +2657,15 @@ def _collect_one_stock_global(name, url):
 
 
 def _sync_all_global():
-    """Sequential collection from all stocks. Called from Flask /api/sync/start.
+    """Parallel sales-stock collection, then MS+ at the end.
 
-    ⚠️ Sequential by design (not parallel). With 5 collectors each holding
-    HTTPS connection pools + SQLite connections + image-download workers,
-    parallel hits fd-exhaustion and SQLite lock contention. Sequential keeps
-    resource usage flat — each stock gets full resources, no contention.
+    All collectors now use direct HTTPS (no Playwright browsers), so the old
+    fd-exhaustion concern that forced sequential mode is gone. Sales stocks
+    run in parallel (4 workers) so user sees new sales fast. MS+ runs LAST
+    because it's slow (15k photos) and not needed before sales are visible —
+    only required before rebuild-matches at the end.
 
-    Order: MS+ first (needed by rebuild-matches), then heaviest stocks last
-    so user sees fast progress on stat boxes before the long Adobe history."""
+    SQLite contention is handled by WAL mode + timeout=15-60s on every conn."""
     if _sync_all_active[0]:
         _sync_log("⚠️ Sync already running!")
         return
@@ -2673,28 +2673,38 @@ def _sync_all_global():
     _sync_stop_flag[0]  = False
     _sync_state["running"] = True
     _sync_state["log"]     = []
-    _sync_log("🚀 Sequential sync from all stocks...")
+    _sync_log("🚀 Parallel sync: sales stocks first, then MS+...")
 
-    # Order matters: MS+ first (lib needed by matching), then small ones, then heaviest
-    ORDER = ["Microstock+", "Depositphotos", "Getty Images", "Shutterstock", "Adobe Stock"]
+    SALES_STOCKS = ["Depositphotos", "Getty Images", "Shutterstock", "Adobe Stock"]
+
+    def _run_one(name):
+        if _sync_stop_flag[0]:
+            return
+        url = STOCK_URLS.get(name)
+        if not url:
+            return
+        _sync_log(f"━━━ [{name}] start ━━━")
+        try:
+            _collect_one_stock_global(name, url)
+            _sync_log(f"━━━ [{name}] finished ━━━")
+        except Exception as ex:
+            _sync_log(f"━━━ [{name}] ⚠️ exception: {ex} ━━━")
 
     try:
-        for name in ORDER:
-            if _sync_stop_flag[0]:
-                break
-            url = STOCK_URLS.get(name)
-            if not url:
-                continue
-            _sync_log(f"━━━ [{name}] start ━━━")
-            try:
-                _collect_one_stock_global(name, url)
-                _sync_log(f"━━━ [{name}] finished ━━━")
-            except Exception as ex:
-                _sync_log(f"━━━ [{name}] ⚠️ exception: {ex} — continuing to next stock ━━━")
+        # Phase 1: sales stocks in parallel
+        from concurrent.futures import ThreadPoolExecutor as _SyncTPE
+        with _SyncTPE(max_workers=4) as pool:
+            futures = [pool.submit(_run_one, n) for n in SALES_STOCKS]
+            for f in futures:
+                try: f.result()
+                except Exception as ex: _sync_log(f"⚠️ sales worker: {ex}")
+
+        # Phase 2: MS+ (slow, runs alone, needed before matching)
+        if not _sync_stop_flag[0]:
+            _run_one("Microstock+")
+
         if not _sync_stop_flag[0]:
             _sync_log("✅ All stocks collected")
-            # Auto-trigger rebuild-matches: pHash for newly downloaded thumbs is
-            # now in asset_meta, ms_library was refreshed by MS+ collector.
             try:
                 _sync_log("🔗 Auto: rebuilding cross-stock matches...")
                 with flask_app.test_request_context():
