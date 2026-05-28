@@ -11,7 +11,8 @@
   import StockColorSettings from '$lib/StockColorSettings.svelte';
   import UpdateBanner from '$lib/components/UpdateBanner.svelte';
   import { stockColors, loadStockColors, STOCK_ABBR } from '$lib/stockColors.js';
-  import { loadPhotoGroups, loadStockList, loadMatches, currentPeriod, appReady, resumeSyncIfRunning, startSyncPoller } from '$lib/stores/appState.js';
+  import { untrack } from 'svelte';
+  import { loadPhotoGroups, loadStockList, loadMatches, currentPeriod, appReady, resumeSyncIfRunning, startSyncPoller, syncTick } from '$lib/stores/appState.js';
 
   let activeTab      = $state(0);
   let tabDir         = $state(1);
@@ -150,6 +151,15 @@
     } else {
       document.body.classList.add('light');
     }
+  });
+
+  // Refresh top stats whenever ANY tab triggers a sync completion.
+  // Without this, deltas only refresh when Downloads tab calls onRefresh —
+  // syncs from Browser tab or background pollers leave stat boxes stale.
+  let _statsTick = 0;
+  $effect(() => {
+    const t = $syncTick;
+    if (t > 0 && t !== _statsTick) { _statsTick = t; untrack(() => loadStats()); }
   });
 
   /** Wait until Flask responds (lib.rs spawns python concurrently with webview

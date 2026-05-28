@@ -342,10 +342,11 @@ flask_app = Flask(__name__)
 flask_app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500 MB cap
 CORS(flask_app)
 
-@flask_app.route('/update', methods=['POST'])
-def api_update():
-    d = request.json
-    if not d: return jsonify({"status": "error"}), 400
+def _save_record(d: dict):
+    """In-process save (no HTTP). Used by collectors to avoid async POST → /update
+    pattern that caused 'UI shows stale data after sync done' bug: sync thread
+    finishes before background HTTP POSTs reach Flask + commit to DB."""
+    if not d: return
     raw_date = d.get('date'); dt = datetime.now()
     if raw_date:
         for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z",
@@ -357,6 +358,12 @@ def api_update():
     d['date']  = dt.strftime("%Y-%m-%d %H:%M:%S")
     d['stock'] = d.get('stock', 'Adobe Stock')
     save_to_db(d)
+
+@flask_app.route('/update', methods=['POST'])
+def api_update():
+    d = request.json
+    if not d: return jsonify({"status": "error"}), 400
+    _save_record(d)
     return jsonify({"status": "success"}), 200
 
 # ═══════════════════════════════════════════════════════════
@@ -563,15 +570,16 @@ def _adobe_collect_direct():
     total_items = pagination.get("total", 0)
     _sync_log(f"   → recent: {total_pages} стор., {total_items} записів")
 
+    stop_pages = False
     for pg in range(1, total_pages + 1):
-        if _sync_stop_flag[0]: return True
+        if _sync_stop_flag[0] or stop_pages: return True
         data = page1 if pg == 1 else _get_page(
             f"/en/insights/sales-earnings?limit=1000&page={pg}&pv={int(time.time()*1000)}")
         if "error" in data:
             _sync_log(f"  ⚠️ page={pg}: {data['error']}")
             continue
         history = data.get("sales", {}).get("history", [])
-        page_old = 0
+        page_old = 0; page_new = 0
         for item in history:
             asset_id = str(item.get("id", ""))
             price    = float(item.get("commissionAmount", 0))
@@ -580,9 +588,8 @@ def _adobe_collect_direct():
             if not asset_id or not sale_full[:10]: continue
             if is_already_saved("Adobe Stock", asset_id, price, sale_full):
                 page_old += 1
-                if pg == 1 and page_old >= 100:
-                    _sync_log("⏹ Adobe direct: 100 saved on p1 — stop early"); break
                 continue
+            page_new += 1
             photo_name = item.get("title") or item.get("originalName") or asset_id
             orig = item.get("originalName") or ""
             fname = orig.rsplit(".", 1)[0] if orig and "." in orig else orig
@@ -590,10 +597,11 @@ def _adobe_collect_direct():
                    "price": price, "thumb_url": thumb, "date": sale_full, "filename": fname}
             if thumb:
                 load_img_async(asset_id, thumb, None, is_adobe=True, stock="Adobe Stock")
-            _http_executor.submit(
-                lambda dd=rec: req_lib.post(
-                    f"http://127.0.0.1:{FLASK_PORT}/update", json=dd, timeout=5))
+            _save_record(rec)
             total_saved += 1
+        if page_new == 0 and page_old >= 100:
+            _sync_log(f"⏭️  Adobe: page {pg} all duplicates — stop")
+            stop_pages = True
         if pg < total_pages:
             time.sleep(0.1)
 
@@ -666,9 +674,7 @@ def _adobe_collect_direct():
                        "price": price, "thumb_url": thumb, "date": sale_full, "filename": fname}
                 if thumb:
                     load_img_async(asset_id, thumb, None, is_adobe=True, stock="Adobe Stock")
-                _http_executor.submit(
-                    lambda dd=rec: req_lib.post(
-                        f"http://127.0.0.1:{FLASK_PORT}/update", json=dd, timeout=5))
+                _save_record(rec)
                 chunk_new += 1; hist_saved += 1
             if pg < range_pages: time.sleep(0.1)
 
@@ -766,9 +772,12 @@ def _depositphotos_collect_direct():
             date     = _pdate(tds[3].get_text(strip=True))
             price    = _pprice(tds[8].get_text(strip=True))
             if not date: continue
+            thumb = img.get("src", "") if img else ""
+            if thumb.startswith("//"):
+                thumb = "https:" + thumb
             rows.append({"asset_id": asset_id, "title": title,
                          "date": date, "price": price,
-                         "thumb": img.get("src", "") if img else ""})
+                         "thumb": thumb})
         return rows
 
     total_saved = 0
@@ -917,9 +926,7 @@ def _adobe_api_collect_global(pw_page):
                    "filename": fname_no_ext}
             if thumb:
                 load_img_async(asset_id, thumb, None, is_adobe=True, stock="Adobe Stock")
-            _http_executor.submit(
-                lambda dd=rec: req_lib.post(
-                    f"http://127.0.0.1:{FLASK_PORT}/update", json=dd, timeout=5))
+            _save_record(rec)
             total_saved += 1
             page_new += 1
 
@@ -1021,9 +1028,7 @@ def _adobe_api_collect_global(pw_page):
                        "thumb_url": thumb, "date": sale_full, "filename": fname_no_ext}
                 if thumb:
                     load_img_async(asset_id, thumb, None, is_adobe=True, stock="Adobe Stock")
-                _http_executor.submit(
-                    lambda dd=rec: req_lib.post(
-                        f"http://127.0.0.1:{FLASK_PORT}/update", json=dd, timeout=5))
+                _save_record(rec)
                 chunk_new += 1
                 hist_saved += 1
             if pg < range_pages:
@@ -1189,9 +1194,7 @@ def _shutterstock_api_collect_direct():
                            "photo_name": name, "date": date_str}
                     if thumb:
                         load_img_async(asset_id, thumb, None, stock="Shutterstock")
-                    _http_executor.submit(
-                        lambda dd=rec: req_lib.post(
-                            f"http://127.0.0.1:{FLASK_PORT}/update", json=dd, timeout=5))
+                    _save_record(rec)
                     day_new += 1; total_saved += 1
                 if page_n >= data.get("pages", 1): break
                 page_n += 1
@@ -1358,10 +1361,7 @@ def _shutterstock_api_collect_global(pw_page):
                            "photo_name": name, "date": date_str}
                     if thumb:
                         load_img_async(asset_id, thumb, None, stock="Shutterstock")
-                    _http_executor.submit(
-                        lambda dd=rec: req_lib.post(
-                            f"http://127.0.0.1:{FLASK_PORT}/update",
-                            json=dd, timeout=5))
+                    _save_record(rec)
                     day_new    += 1
                     total_saved += 1
 
@@ -2915,16 +2915,25 @@ def api_stats():
         base_where  = "1=1"
         base_params = []
 
+    today_d = now.date()
+    week_start  = today_d - timedelta(days=today_d.weekday())   # Monday
+    prev_week   = week_start - timedelta(days=7)
+    month_start = today_d.replace(day=1)
+    prev_month  = (month_start - timedelta(days=1)).replace(day=1)
+    year_start  = today_d.replace(month=1, day=1)
+    prev_year   = year_start.replace(year=year_start.year - 1)
+    yesterday   = today_d - timedelta(days=1)
+
     spans = {
-        'today': (now.strftime('%Y-%m-%d'),
-                  (now - timedelta(days=1)).strftime('%Y-%m-%d'),
-                  (now - timedelta(days=1)).strftime('%Y-%m-%d')),
-        'week':  ((now - timedelta(days=7)).strftime('%Y-%m-%d'), None,
-                  (now - timedelta(days=14)).strftime('%Y-%m-%d')),
-        'month': ((now - timedelta(days=30)).strftime('%Y-%m-%d'), None,
-                  (now - timedelta(days=60)).strftime('%Y-%m-%d')),
-        'year':  ((now - timedelta(days=365)).strftime('%Y-%m-%d'), None,
-                  (now - timedelta(days=730)).strftime('%Y-%m-%d')),
+        'today': (today_d.strftime('%Y-%m-%d'),
+                  yesterday.strftime('%Y-%m-%d'),
+                  yesterday.strftime('%Y-%m-%d')),
+        'week':  (week_start.strftime('%Y-%m-%d'), None,
+                  prev_week.strftime('%Y-%m-%d')),
+        'month': (month_start.strftime('%Y-%m-%d'), None,
+                  prev_month.strftime('%Y-%m-%d')),
+        'year':  (year_start.strftime('%Y-%m-%d'), None,
+                  prev_year.strftime('%Y-%m-%d')),
     }
     result = {}
     with sqlite3.connect(DB_NAME, timeout=15) as conn:
