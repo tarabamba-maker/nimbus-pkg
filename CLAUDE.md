@@ -142,14 +142,27 @@ Tauri auto-starts `main.py` on launch and kills it on exit:
 ## Stocks — status
 
 ### ✅ Adobe Stock
-- **Method: API** (`_adobe_api_collect`)
+- **Method: API** (`_adobe_api_collect_global` in main.py:559+)
 - Required header: `x-requested-with: XMLHttpRequest` — without it server returns HTML not JSON
-- **Do NOT use** date-range params (`start_date`, `end_date`, `time_range`) — they no longer return data
-- **Correct endpoint:** `GET /en/insights/sales-earnings?limit=1000&page=N&pv={timestamp}`
+- **Endpoint:** `GET /en/insights/sales-earnings`
 - Pagination: `view.pagination` → `{limit, page, pages, total}` — iterate 1..pages
 - Data in `sales.history[]` (NOT `body.history` — always empty!) → `{id, commissionAmount, thumbnailUrl, saleDate, title, originalName}`
 - `saleDate` format: `"2026-05-03T01:13:34+00:00"` → slice `[:10]` = `"2026-05-03"`
 - Dedup: `is_already_saved()` per record (not per month)
+
+#### Two-pass strategy — DO NOT TOUCH unless Adobe API changes
+1. **Pass 1 (recent, no date filter):** `?limit=1000&page=N&pv={ms}` — pulls most recent ~5000 sales. Has early-stop: if a page is 100% duplicates → `break` (NOT `return` — that would skip Pass 2!). 
+2. **Pass 2 (historical chunks):** `?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD&time_range=day&pv={ms}&limit=1000&page=N` — walks 10 years back in **360-day chunks** (Adobe max is 364 — keep ≥4 day margin).
+
+#### Critical state file: `recipes/_processed_dates.json` → `"Adobe Stock": ["YYYY-MM", ...]`
+- A chunk's months are marked done **ONLY when API returned >0 records** (`range_total > 0`).
+- Empty chunks are NOT marked → re-checked next sync. This is intentional: Adobe's API has been observed to temporarily return empty for chunks that genuinely had sales (historical breakage in 2024-2025 silently wiped ~9,500 rows / $8,400 from our DB before we detected it). One extra request per empty month per sync is a tiny price for never losing history again.
+- **First-sale guard:** chunks whose `chunk_end < MIN(date) FROM sales WHERE stock='Adobe Stock'` are marked done unconditionally (pre-activity months are guaranteed empty).
+- To force a full re-walk: delete `"Adobe Stock"` key from `_processed_dates.json`.
+
+#### Endpoint variants — don't confuse them
+- `/en/insights/sales-earnings` — **individual sales list** (what we use). Accepts date params. Returns `sales.history[]`.
+- `/en/insights/earnings` — **daily aggregates only** (totals per day). Don't use for collection; we'd lose per-sale data.
 
 ### ✅ Shutterstock
 - **Method: API** (`_shutterstock_api_collect`)
@@ -200,6 +213,111 @@ DataDome and similar anti-bot systems block direct HTTP requests. Browser-intern
 - `_cross_stock_matches.json` — maps `primary_id → [primary_id, sibling_id, ...]`, rebuilt from ms_library stockids. Used by `/api/best-sellers` and `/api/photo-groups` to aggregate earnings across sibling IDs.
 - **Rebuild flow** (`/api/rebuild-matches`): reads ms_library.json → groups photos by `group` field → for each photo picks ONE primary_id (adobestock > shutterstock > istock > esp) → writes to photo_groups.json.
 - **Dedup**: `api_rebuild_matches` has a dedup pass; `api_groups_get` tracks a `represented` set to skip siblings already covered by their primary.
+
+## Architecture Invariants — DO NOT BREAK
+
+These are load-bearing contracts cemented across multiple debugging sessions.
+Each was a real bug that took hours to trace. Future agents: read this before
+touching any of these areas.
+
+### Sync orchestration (`_sync_all_global`, main.py:~2740)
+- **Parallel mode only when DB has >1000 sales.** Cold-start (empty DB) MUST go
+  sequential — 4 parallel collectors hammering an empty DB triggers fd
+  exhaustion / rate limits / SQLite contention. The guard is at the start of
+  `_sync_all_global`. Don't remove.
+- **MS+ runs LAST, after all 4 sales stocks.** MS+ is the slow one (15k photos,
+  refs in `img_cache_ms/`). User sees sales fast; MS+ updates `ms_library.json`
+  in background which only matters for the post-sync rebuild-matches.
+- **`_session_new_keys` is cleared at sync start, appended by `_save_record` per
+  insert.** Client reads via `GET /api/sync/recent-keys` to paint blue
+  highlights. DO NOT switch back to client-side diff — that's been broken twice
+  due to closure / cache timing issues.
+
+### Collectors — `_save_record` is the ONLY save path (main.py:359)
+- Collectors call `_save_record(rec)` (sync, in-process). NEVER use the old
+  HTTP `_http_executor.submit(requests.post(...))` pattern — sync thread would
+  finish before background HTTP POSTs hit the DB → SSE `done` fires with stale
+  data.
+- `_save_record` has a dedup guard (`is_already_saved`) BEFORE insert. Without
+  it, re-syncs would balloon `_session_new_keys` with already-known sales.
+- Date normalization: 5 input formats supported. Stored as 19-char
+  `"YYYY-MM-DD HH:MM:SS"`. `/api/feed` slices to 10-char for display.
+
+### Dedup — `is_already_saved` (main.py:276)
+- Two-pass: (1) exact 19-char datetime match for new records, (2) `substr(date,1,10)` + price ± 0.005 fallback for legacy rows. **DO NOT add `AND LENGTH(date)=10`** — historical bug that misclassified all 19-char rows as new, causing 6,241 dups (deleted 2026-05-19).
+- Index `idx_sales_dedup ON sales(stock, asset_id, date)` is required for performance.
+
+### Adobe Stock — Pass 1 / Pass 2 contract (main.py:559+)
+See `### ✅ Adobe Stock` section above. Key invariants:
+- `stop_pages` early-exit in Pass 1 MUST `break`, not `return` (this killed Pass 2 silently for months).
+- Pass 2 chunks: **360 days** (Adobe max is 364, 4-day safety margin).
+- **Don't mark empty chunks as done.** This is what lost us $8,400 of history in 2024-2025. See Adobe section.
+
+### Shutterstock (main.py:_shutterstock_api_collect_global)
+- Browser fetch to `/api/next/v2/earnings/media_stats/day` (not direct HTTPS — DataDome blocks). Navigate to `/earnings` first to seed cookies.
+- Headless mode requires `networkidle` + `add_init_script(_STEALTH_JS)`. Without them → `/unsupported-browser`.
+- Header `x-end-app-name: contributor-web` is mandatory.
+- Incremental dedup: last 30 days via DB MAX(date) check (saves ~92→30 daily requests). Cold-start: full 92 days.
+
+### Getty / iStock (main.py:_getty_collect_direct + _getty_api_collect_global)
+- ESP profile is SEPARATE (`getty_profile/`), not `chrome_profile/`.
+- `ccw` cookie is HttpOnly — read via Playwright `browser.cookies()`, NEVER `document.cookie`.
+- Base64-decode `ccw` → JSON → `sts_token`. Pass as `Authorization: Bearer {sts_token}`.
+- API returns at most 50 assets per request. Paginate by `TotalAssetCount / 50`.
+- Skip if last sync was THIS calendar month and we're before the 21st (statements arrive ~21st).
+- Prices come from TSV statements only (API returns counts, no prices). Import via `import_getty.py`.
+
+### Depositphotos (main.py:_depositphotos_collect_direct)
+- HTML scraping via BeautifulSoup (no JSON API).
+- Thumb URLs are protocol-relative (`//st.depositphotos.com/...`) — MUST prepend `https:` (or images break on cards). Both `_extract_rows` functions do this normalization.
+- First-time vs incremental: cold-start = 500 pages, warm = 30 pages.
+
+### MS+ (Microstock+) (main.py:_microstock_plus_collect_direct)
+- Auth: Safari `binarycookies` parsing (cookies live in `~/Library/Containers/com.apple.Safari/`). Required: `koa.sid` or `session_debug`.
+- `useragencyids` parameter is URL-encoded JSON array, NOT PHP-style repeated keys (the old `useragencyids[]=foo&useragencyids[]=bar` returns HTTP 500).
+- Two-tier diff (v0.9.36+):
+  1. `recipes/_ms_dirs_state.json` stores `{path: filestotal}`. Next sync fetches `contentlist` only for dirs whose `filestotal` changed.
+  2. Thumbnail download iterates ONLY new basepaths (not all 15k). Skip pHash compute when `dl_count == 0`.
+- Basepath is the unique key (NOT filename — camera reuses `B94A1234` every 10k shots).
+
+### rebuild-matches (main.py:5044, `api_rebuild_matches`)
+Pass ordering and incremental contracts (v0.9.37):
+- **Pass A (pHash clustering)** — incremental via `last_asset_meta_rowid` cursor in `recipes/_matches_state.json`. Old × old pairs skipped (hashes are immutable, threshold constants).
+- **Pass B (ms_library stockids)** — skipped when `ms_library` content fingerprint (sha1 of all `(basepath, group, sorted stockids)`) is unchanged.
+- **Pass D (MS+ groups → photo_groups) — SNAPSHOT DIFF.** `recipes/_ms_group_snapshot.json` stores `{primary_id: ms_group_name}` from last successful rebuild. Next rebuild computes `diff_added` and `diff_moved`. **Unchanged primaries are not touched — this is how user UI moves survive across rebuilds.**
+- **Pass F (MS+ visual matching)** — incremental with BOTH cursors (`last_asset_meta_rowid` + `last_ms_meta_rowid`). Pairs where both rows are old → skip (60M → ~10k comparisons typical).
+- **Full early-exit** at start: if asset_meta + ms_meta + ms_library fingerprint all unchanged → return cached counts immediately (no work).
+- **First-run path** for Pass D (empty snapshot): does CLASSIC full purge + reassign, NOT diff. Otherwise photos end up in two groups. Don't change this.
+- Manual overrides (`_apply_manual_overrides`, Pass H) always wins. Stored in `recipes/_match_overrides.json` via `/api/match-override`.
+- To force full rebuild: delete `recipes/_matches_state.json` and `_ms_group_snapshot.json`.
+
+### SQLite (main.py:init_db)
+- **WAL mode is required** (`PRAGMA journal_mode=WAL`). Without it parallel sync collectors block each other.
+- `synchronous=NORMAL` is safe with WAL.
+- Indexes: `idx_sales_dedup`, `idx_sales_date`, `idx_asset_meta_hash`, `idx_ms_meta_hash`. Don't remove.
+- Connection timeout 15s (60s for rebuild-matches batch ops). All connections use `with sqlite3.connect(...)` for autocommit-on-exit.
+
+### Svelte UI invariants
+- `appState.js` is the **single source of truth**. Tabs subscribe to writables, never duplicate fetches. New shared state → add a writable here, not a prop.
+- `syncTick` is incremented by `notifySyncDone()` after any sync completes. Every tab has a `$effect` watching it that reloads cache-skipping (`load(true, true)`).
+- `notifySyncDone()` ALSO **clears tab caches** (`_dlMem`, `_bsMem`, `_groupsLoaded`). If a tab needs cache to survive sync (e.g., to preserve blue highlights), it MUST re-`downloadsCache.write(...)` AFTER calling `notifySyncDone()`. See Downloads.svelte `doRefresh` → `finish` for the canonical pattern.
+- **Blue new-sale highlights:** backend-tracked via `_session_new_keys` (Python side). Client reads via `GET /api/sync/recent-keys` → `newSaleKeys.set(new Set(...))`. **Do NOT switch to client-side diff** — it was broken twice (closure timing, cache invalidation). The backend-tracked path is the only reliable one.
+- Each card's `isNew` is `$newSaleKeys.has(_k(item))` where `_k(it) = "asset_id|date|stock|price.toFixed(2)"`. Backend produces matching keys in `_save_record`.
+
+### Group merge UI (Groups.svelte, v0.9.39)
+- Optimistic local mutation (`_localMerge`) — merges photos into target, removes source from `groups` array. Server call fires in background.
+- `animate:flip` on each group card → other cards smoothly reposition.
+- Custom `mergeFly` outro captures target rect BEFORE mutation, source card scales + translates toward it.
+- Full reload via `load({ force: true })` only on server error (rollback).
+
+### Stock UI metadata (Stocks tab) — when adding a new stock
+1. Add chrome profile dir `chrome_profile_StockName/`.
+2. Add to `STOCK_URLS` (sync landing) and `_INSPECTOR_URLS` (inspector deep-link).
+3. Add to `_stock_colors` in `recipes/stock_colors.json` (or default).
+4. Add to `INSPECTOR_STOCKS` array in `Browser.svelte`.
+5. Add to `STOCKS` array in `Browser.svelte` (filter pills).
+6. Write `_stockname_api_collect(pw_page)` following the Adobe/SS pattern.
+7. Wire into `_sync_all_global` SALES_STOCKS list.
 
 ## Pitfalls from experience
 

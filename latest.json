@@ -1,11 +1,11 @@
 {
-  "version": "0.9.41",
-  "notes": "Release v0.9.41",
-  "pub_date": "2026-05-29T11:05:12Z",
+  "version": "0.9.42",
+  "notes": "Release v0.9.42",
+  "pub_date": "2026-05-29T11:08:31Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRSEwzamdLZGJyTmZ0WTlubXVjWmtKQVl6d0hxbVE4b0pRNENXT1Z4Z1Nxa2N0V1YxUzdMcGdreXpNcTJPd3JKZTVSY3NPVHhWR2x0VldDOVR2YjZYeXhROWIrL1kvYVFrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgwMDUyNzEyCWZpbGU6U3RvY2sgQXV0b21hdGlvbi5hcHAudGFyLmd6ClptQks5K2JRNUZrTEJqTXRVMkVUZnhhbGFZeDVqY2VNa1pUOTJYeGlHdVgraXFxOHJHMmNaZWJ5R0wyQzl0aHliaGN1VERKT1ZvZmRKRGhuYmdabENnPT0K",
-      "url": "https://github.com/tarabamba-maker/nimbus-pkg/releases/download/v0.9.41/Stock.Automation.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRSEwzamdLZGJyTmF3djNlOVBQZnZRZWRCU1hjT2duVnArb0JRcnVNNjE0TGR0dmpHc2g3bEtTRWo1ZktFZFRpTEtmNXdDL2g4b2N3cWNnUVFiUEVBSTBvVWIyMXlEc0F3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgwMDUyOTExCWZpbGU6U3RvY2sgQXV0b21hdGlvbi5hcHAudGFyLmd6CllLQVBEalR1NncvSzA2bkEwNU54SHdIb3JobDV6aWl0Sk1yY3hQQSszaUh4OUErU1pnREZXekNKbXNlNFJrbzEycXhQODlSSXJQK3dsTGJhZXpKOERnPT0K",
+      "url": "https://github.com/tarabamba-maker/nimbus-pkg/releases/download/v0.9.42/Stock.Automation.app.tar.gz"
     }
   }
 }

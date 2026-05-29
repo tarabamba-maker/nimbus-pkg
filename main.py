@@ -294,8 +294,12 @@ def is_already_saved(stock, asset_id, price, date_str):
     1. If date_str has a time component (ISO from Adobe): exact datetime match
        against records stored with time.  Different sales of the same photo on
        the same day have different timestamps → correctly allowed.
-    2. Fallback: price±0.005 + day match, restricted to old date-only rows
-       (LENGTH(date)=10).  Catches re-synced duplicates stored before we kept time.
+    2. Fallback: price±0.005 + day match via substr(date,1,10). Matches BOTH
+       legacy 10-char and current 19-char rows.
+
+    ⚠️ DO NOT add `AND LENGTH(date)=10` — past bug: with all current rows in
+    19-char format, that filter matched nothing → SS daily aggregates were
+    re-inserted as duplicates every sync (6,241 dups deleted 2026-05-19).
     """
     if not asset_id:
         return False
@@ -357,9 +361,15 @@ flask_app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500 MB cap
 CORS(flask_app)
 
 def _save_record(d: dict):
-    """In-process save (no HTTP). Used by collectors to avoid async POST → /update
-    pattern that caused 'UI shows stale data after sync done' bug: sync thread
-    finishes before background HTTP POSTs reach Flask + commit to DB."""
+    """In-process save (no HTTP). Used by collectors as the ONLY save path.
+
+    ⚠️ DO NOT switch back to `_http_executor.submit(requests.post('/update', ...))`:
+    sync thread completes before background POSTs reach Flask → SSE 'done' fires
+    with stale DB → UI shows old data. The bug took 2 sessions to diagnose.
+
+    Also appends the inserted key to _session_new_keys for backend-tracked
+    blue-highlight diff (client reads via /api/sync/recent-keys). The dedup
+    guard before insert prevents already-known sales from polluting that list."""
     if not d: return
     raw_date = d.get('date'); dt = datetime.now()
     if raw_date:
@@ -605,10 +615,14 @@ def _adobe_collect_direct():
     total_items = pagination.get("total", 0)
     _sync_log(f"   → recent: {total_pages} стор., {total_items} записів")
 
+    # ⚠️ CRITICAL: stop_pages early-exit MUST use `break`, not `return True`.
+    # Past bug (v0.9.32→v0.9.41): `return True` killed the whole function,
+    # silently skipping Pass 2 forever. Symptom: log shows "Adobe direct
+    # recent: +N" then "done" without any "📅 Adobe direct: ..." chunk lines.
     stop_pages = False
     for pg in range(1, total_pages + 1):
         if _sync_stop_flag[0]: return True
-        if stop_pages: break   # exit Pass 1 — Pass 2 (historical chunks) still runs
+        if stop_pages: break   # exit Pass 1 only — Pass 2 below still runs
         data = page1 if pg == 1 else _get_page(
             f"/en/insights/sales-earnings?limit=1000&page={pg}&pv={int(time.time()*1000)}")
         if "error" in data:
@@ -2252,9 +2266,15 @@ def _ms_plus_collect_direct():
     dirs = [d for d in dirs_resp.get("list", []) if d.get("filestotal", 0) > 0]
     _sync_log(f"📁 MS+ direct: {len(dirs)} папок з файлами")
 
-    # Skip-unchanged: getfulllist gives filestotal per dir; if unchanged since
-    # last successful sync, the dir's contents haven't been touched on MS+ side
-    # (uploads/deletes change filestotal). Only fetch contentlist for changed dirs.
+    # Skip-unchanged (v0.9.36): getfulllist gives filestotal per dir; if
+    # unchanged since last successful sync, the dir's contents haven't been
+    # touched on MS+ side (uploads/deletes change filestotal). Only fetch
+    # contentlist for changed dirs.
+    #
+    # ⚠️ DO NOT remove _ms_dirs_state.json or weaken this check — without it
+    # every sync re-fetches all 152 directories sequentially (~30-60s wasted).
+    # To force a full re-sync (e.g., after suspected MS+ corruption):
+    #   rm recipes/_ms_dirs_state.json
     _ms_state_file = os.path.join(RECIPES_DIR, "_ms_dirs_state.json")
     try:
         with open(_ms_state_file) as _f:
@@ -2768,7 +2788,14 @@ def _sync_all_global():
     because it's slow (15k photos) and not needed before sales are visible —
     only required before rebuild-matches at the end.
 
-    SQLite contention is handled by WAL mode + timeout=15-60s on every conn."""
+    SQLite contention is handled by WAL mode + timeout=15-60s on every conn.
+
+    ⚠️ INVARIANTS — DO NOT BREAK:
+    - Cold-start (DB <1000 rows): SEQUENTIAL mode. 4 parallel collectors on
+      empty DB exhaust file descriptors / saturate rate limits.
+    - MS+ ALWAYS runs after the 4 sales stocks finish (not parallel with them).
+    - _session_new_keys.clear() at the START — this is what enables blue
+      highlights for new sales (client reads via /api/sync/recent-keys)."""
     if _sync_all_active[0]:
         _sync_log("⚠️ Sync already running!")
         return
@@ -5258,8 +5285,12 @@ def api_rebuild_matches():
     photos_synced = 0
 
     if not _snapshot:
-        # First run after migration / fresh DB — do classic full Pass D so that
-        # initial state is consistent. Subsequent runs use diff-based path below.
+        # ⚠️ First run after migration / fresh DB MUST use classic full Pass D.
+        # Reason: existing groups may already contain primaries (added before
+        # snapshot existed). Diff path treats all primaries as "added" and would
+        # place them in MS+ groups WITHOUT purging from old groups → photos end
+        # up in two groups. Classic purge-then-reassign is the only safe init.
+        # Subsequent runs use diff-based path below (preserves user moves).
         purge_aids = set()
         for primary in ms_authoritative:
             purge_aids.add(primary)

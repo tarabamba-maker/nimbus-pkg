@@ -98,6 +98,17 @@
   let _syncEs = /** @type {EventSource|null} */ (null);
   let _lastTick = get(syncTick);  // init to current tick so remount doesn't re-trigger load
 
+  // ⚠️ CRITICAL flow — read before modifying. Order matters:
+  //   1. Pre-bump _lastTick so the syncTick $effect below doesn't re-fetch
+  //      and wipe newSaleKeys we're about to set.
+  //   2. load(true, true) — skipCache=true → fetch fresh items reflecting DB.
+  //   3. /api/sync/recent-keys → backend-tracked new sale keys (RELIABLE).
+  //      DO NOT switch to client-side diff (broken twice — closure timing).
+  //   4. downloadsCache.write — must happen BEFORE notifySyncDone (which
+  //      wipes _dlMem) so cache survives.
+  //   5. notifySyncDone — increments syncTick, wipes other tabs' caches.
+  //   6. downloadsCache.write again — re-cache, otherwise on tab switch
+  //      remount would re-fetch and lose blue highlights.
   async function doRefresh() {
     if (syncing) return;
     syncing = true;
