@@ -642,7 +642,10 @@ def _adobe_collect_direct():
 
     _sync_log(f"✅ Adobe direct recent: +{total_saved}")
 
-    # Pass 2: historical 90-day chunks back 10 years
+    # Pass 2: historical chunks back 10 years.
+    # Chunk size: 360 days (Adobe's documented max is 364; using 360 leaves
+    # 4 days of safety margin in case Adobe tightens the limit).
+    # Cuts Pass 2 from ~40 chunks (90d each) to ~10 chunks → ~10s faster sync.
     proc_file = os.path.join(RECIPES_DIR, "_processed_dates.json")
     try:
         with open(proc_file) as f:
@@ -650,6 +653,22 @@ def _adobe_collect_direct():
     except Exception:
         all_proc = {}
     adobe_done = set(all_proc.get("Adobe Stock", []))
+
+    # First-sale guard: any chunk whose ENTIRE range falls before the user's
+    # first known Adobe sale is unconditionally empty and never needs re-check.
+    # For empty chunks in the post-first-sale window we DON'T mark them done →
+    # they get re-checked next sync (cheap 1-request probe; protects against
+    # API breakage that would otherwise silently lose history).
+    try:
+        with sqlite3.connect(DB_NAME, timeout=15) as _c:
+            _r = _c.execute(
+                "SELECT substr(MIN(date),1,10) FROM sales WHERE stock='Adobe Stock'"
+            ).fetchone()
+            _first_sale_str = _r[0] if _r and _r[0] else None
+        first_sale_d = (datetime.strptime(_first_sale_str, '%Y-%m-%d').date()
+                        if _first_sale_str else None)
+    except Exception:
+        first_sale_d = None
 
     def _months_in_range(start, end):
         months = set()
@@ -665,9 +684,17 @@ def _adobe_collect_direct():
     hist_saved = 0
     while chunk_end > cutoff:
         if _sync_stop_flag[0]: break
-        chunk_start = max(chunk_end - timedelta(days=89), cutoff)
+        chunk_start = max(chunk_end - timedelta(days=359), cutoff)
         months = _months_in_range(chunk_start, chunk_end)
         if months.issubset(adobe_done):
+            chunk_end = chunk_start - timedelta(days=1); continue
+        # Pre-first-sale chunk: skip entirely + mark all months done forever.
+        if first_sale_d and chunk_end.date() < first_sale_d:
+            adobe_done.update(months)
+            all_proc["Adobe Stock"] = sorted(adobe_done)
+            try:
+                with open(proc_file, "w") as f: json.dump(all_proc, f, indent=2)
+            except Exception: pass
             chunk_end = chunk_start - timedelta(days=1); continue
         s_str = chunk_start.strftime("%Y-%m-%d")
         e_str = chunk_end.strftime("%Y-%m-%d")
@@ -715,11 +742,15 @@ def _adobe_collect_direct():
 
         if chunk_new > 0:
             _sync_log(f"   ✚ {chunk_new} new")
-        adobe_done.update(months)
-        all_proc["Adobe Stock"] = sorted(adobe_done)
-        try:
-            with open(proc_file, "w") as f: json.dump(all_proc, f, indent=2)
-        except Exception: pass
+        # Only mark months as "done" if Adobe actually returned records for this
+        # chunk. Empty responses might be a temporary API breakage (history: 2021-2023
+        # was lost this way once). Re-checking an empty chunk next sync costs 1 request.
+        if range_total > 0:
+            adobe_done.update(months)
+            all_proc["Adobe Stock"] = sorted(adobe_done)
+            try:
+                with open(proc_file, "w") as f: json.dump(all_proc, f, indent=2)
+            except Exception: pass
         chunk_end = chunk_start - timedelta(days=1)
         time.sleep(0.2)
 
