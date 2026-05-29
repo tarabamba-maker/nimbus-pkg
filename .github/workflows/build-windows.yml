@@ -109,10 +109,10 @@ jobs:
           # Upload the .sig alongside the installer (already uploaded in step 6)
           gh release upload "$TAG" "$WIN_SIG" --clobber
 
-          WIN_SIG_CONTENT=$(cat "$WIN_SIG")
+          export WIN_SIG_CONTENT=$(cat "$WIN_SIG")
           WIN_FNAME=$(basename "$WIN_INSTALLER")
           # GitHub URLs use dots instead of spaces
-          WIN_URL="https://github.com/${REPO}/releases/download/${TAG}/${WIN_FNAME// /.}"
+          export WIN_URL="https://github.com/${REPO}/releases/download/${TAG}/${WIN_FNAME// /.}"
 
           # Download the Mac-only latest.json that release.sh uploaded.
           # Use RUNNER_TEMP (cross-platform; Git Bash on Windows handles paths
