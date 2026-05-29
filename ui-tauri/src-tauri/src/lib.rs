@@ -61,9 +61,14 @@ fn python_has_deps(python: &str) -> bool {
     // ⚠️ KEEP THIS LIST IN SYNC WITH main.py's top-level imports.
     // If a module main.py needs isn't listed here, the launcher may pick a Python
     // missing it → Flask crashes at startup with ModuleNotFoundError → empty UI
-    // with no clear error. flask_cors and requests are mandatory.
+    // with no clear error.
+    //
+    // `browser_cookie3` is REQUIRED on Windows (Chrome cookie decryption) but
+    // optional on macOS (Safari binarycookies parsed in-tree). The import check
+    // verifies all platforms uniformly so launches with the wrong Python pick
+    // up the absence quickly.
     Command::new(python)
-        .args(["-c", "import flask, flask_cors, playwright, PIL, bs4, requests"])
+        .args(["-c", "import flask, flask_cors, playwright, PIL, bs4, requests, browser_cookie3"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()

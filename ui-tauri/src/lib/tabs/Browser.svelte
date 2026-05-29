@@ -25,6 +25,18 @@
   const STOCKS = ['Adobe Stock', 'Shutterstock', 'Getty Images', 'Depositphotos'];
   const STOCK_COLORS = $derived($stockColors);
 
+  let debugCopyMsg = $state('');
+  async function copyDebugLog() {
+    try {
+      const txt = await fetch(API_BASE + '/api/debug/log?n=400').then(r => r.text());
+      await navigator.clipboard.writeText(txt);
+      debugCopyMsg = '✓ Copied';
+    } catch (e) {
+      debugCopyMsg = '✗ ' + (e.message || 'error');
+    }
+    setTimeout(() => { debugCopyMsg = ''; }, 2000);
+  }
+
   /** @param {string|null} [stockName] */
   async function startStream(stockName = null) {
     stopSyncStream();
@@ -133,6 +145,17 @@
     {#if logs.length === 0}
       <div class="dim" style="font-size:11px">Log will appear after sync starts…</div>
     {/if}
+  </div>
+
+  <!-- ── Debug logs ───────────────────────────── -->
+  <div class="inspector-section card">
+    <div class="inspector-header">
+      <span class="inspector-title">Debug logs</span>
+      <span class="inspector-sub dim">копіюй сюди коли репортиш баг</span>
+      <div class="inspector-controls">
+        <button class="action-pill" onclick={copyDebugLog}>{debugCopyMsg || 'Copy logs'}</button>
+      </div>
+    </div>
   </div>
 
   <!-- ── Network Inspector ───────────────────────────── -->

@@ -42,7 +42,7 @@ jobs:
 
       # ── 3. Python deps (needed to verify packages import in lib.rs) ────────
       - name: Install Python packages
-        run: pip install flask playwright pillow beautifulsoup4 requests
+        run: pip install flask flask-cors playwright pillow beautifulsoup4 requests browser-cookie3
 
       # ── 4. Frontend deps ───────────────────────────────────────────────────
       - name: npm install
@@ -88,25 +88,29 @@ jobs:
           TAG="${{ github.ref_name }}"
           REPO="${{ github.repository }}"
 
-          # Tauri 2 updater artifact: NSIS .zip + .sig (preferred), else MSI .zip + .sig
-          WIN_ZIP=$(find ui-tauri/src-tauri/target/release/bundle/nsis -name "*.zip" 2>/dev/null | head -1)
-          WIN_SIG=$(find ui-tauri/src-tauri/target/release/bundle/nsis -name "*.sig" 2>/dev/null | head -1)
+          # Tauri 2 on Windows produces the installer file as the updater payload.
+          # NSIS preferred (smaller, no admin needed for per-user install):
+          #   *-setup.exe + *-setup.exe.sig
+          # Fallback to MSI:
+          #   *_x64_en-US.msi + *_x64_en-US.msi.sig
+          WIN_INSTALLER=$(find ui-tauri/src-tauri/target/release/bundle/nsis -name "*-setup.exe" 2>/dev/null | head -1)
+          WIN_SIG=$(find ui-tauri/src-tauri/target/release/bundle/nsis -name "*-setup.exe.sig" 2>/dev/null | head -1)
 
-          if [ -z "$WIN_ZIP" ]; then
-            WIN_ZIP=$(find ui-tauri/src-tauri/target/release/bundle/msi -name "*.zip" 2>/dev/null | head -1)
-            WIN_SIG=$(find ui-tauri/src-tauri/target/release/bundle/msi -name "*.sig" 2>/dev/null | head -1)
+          if [ -z "$WIN_INSTALLER" ]; then
+            WIN_INSTALLER=$(find ui-tauri/src-tauri/target/release/bundle/msi -name "*.msi" 2>/dev/null | head -1)
+            WIN_SIG=$(find ui-tauri/src-tauri/target/release/bundle/msi -name "*.msi.sig" 2>/dev/null | head -1)
           fi
 
-          if [ -z "$WIN_ZIP" ] || [ -z "$WIN_SIG" ]; then
-            echo "No updater artifacts (.zip + .sig) found — skipping latest.json update"
+          if [ -z "$WIN_INSTALLER" ] || [ -z "$WIN_SIG" ]; then
+            echo "No updater artifacts (.exe/.msi + .sig) found — skipping latest.json update"
             exit 0
           fi
 
-          # Upload updater zip + signature to release
-          gh release upload "$TAG" "$WIN_ZIP" "$WIN_SIG" --clobber
+          # Upload the .sig alongside the installer (already uploaded in step 6)
+          gh release upload "$TAG" "$WIN_SIG" --clobber
 
           WIN_SIG_CONTENT=$(cat "$WIN_SIG")
-          WIN_FNAME=$(basename "$WIN_ZIP")
+          WIN_FNAME=$(basename "$WIN_INSTALLER")
           # GitHub URLs use dots instead of spaces
           WIN_URL="https://github.com/${REPO}/releases/download/${TAG}/${WIN_FNAME// /.}"
 

@@ -1,6 +1,11 @@
-import ssl, time, threading, sqlite3, os, re, json, base64, atexit
+import ssl, time, threading, sqlite3, os, re, json, base64, atexit, sys
 from io import BytesIO
 from datetime import datetime, timedelta
+
+# Platform: 'darwin' (macOS), 'win32' (Windows), 'linux'.
+# Used for browser-cookie source selection (Safari on mac vs Chrome on Windows).
+IS_MAC = sys.platform == 'darwin'
+IS_WIN = sys.platform == 'win32'
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
@@ -9,17 +14,19 @@ ssl._create_default_https_context = ssl._create_unverified_context
 # With 5 parallel direct-API collectors each holding HTTPS connection pool +
 # SQLite connections + img_executor threads, 4096 wasn't enough → "Too many
 # open files" mid-sync killed Getty's DB writes. Try 65536, fall back stepwise.
-try:
-    import resource as _res
-    _, _hard = _res.getrlimit(_res.RLIMIT_NOFILE)
-    for _target in (65536, 32768, 16384, 8192, 4096):
-        try:
-            _res.setrlimit(_res.RLIMIT_NOFILE, (_target, _hard if _hard >= _target else _target))
-            break
-        except Exception:
-            continue
-except Exception:
-    pass
+# Unix only — `resource` module doesn't exist on Windows (fds managed differently).
+if not IS_WIN:
+    try:
+        import resource as _res
+        _, _hard = _res.getrlimit(_res.RLIMIT_NOFILE)
+        for _target in (65536, 32768, 16384, 8192, 4096):
+            try:
+                _res.setrlimit(_res.RLIMIT_NOFILE, (_target, _hard if _hard >= _target else _target))
+                break
+            except Exception:
+                continue
+    except Exception:
+        pass
 
 # ── Логування у файл + термінал ──────────────────────────────
 _LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.log")
@@ -556,15 +563,14 @@ def _adobe_collect_direct():
     returns HTML login page, not JSON)."""
     _sync_log("🚀 Adobe direct: старт...")
 
-    safari_path = os.path.expanduser(
-        "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
-    if not os.path.exists(safari_path):
-        _sync_log("⚠️ Adobe direct: Safari cookies missing — fallback")
-        return False
+    # Cross-platform: Safari on mac / Chrome on Windows. See _load_browser_cookies.
     try:
-        all_cookies = _parse_safari_binarycookies(safari_path)
+        all_cookies = _load_browser_cookies()
     except Exception as e:
-        _sync_log(f"⚠️ Adobe direct: parse failed: {e} — fallback")
+        _sync_log(f"⚠️ Adobe direct: cookies read failed: {e} — fallback")
+        return False
+    if not all_cookies:
+        _sync_log("⚠️ Adobe direct: no browser cookies — log in to Adobe in Safari (mac) / Chrome (win)")
         return False
 
     adobe_cookies = {c['name']: c['value'] for c in all_cookies
@@ -783,15 +789,13 @@ def _depositphotos_collect_direct():
     _sync_log("🚀 Depositphotos direct: старт...")
     from bs4 import BeautifulSoup
 
-    safari_path = os.path.expanduser(
-        "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
-    if not os.path.exists(safari_path):
-        _sync_log("⚠️ Deposit direct: Safari cookies missing — fallback")
-        return False
     try:
-        all_cookies = _parse_safari_binarycookies(safari_path)
+        all_cookies = _load_browser_cookies()
     except Exception as e:
-        _sync_log(f"⚠️ Deposit direct: parse failed: {e} — fallback")
+        _sync_log(f"⚠️ Deposit direct: cookies read failed: {e} — fallback")
+        return False
+    if not all_cookies:
+        _sync_log("⚠️ Deposit direct: no browser cookies — log in to Deposit in Safari (mac) / Chrome (win)")
         return False
 
     dp_cookies = {c['name']: c['value'] for c in all_cookies
@@ -1155,18 +1159,16 @@ def _shutterstock_api_collect_direct():
     """
     _sync_log("🚀 Shutterstock direct API: старт...")
 
-    safari_path = os.path.expanduser(
-        "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
-    if not os.path.exists(safari_path):
-        _sync_log("⚠️ Shutterstock direct: Safari cookies not found — fallback to Playwright")
-        return False
     try:
-        all_cookies = _parse_safari_binarycookies(safari_path)
+        all_cookies = _load_browser_cookies()
     except PermissionError:
-        _sync_log("⚠️ Shutterstock direct: Full Disk Access не наданий — fallback")
+        _sync_log("⚠️ Shutterstock direct: Full Disk Access не наданий (mac) — fallback")
         return False
     except Exception as e:
-        _sync_log(f"⚠️ Shutterstock direct: parse failed: {e} — fallback")
+        _sync_log(f"⚠️ Shutterstock direct: cookies read failed: {e} — fallback")
+        return False
+    if not all_cookies:
+        _sync_log("⚠️ Shutterstock direct: no browser cookies — log in in Safari (mac) / Chrome (win)")
         return False
 
     ss_cookies = {c['name']: c['value'] for c in all_cookies
@@ -1648,15 +1650,13 @@ def _getty_collect_direct():
             _sync_log(f"⏭️  Getty: вже синкався {last_run_str} (раз на місяць досить) — skip")
             return True
 
-    safari_path = os.path.expanduser(
-        "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
-    if not os.path.exists(safari_path):
-        _sync_log("⚠️ Getty direct: Safari cookies missing — fallback")
-        return False
     try:
-        all_cookies = _parse_safari_binarycookies(safari_path)
+        all_cookies = _load_browser_cookies()
     except Exception as e:
-        _sync_log(f"⚠️ Getty direct: parse failed: {e} — fallback")
+        _sync_log(f"⚠️ Getty direct: cookies read failed: {e} — fallback")
+        return False
+    if not all_cookies:
+        _sync_log("⚠️ Getty direct: no browser cookies — log in to ESP in Safari (mac) / Chrome (win)")
         return False
 
     g_cookies = {c['name']: c['value'] for c in all_cookies
@@ -2219,15 +2219,13 @@ def _ms_plus_collect_direct():
     Tested: 163 folders + paginated photos returned in <1 minute."""
     _sync_log("🚀 Microstock+ direct: старт...")
 
-    safari_path = os.path.expanduser(
-        "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
-    if not os.path.exists(safari_path):
-        _sync_log("⚠️ MS+ direct: Safari cookies missing — fallback")
-        return False
     try:
-        all_cookies = _parse_safari_binarycookies(safari_path)
+        all_cookies = _load_browser_cookies()
     except Exception as e:
-        _sync_log(f"⚠️ MS+ direct: parse failed: {e} — fallback")
+        _sync_log(f"⚠️ MS+ direct: cookies read failed: {e} — fallback")
+        return False
+    if not all_cookies:
+        _sync_log("⚠️ MS+ direct: no browser cookies — log in to microstock.plus in Safari (mac) / Chrome (win)")
         return False
 
     ms_cookies = {c['name']: c['value'] for c in all_cookies
@@ -3919,6 +3917,59 @@ def _is_chrome_running():
         return False
 
 
+# ═══════════════════════════════════════════════════════════
+# Cross-platform browser cookies
+# ═══════════════════════════════════════════════════════════
+# Collectors authenticate to stock sites by reading session cookies set by
+# the user in their native browser. On macOS we parse Safari's
+# Cookies.binarycookies directly. On Windows there's no Safari — we read
+# Chrome's encrypted cookie store via the `browser_cookie3` library.
+#
+# Unified return shape: list of {'name', 'value', 'domain'} dicts. Existing
+# Mac collectors filter by domain in-place — Windows path returns ALL cookies
+# (filtering happens at call site).
+
+def _load_chrome_cookies_windows():
+    """Read all Chrome cookies on Windows via browser_cookie3 (handles DPAPI
+    decryption of master key + AES-GCM of values). Returns list of dicts.
+    Returns [] if browser_cookie3 isn't installed or Chrome isn't found."""
+    try:
+        import browser_cookie3 as _bc3
+    except ImportError:
+        _app_log("⚠️ browser_cookie3 not installed — Windows cookie reading disabled. "
+                 "Install with: pip install browser-cookie3")
+        return []
+    out = []
+    try:
+        jar = _bc3.chrome()
+        for c in jar:
+            out.append({
+                'name':   c.name,
+                'value':  c.value,
+                'domain': c.domain.lstrip('.'),
+            })
+    except Exception as e:
+        _app_log(f"⚠️ Chrome cookie read failed: {e}")
+    return out
+
+def _load_browser_cookies():
+    """OS-agnostic: returns all browser cookies as list of dicts.
+    On macOS: Safari binarycookies. On Windows: Chrome via browser_cookie3."""
+    if IS_MAC:
+        path = os.path.expanduser(
+            "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
+        if not os.path.exists(path):
+            return []
+        try:
+            return _parse_safari_binarycookies(path)
+        except Exception as e:
+            _app_log(f"⚠️ Safari cookies parse failed: {e}")
+            return []
+    if IS_WIN:
+        return _load_chrome_cookies_windows()
+    return []
+
+
 def _parse_safari_binarycookies(filepath):
     """Parse Apple's binarycookies format. Returns list of cookie dicts."""
     import struct
@@ -4681,14 +4732,13 @@ def api_refresh_istock_thumbs():
     if not target:
         return jsonify({'status': 'ok', 'msg': 'no iStock aids missing pHash', 'updated': 0})
 
-    safari_path = os.path.expanduser(
-        "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
-    if not os.path.exists(safari_path):
-        return jsonify({'status': 'error', 'msg': 'Safari cookies missing'}), 400
     try:
-        all_cookies = _parse_safari_binarycookies(safari_path)
+        all_cookies = _load_browser_cookies()
     except Exception as e:
-        return jsonify({'status': 'error', 'msg': f'cookie parse failed: {e}'}), 500
+        return jsonify({'status': 'error', 'msg': f'cookie read failed: {e}'}), 500
+    if not all_cookies:
+        return jsonify({'status': 'error',
+                        'msg': 'no browser cookies (Safari on mac / Chrome on win)'}), 400
 
     g_cookies = {c['name']: c['value'] for c in all_cookies
                  if 'gettyimages' in c.get('domain', '').lower()}
@@ -5457,6 +5507,35 @@ def api_matches_post():
 def api_sync_status():
     """Поточний стан синхронізації."""
     return jsonify(_sync_state)
+
+@flask_app.route('/api/debug/log', methods=['GET'])
+def api_debug_log():
+    """Last N lines of app.log + sync log + platform info. UI exposes a Copy
+    Logs button (Browser tab) so the user can paste into bug reports without
+    digging through filesystem paths that differ by OS."""
+    n = int(request.args.get('n', 300))
+    out = []
+    out.append(f"=== Platform: {sys.platform} ===")
+    try:
+        import platform as _pl
+        out.append(f"OS: {_pl.platform()}")
+        out.append(f"Python: {sys.version.split()[0]} at {sys.executable}")
+    except Exception: pass
+    out.append(f"App version: see ui-tauri/src-tauri/tauri.conf.json")
+    out.append("")
+    out.append("=== Recent sync log ===")
+    with _sync_log_lock:
+        out.extend(list(_sync_state.get('log', []))[-100:])
+    out.append("")
+    out.append(f"=== Last {n} lines of app.log ===")
+    try:
+        if os.path.exists(_LOG_FILE):
+            with open(_LOG_FILE, errors='replace') as f:
+                lines = f.readlines()
+            out.extend(l.rstrip() for l in lines[-n:])
+    except Exception as e:
+        out.append(f"<failed to read app.log: {e}>")
+    return ('\n'.join(out), 200, {'Content-Type': 'text/plain; charset=utf-8'})
 
 @flask_app.route('/api/sync/recent-keys', methods=['GET'])
 def api_sync_recent_keys():
