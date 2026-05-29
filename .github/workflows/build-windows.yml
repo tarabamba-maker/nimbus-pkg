@@ -114,22 +114,29 @@ jobs:
           # GitHub URLs use dots instead of spaces
           WIN_URL="https://github.com/${REPO}/releases/download/${TAG}/${WIN_FNAME// /.}"
 
-          # Download the Mac-only latest.json that release.sh uploaded
-          gh release download "$TAG" --pattern "latest.json" --dir /tmp --clobber
+          # Download the Mac-only latest.json that release.sh uploaded.
+          # Use RUNNER_TEMP (cross-platform; Git Bash on Windows handles paths
+          # with backslashes inside Python but /tmp/ doesn't exist there).
+          TMP_DIR="${RUNNER_TEMP:-/tmp}"
+          mkdir -p "$TMP_DIR"
+          gh release download "$TAG" --pattern "latest.json" --dir "$TMP_DIR" --clobber
+          export LATEST_JSON_PATH="$TMP_DIR/latest.json"
 
           # Add windows-x86_64 entry and re-upload
           python -c "
           import json, os
-          with open('/tmp/latest.json') as f:
+          p = os.environ['LATEST_JSON_PATH']
+          with open(p) as f:
               d = json.load(f)
+          d.setdefault('platforms', {})
           d['platforms']['windows-x86_64'] = {
               'signature': os.environ['WIN_SIG_CONTENT'],
               'url':       os.environ['WIN_URL'],
           }
-          with open('/tmp/latest.json', 'w') as f:
+          with open(p, 'w') as f:
               json.dump(d, f, indent=2)
-          print('latest.json updated:', json.dumps(d['platforms'].keys(), default=list))
+          print('latest.json platforms:', list(d['platforms'].keys()))
           "
 
-          gh release upload "$TAG" /tmp/latest.json --clobber
+          gh release upload "$TAG" "$LATEST_JSON_PATH" --clobber
           echo "latest.json now has both darwin-aarch64 and windows-x86_64"
