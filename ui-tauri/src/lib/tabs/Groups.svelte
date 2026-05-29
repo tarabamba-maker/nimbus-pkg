@@ -3,7 +3,8 @@
   import { onMount, untrack } from 'svelte';
   import { get } from 'svelte/store';
   import { scale, fly } from 'svelte/transition';
-  import { backOut } from 'svelte/easing';
+  import { flip } from 'svelte/animate';
+  import { backOut, cubicOut } from 'svelte/easing';
   import { RefreshCw, RotateCcw, Pencil, Trash2, Link, Plus, X, UserPlus, Merge } from 'lucide-svelte';
   import PhotoPopup from '$lib/PhotoPopup.svelte';
   import { stockColors } from '$lib/stockColors.js';
@@ -31,6 +32,29 @@
   let matching     = $state(false);
   let matchingInCard = $state(/** @type {string|null} */ (null));
   let refreshingIstock = $state(false);
+
+  /** Captured DOM rect for the merge target — used by mergeFly outro to fly
+   *  the source card toward where its photos will end up. Refreshed at each
+   *  merge call site. */
+  let _mergeTargetRect = /** @type {DOMRect|null} */ (null);
+
+  /** Svelte outro: scale + translate toward _mergeTargetRect (Finder-style merge). */
+  function mergeFly(/** @type {HTMLElement} */ node) {
+    const src = node.getBoundingClientRect();
+    const tgt = _mergeTargetRect;
+    const dx = tgt ? (tgt.left + tgt.width / 2) - (src.left + src.width / 2) : 0;
+    const dy = tgt ? (tgt.top  + tgt.height / 2) - (src.top  + src.height / 2) : 0;
+    return {
+      duration: 380, easing: cubicOut,
+      css: (t) => {
+        const u = 1 - t;  // 0→1 as anim progresses
+        const tx = dx * u;
+        const ty = dy * u;
+        const s  = 1 - 0.7 * u;
+        return `transform: translate(${tx}px, ${ty}px) scale(${s}); opacity: ${t};`;
+      },
+    };
+  }
 
   // In-modal match mode
   let modalMatchPending = $state(/** @type {any} */ (null));
@@ -291,35 +315,64 @@
     }
   }
 
+  /** Optimistic local merge: mutate groups array immediately, fire server in
+   *  background, no full reload. animate:flip handles the layout reflow. */
+  function _localMerge(/** @type {string} */ source, /** @type {string} */ target) {
+    const srcG = groups.find(g => g.name === source);
+    const tgtG = groups.find(g => g.name === target);
+    if (!srcG || !tgtG) return;
+    // Capture target rect BEFORE mutation so mergeFly outro can read it.
+    const tgtEl = /** @type {HTMLElement|null} */ (document.querySelector(`[data-group-name="${CSS.escape(target)}"]`));
+    _mergeTargetRect = tgtEl ? tgtEl.getBoundingClientRect() : null;
+    // Merge photos + bump count + sum earnings.
+    const merged = [...(tgtG.photos || []), ...(srcG.photos || [])];
+    const seen = new Set(); const dedup = [];
+    for (const p of merged) {
+      const k = p.asset_id || p.id;
+      if (k && !seen.has(k)) { seen.add(k); dedup.push(p); }
+    }
+    tgtG.photos = dedup;
+    tgtG.count = (tgtG.count || 0) + (srcG.count || 0);
+    tgtG.total = (tgtG.total || 0) + (srcG.total || 0);
+    groups = groups.filter(g => g.name !== source);
+  }
+
   async function mergeGroup() {
     const target = mergeTarget.trim();
     if (!target || !merging || target === merging) return;
-    const r = await fetch(API_BASE + '/api/photo-groups/merge', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ source: merging, target }),
-    }).then(r => r.json());
-    if (r.status === 'ok') {
-      mergeMsg = `✅ Merged into "${target}" (${r.merged} photos)`;
-      setTimeout(() => { merging = null; mergeTarget = ''; mergeMsg = ''; }, 2000);
-      modalGroup = null;
-      await load({ force: true }); onGroupsChange?.();
-    } else {
-      mergeMsg = `❌ ${r.msg || 'Error'}`;
+    const source = merging;
+    _localMerge(source, target);
+    mergeMsg = `✅ Merged into "${target}"`;
+    setTimeout(() => { merging = null; mergeTarget = ''; mergeMsg = ''; }, 1200);
+    modalGroup = null;
+    try {
+      const r = await fetch(API_BASE + '/api/photo-groups/merge', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source, target }),
+      }).then(r => r.json());
+      if (r.status !== 'ok') {
+        mergeMsg = `❌ ${r.msg || 'Error'}`;
+        await load({ force: true });
+      }
+    } catch {
+      await load({ force: true });
     }
+    onGroupsChange?.();
   }
 
-  /** Card-click merge: call this when user clicks a group card while mergeClickSrc is set. */
   async function mergeClickDo(/** @type {string} */ targetName) {
     const source = mergeClickSrc;
     if (!source || source === targetName) { mergeClickSrc = null; return; }
     mergeClickSrc = null;
-    const r = await fetch(API_BASE + '/api/photo-groups/merge', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ source, target: targetName }),
-    }).then(r => r.json());
-    if (r.status === 'ok') {
-      await load({ force: true }); onGroupsChange?.();
-    }
+    _localMerge(source, targetName);
+    try {
+      const r = await fetch(API_BASE + '/api/photo-groups/merge', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source, target: targetName }),
+      }).then(r => r.json());
+      if (r.status !== 'ok') await load({ force: true });
+    } catch { await load({ force: true }); }
+    onGroupsChange?.();
   }
 
   /** @param {string} groupName @param {any} ph */
@@ -435,7 +488,10 @@
       {#each visibleGroups as g, i (g.name)}
         {@const isMergeSrc = mergeClickSrc === g.name}
         <div class="group-card {mergeClickSrc ? 'merge-pick' : ''} {isMergeSrc ? 'merge-src' : ''}"
+          data-group-name={g.name}
+          animate:flip={{ duration: 320, easing: cubicOut }}
           in:fly={i < 15 ? { y: 14, duration: 180, delay: i * 16 } : { y: 0, duration: 0 }}
+          out:mergeFly
           role="button" tabindex="0"
           onclick={() => {
             if (mergeClickSrc) { mergeClickDo(g.name); return; }
