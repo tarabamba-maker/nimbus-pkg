@@ -371,7 +371,22 @@ def _save_record(d: dict):
             except Exception: pass
     d['date']  = dt.strftime("%Y-%m-%d %H:%M:%S")
     d['stock'] = d.get('stock', 'Adobe Stock')
+    # Dedup guard: skip if already in DB (collectors call this without checking).
+    # Without this, re-syncs would balloon _session_new_keys with duplicates.
+    try:
+        if is_already_saved(d['stock'], d.get('asset_id', ''), d.get('price', 0), d['date']):
+            return
+    except Exception:
+        pass
     save_to_db(d)
+    # Record the key for client blue-highlight diff. Uses 10-char date prefix
+    # so it matches /api/feed which slices date to YYYY-MM-DD.
+    try:
+        key = f"{d.get('asset_id','')}|{d['date'][:10]}|{d['stock']}|{float(d.get('price') or 0):.2f}"
+        with _session_new_keys_lock:
+            _session_new_keys.append(key)
+    except Exception:
+        pass
 
 @flask_app.route('/update', methods=['POST'])
 def api_update():
@@ -388,6 +403,12 @@ def api_update():
 _sync_state: dict = {"running": False, "log": [], "progress": ""}
 _sync_stop_flag: list  = [False]   # [0] = True → зупинити синк
 _sync_all_active: list = [False]   # [0] = True → синк вже запущено
+# Keys of sales inserted during the CURRENT/MOST-RECENT sync session.
+# Cleared at the start of each sync, appended by _save_record per insert.
+# Client reads via GET /api/sync/recent-keys to paint blue highlights —
+# this is more reliable than client-side diffing of cached items.
+_session_new_keys: list = []
+_session_new_keys_lock = threading.Lock()
 _headless_mode: bool   = True
 _headless_lock = threading.Lock()
 _sync_log_lock = threading.Lock()  # guards _sync_state["log"] reads/writes
@@ -2723,6 +2744,8 @@ def _sync_all_global():
     _sync_stop_flag[0]  = False
     _sync_state["running"] = True
     _sync_state["log"]     = []
+    with _session_new_keys_lock:
+        _session_new_keys.clear()
     # First-run safeguard: empty DB → sequential mode. From-scratch sync hits
     # the full backfill path in every collector (Adobe = 2900+ pages, SS = days
     # since 2018, Getty = all 63 statements + ESP thumbs). 4 parallel doing
@@ -2967,23 +2990,41 @@ def api_stats():
 
     today_d = now.date()
     week_start  = today_d - timedelta(days=today_d.weekday())   # Monday
-    prev_week   = week_start - timedelta(days=7)
-    month_start = today_d.replace(day=1)
-    prev_month  = (month_start - timedelta(days=1)).replace(day=1)
-    year_start  = today_d.replace(month=1, day=1)
-    prev_year   = year_start.replace(year=year_start.year - 1)
-    yesterday   = today_d - timedelta(days=1)
+    prev_week_start = week_start - timedelta(days=7)
+    # Same DOW progress in prev week (excl) — Mon..today maps to Mon..today-7
+    prev_week_end   = today_d - timedelta(days=7)
+    month_start     = today_d.replace(day=1)
+    # Same day-of-month in prev month, clamped if prev month is shorter
+    _pm_last_day    = (month_start - timedelta(days=1))
+    prev_month_start = _pm_last_day.replace(day=1)
+    try:
+        prev_month_end = prev_month_start.replace(day=today_d.day)
+    except ValueError:
+        prev_month_end = _pm_last_day  # e.g., 31 May → 30 Apr
+    year_start      = today_d.replace(month=1, day=1)
+    prev_year_start = year_start.replace(year=year_start.year - 1)
+    try:
+        prev_year_end = today_d.replace(year=today_d.year - 1)
+    except ValueError:
+        prev_year_end = today_d.replace(year=today_d.year - 1, day=28)
+    yesterday       = today_d - timedelta(days=1)
 
+    # Format: (current_from, current_to_exact_day_or_None, prev_from, prev_to_exclusive_or_None)
+    # current_to is None → range "date >= cur_from"
+    # prev_to is set → range "date >= prev_from AND date < prev_to" (same progress)
     spans = {
         'today': (today_d.strftime('%Y-%m-%d'),
                   yesterday.strftime('%Y-%m-%d'),
-                  yesterday.strftime('%Y-%m-%d')),
+                  yesterday.strftime('%Y-%m-%d'), None),
         'week':  (week_start.strftime('%Y-%m-%d'), None,
-                  prev_week.strftime('%Y-%m-%d')),
+                  prev_week_start.strftime('%Y-%m-%d'),
+                  prev_week_end.strftime('%Y-%m-%d')),
         'month': (month_start.strftime('%Y-%m-%d'), None,
-                  prev_month.strftime('%Y-%m-%d')),
+                  prev_month_start.strftime('%Y-%m-%d'),
+                  prev_month_end.strftime('%Y-%m-%d')),
         'year':  (year_start.strftime('%Y-%m-%d'), None,
-                  prev_year.strftime('%Y-%m-%d')),
+                  prev_year_start.strftime('%Y-%m-%d'),
+                  prev_year_end.strftime('%Y-%m-%d')),
     }
     result = {}
     with sqlite3.connect(DB_NAME, timeout=15) as conn:
@@ -2999,7 +3040,7 @@ def api_stats():
                 base_params + extra_params).fetchall()
             return {r[0]: {"total": round(float(r[1] or 0), 2), "count": r[2] or 0} for r in rows}
 
-        for key, (cur_from, cur_to, prev_from) in spans.items():
+        for key, (cur_from, cur_to, prev_from, prev_to) in spans.items():
             if cur_to:
                 # 'today' span: exact-day match. DB stores "YYYY-MM-DD HH:MM:SS",
                 # so plain `date = '2026-05-21'` never matches — use LIKE with day prefix.
@@ -3008,7 +3049,10 @@ def api_stats():
                 ps = q_stock("date LIKE ?", [cur_from + '%'])
             else:
                 cur_t, cur_c = q("date >= ?", [cur_from])
-                prv_t, _     = q("date >= ? AND date < ?", [prev_from, cur_from])
+                # Same-progress comparison: prev period from prev_from to prev_to
+                # (matches how far we are in the current period). Avoids unfair
+                # partial-vs-full comparisons that always yielded negative deltas.
+                prv_t, _     = q("date >= ? AND date < ?", [prev_from, prev_to])
                 ps = q_stock("date >= ?", [cur_from])
             result[key] = {
                 "total": cur_t, "count": cur_c,
@@ -5350,6 +5394,13 @@ def api_matches_post():
 def api_sync_status():
     """Поточний стан синхронізації."""
     return jsonify(_sync_state)
+
+@flask_app.route('/api/sync/recent-keys', methods=['GET'])
+def api_sync_recent_keys():
+    """Keys of sales inserted during the most recent sync session.
+    Client uses these to paint blue highlights. Survives until next sync starts."""
+    with _session_new_keys_lock:
+        return jsonify(list(_session_new_keys))
 
 @flask_app.route('/api/sync/stream')
 def api_sync_stream():

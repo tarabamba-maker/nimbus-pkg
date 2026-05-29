@@ -102,24 +102,18 @@
     if (syncing) return;
     syncing = true;
     syncLog = 'Starting sync…';
-    // Snapshot existing sales BEFORE sync. After sync, any items not in this
-    // set are "new" → painted blue. Survives tab switches via newSaleKeys store.
-    const before = new Set(items.map(_k));
 
     const finish = async () => {
       if (_syncEs) { _syncEs.close(); _syncEs = null; }
       await loadStockList();
-      // Force a fresh fetch (skip cache) so items reflect the post-sync DB.
       _lastTick++;        // pre-bump so syncTick $effect won't re-fetch
       await load(true, true);
-      // Compute "new" keys — diff fresh items vs pre-sync snapshot.
-      const fresh = new Set();
-      for (const it of items) {
-        const k = _k(it);
-        if (!before.has(k)) fresh.add(k);
-      }
-      newSaleKeys.set(fresh);
-      // Re-cache items (just in case notifySyncDone wipes it below).
+      // Reliable new-sale tracking: backend records inserted keys during sync,
+      // we fetch them here. No client-side diff timing issues.
+      try {
+        const keys = await fetch(API_BASE + '/api/sync/recent-keys').then(r => r.json());
+        newSaleKeys.set(new Set(keys || []));
+      } catch { newSaleKeys.set(new Set()); }
       downloadsCache.write({
         items, totalCount, period: get(currentPeriod), stock,
       });
@@ -128,7 +122,6 @@
       catch {}
       onRefresh?.();
       notifySyncDone();
-      // notifySyncDone clears cache — re-write after.
       downloadsCache.write({
         items, totalCount, period: get(currentPeriod), stock,
       });
