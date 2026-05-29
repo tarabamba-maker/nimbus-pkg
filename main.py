@@ -607,7 +607,8 @@ def _adobe_collect_direct():
 
     stop_pages = False
     for pg in range(1, total_pages + 1):
-        if _sync_stop_flag[0] or stop_pages: return True
+        if _sync_stop_flag[0]: return True
+        if stop_pages: break   # exit Pass 1 — Pass 2 (historical chunks) still runs
         data = page1 if pg == 1 else _get_page(
             f"/en/insights/sales-earnings?limit=1000&page={pg}&pv={int(time.time()*1000)}")
         if "error" in data:
