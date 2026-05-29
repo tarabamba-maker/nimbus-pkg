@@ -5613,13 +5613,26 @@ def _inspector_thread(stock_name: str, start_url: str):
             try: fh.close()
             except Exception: pass
 
+_INSPECTOR_URLS = {
+    # Override sync URLs with pages that expose the most useful XHR endpoints
+    # (insights/stats pages, where date filters live).
+    "Adobe Stock":   "https://contributor.stock.adobe.com/en/insights/sales-earnings",
+    "Shutterstock":  "https://submit.shutterstock.com/earnings",
+    "Getty Images":  "https://esp.gettyimages.com/contribute/stats",
+    "iStock":        "https://esp.gettyimages.com/contribute/stats",
+    "Depositphotos": "https://depositphotos.com/account/sales-history.html",
+    "Pond5":         "https://www.pond5.com/dashboard/index/sales",
+}
+
 @flask_app.route('/api/inspector/start', methods=['POST'])
 def api_inspector_start():
     if _inspector_state["running"]:
         return jsonify({"ok": False, "msg": "already running"})
     data  = request.get_json(force=True, silent=True) or {}
     stock = data.get("stock", "Depositphotos")
-    url   = STOCK_URLS.get(stock, "https://depositphotos.com/account/sales-history.html")
+    url   = (_INSPECTOR_URLS.get(stock)
+             or STOCK_URLS.get(stock)
+             or "https://depositphotos.com/account/sales-history.html")
     threading.Thread(target=_inspector_thread, args=(stock, url), daemon=True).start()
     return jsonify({"ok": True})
 
