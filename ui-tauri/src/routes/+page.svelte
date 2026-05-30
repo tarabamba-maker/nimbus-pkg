@@ -72,46 +72,59 @@
     { label: 'Browser',      Icon: RefreshCw },
   ];
 
-  // Delta matrix: per-period per-filter NEW earnings since last loadStats().
+  // Delta matrix: per-period per-filter NEW earnings since BASELINE.
+  // Baseline (_baselineStats) is what we compare against — it only advances
+  // when we actually see growth. This prevents the bug where two rapid
+  // loadStats() calls would compute delta vs each other (0) and wipe the green.
   // Shape: { today: { All: 12.5, 'Adobe Stock': 7.0, ... }, week: {...}, all: {...} }
-  // Filled from unfiltered stats — switching filter just changes which slice is displayed.
-  let deltasMatrix = $state(/** @type {Record<string, Record<string, number>>} */ ({}));
-  let _statsBaseline = false;  // first loadStats() just stores baseline, no deltas
+  let deltasMatrix     = $state(/** @type {Record<string, Record<string, number>>} */ ({}));
+  let _statsBaseline   = false;
+  let _baselineStats   = /** @type {any} */ (null);  // snapshot we diff against
 
   async function loadStats() {
     try {
-      // Always fetch unfiltered — filtered views are computed client-side from one snapshot,
-      // so switching filter never wipes deltas.
       const fresh = await fetch(API_BASE + '/api/stats').then(r => r.json());
 
-      const newD = /** @type {Record<string, Record<string, number>>} */ ({});
-      if (_statsBaseline) {
-        for (const k of ['today', 'week', 'month', 'year']) {
-          const perFilter = /** @type {Record<string, number>} */ ({});
-          const dAll = (fresh[k]?.total ?? 0) - (stats[k]?.total ?? 0);
-          if (dAll > 0.005) perFilter.All = dAll;
-          const freshBs = fresh[k]?.by_stock ?? {};
-          const oldBs   = stats[k]?.by_stock ?? {};
-          for (const s of Object.keys(freshBs)) {
-            const d = (freshBs[s]?.total ?? 0) - (oldBs[s]?.total ?? 0);
-            if (d > 0.005) perFilter[s] = d;
-          }
-          if (Object.keys(perFilter).length) newD[k] = perFilter;
-        }
-        // all-time deltas (uses top-level by_stock list)
-        const perFilterAll = /** @type {Record<string, number>} */ ({});
-        const dAllTime = (fresh.all?.total ?? 0) - (stats.all?.total ?? 0);
-        if (dAllTime > 0.005) perFilterAll.All = dAllTime;
-        const oldByStock = Object.fromEntries((stats.by_stock || []).map((/** @type {any} */ b) => [b.stock, b]));
-        for (const bs of (fresh.by_stock || [])) {
-          const d = (bs.total ?? 0) - (oldByStock[bs.stock]?.total ?? 0);
-          if (d > 0.005) perFilterAll[bs.stock] = d;
-        }
-        if (Object.keys(perFilterAll).length) newD.all = perFilterAll;
+      if (!_statsBaseline) {
+        _baselineStats = fresh;
+        _statsBaseline = true;
+        stats = fresh;
+        console.log('[+page] loadStats baseline set');
+        return;
       }
-      deltasMatrix = newD;
+
+      // Compute deltas vs persistent baseline (not vs last-shown stats).
+      const newD = /** @type {Record<string, Record<string, number>>} */ ({});
+      for (const k of ['today', 'week', 'month', 'year']) {
+        const perFilter = /** @type {Record<string, number>} */ ({});
+        const dAll = (fresh[k]?.total ?? 0) - (_baselineStats[k]?.total ?? 0);
+        if (dAll > 0.005) perFilter.All = dAll;
+        const freshBs = fresh[k]?.by_stock ?? {};
+        const oldBs   = _baselineStats[k]?.by_stock ?? {};
+        for (const s of Object.keys(freshBs)) {
+          const d = (freshBs[s]?.total ?? 0) - (oldBs[s]?.total ?? 0);
+          if (d > 0.005) perFilter[s] = d;
+        }
+        if (Object.keys(perFilter).length) newD[k] = perFilter;
+      }
+      const perFilterAll = /** @type {Record<string, number>} */ ({});
+      const dAllTime = (fresh.all?.total ?? 0) - (_baselineStats.all?.total ?? 0);
+      if (dAllTime > 0.005) perFilterAll.All = dAllTime;
+      const oldByStock = Object.fromEntries((_baselineStats.by_stock || []).map((/** @type {any} */ b) => [b.stock, b]));
+      for (const bs of (fresh.by_stock || [])) {
+        const d = (bs.total ?? 0) - (oldByStock[bs.stock]?.total ?? 0);
+        if (d > 0.005) perFilterAll[bs.stock] = d;
+      }
+      if (Object.keys(perFilterAll).length) newD.all = perFilterAll;
+
+      // Only update deltasMatrix when we actually computed new growth.
+      // Repeated loadStats() with unchanged data → preserve previously-shown
+      // green numbers instead of wiping them.
+      if (Object.keys(newD).length > 0) {
+        deltasMatrix   = newD;
+        _baselineStats = fresh;   // advance baseline so next delta is incremental
+      }
       stats = fresh;
-      _statsBaseline = true;
       console.log('[+page] loadStats OK: today=$' + (fresh.today?.total ?? 0));
     } catch (e) {
       console.error('[+page] loadStats FAILED:', e);

@@ -123,11 +123,19 @@ export function startSyncStream() {
   syncRunning.set(true);
   try {
     _syncEs = new EventSource(API_BASE + '/api/sync/stream');
-    _syncEs.onmessage = (e) => {
+    _syncEs.onmessage = async (e) => {
       try {
         const d = JSON.parse(e.data);
         if (d.done) {
           stopSyncStream();
+          // Fetch backend-tracked new-sale keys BEFORE notifySyncDone so blue
+          // highlights work for syncs started from ANY source (Downloads
+          // Refresh, Browser Start, resumed-on-mount, background poller).
+          // Without this, only Downloads.svelte doRefresh path updated keys.
+          try {
+            const keys = await fetch(API_BASE + '/api/sync/recent-keys').then(r => r.json());
+            newSaleKeys.set(new Set(keys || []));
+          } catch {}
           notifySyncDone();
         } else if (d.msg) {
           syncLog.update(arr => [...arr.slice(-499), d.msg]);
