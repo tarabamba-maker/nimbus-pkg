@@ -6,6 +6,18 @@ use tauri::RunEvent;
 
 static BACKEND: Mutex<Option<Child>> = Mutex::new(None);
 
+/// Apply CREATE_NO_WINDOW on Windows so subprocess invocations don't briefly
+/// flash a cmd.exe console window in front of the user. No-op on other OSes.
+#[allow(unused_mut)]
+fn no_console(mut cmd: Command) -> Command {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd
+}
+
 fn log_dir() -> std::path::PathBuf {
     #[cfg(target_os = "windows")]
     {
@@ -67,8 +79,8 @@ fn python_has_deps(python: &str) -> bool {
     // optional on macOS (Safari binarycookies parsed in-tree). The import check
     // verifies all platforms uniformly so launches with the wrong Python pick
     // up the absence quickly.
-    Command::new(python)
-        .args(["-c", "import flask, flask_cors, playwright, PIL, bs4, requests, browser_cookie3"])
+    let mut cmd = no_console(Command::new(python));
+    cmd.args(["-c", "import flask, flask_cors, playwright, PIL, bs4, requests, browser_cookie3"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -130,7 +142,7 @@ fn find_python3(project_root: Option<&std::path::Path>) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
         // Windows Python Launcher (py.exe) — resolves the latest installed Python
-        if let Ok(out) = Command::new("py").args(["-3", "-c", "import sys; print(sys.executable)"]).output() {
+        if let Ok(out) = no_console(Command::new("py")).args(["-3", "-c", "import sys; print(sys.executable)"]).output() {
             let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !path.is_empty() && std::path::Path::new(&path).exists() && python_has_deps(&path) {
                 log_line(&format!("python found via py launcher: {path}"));
@@ -147,7 +159,7 @@ fn find_python3(project_root: Option<&std::path::Path>) -> Option<String> {
     #[cfg(not(target_os = "windows"))]
     {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-        if let Ok(out) = Command::new(&shell).args(["-l", "-c", "command -v python3"]).output() {
+        if let Ok(out) = no_console(Command::new(&shell)).args(["-l", "-c", "command -v python3"]).output() {
             let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !path.is_empty() && std::path::Path::new(&path).exists() && python_has_deps(&path) {
                 log_line(&format!("python3 resolved via {shell} -l: {path}"));
@@ -210,7 +222,7 @@ fn start_backend() {
     #[cfg(not(target_os = "windows"))]
     let _ = Command::new("pkill").args(["-f", "main.py"]).status();
     #[cfg(target_os = "windows")]
-    let _ = Command::new("wmic")
+    let _ = no_console(Command::new("wmic"))
         .args(["process", "where", "CommandLine like '%main.py%'", "delete"])
         .status();
 
@@ -245,7 +257,7 @@ fn start_backend() {
     let _ = std::fs::create_dir_all(&data);
     log_line(&format!("STOCK_DATA_DIR = {}", data.display()));
 
-    let mut cmd = Command::new(&python);
+    let mut cmd = no_console(Command::new(&python));
     cmd.arg(&path)
         .current_dir(&data)
         .env("STOCK_DATA_DIR", &data);
@@ -266,7 +278,7 @@ fn stop_backend() {
         if let Some(mut child) = guard.take() {
             #[cfg(target_os = "windows")]
             // Kill entire process tree (Python may have spawned Chromium subprocesses)
-            let _ = Command::new("taskkill")
+            let _ = no_console(Command::new("taskkill"))
                 .args(["/F", "/T", "/PID", &child.id().to_string()])
                 .status();
             let _ = child.kill();
@@ -276,7 +288,7 @@ fn stop_backend() {
     #[cfg(not(target_os = "windows"))]
     let _ = Command::new("pkill").args(["-f", "main.py"]).status();
     #[cfg(target_os = "windows")]
-    let _ = Command::new("wmic")
+    let _ = no_console(Command::new("wmic"))
         .args(["process", "where", "CommandLine like '%main.py%'", "delete"])
         .status();
 }

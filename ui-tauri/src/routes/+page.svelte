@@ -46,6 +46,8 @@
     })();
   });
   let downloadsStock  = $state('All');
+  // Theme: persisted in localStorage so user's choice survives app restart.
+  // Default to dark on first launch; load saved preference on mount.
   let darkMode        = $state(true);
   let activeGroup     = $state(/** @type {any} */ (null)); // group open in Groups tab
 
@@ -145,12 +147,23 @@
     currentPeriod.set(PERIOD_MAP[key] || 'All-time');
   }
 
+  // Load persisted theme on first render (browser-only).
+  $effect(() => {
+    try {
+      const saved = localStorage.getItem('app_theme');
+      if (saved === 'light') darkMode = false;
+      else if (saved === 'dark') darkMode = true;
+    } catch {}
+  });
+
+  // Apply theme + persist on every change.
   $effect(() => {
     if (darkMode) {
       document.body.classList.remove('light');
     } else {
       document.body.classList.add('light');
     }
+    try { localStorage.setItem('app_theme', darkMode ? 'dark' : 'light'); } catch {}
   });
 
   // Refresh top stats whenever ANY tab triggers a sync completion.

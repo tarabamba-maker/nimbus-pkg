@@ -7,6 +7,12 @@ from datetime import datetime, timedelta
 IS_MAC = sys.platform == 'darwin'
 IS_WIN = sys.platform == 'win32'
 
+# Windows-only kwargs for subprocess to suppress cmd-window flashes.
+# subprocess.CREATE_NO_WINDOW = 0x0800_0000. We pass as creationflags.
+_SUBPROC_NOWINDOW = (
+    {'creationflags': 0x0800_0000} if IS_WIN else {}
+)
+
 ssl._create_default_https_context = ssl._create_unverified_context
 
 # Raise file descriptor limit. macOS default soft limit is 256, hard is
@@ -82,7 +88,7 @@ def _ensure_playwright_browsers():
     try:
         subprocess.run(
             [sys.executable, "-m", "playwright", "install", "chromium", "chromium-headless-shell"],
-            check=False, timeout=300)
+            check=False, timeout=300, **_SUBPROC_NOWINDOW)
         print("[Playwright] ✅ Browsers installed")
     except Exception as e:
         print(f"[Playwright] ⚠️ Install failed: {e}")
@@ -3927,7 +3933,7 @@ def _is_chrome_running():
         if IS_WIN:
             r = subprocess.run(
                 ['tasklist', '/FI', 'IMAGENAME eq chrome.exe', '/NH'],
-                capture_output=True, timeout=5, text=True)
+                capture_output=True, timeout=5, text=True, **_SUBPROC_NOWINDOW)
             return 'chrome.exe' in (r.stdout or '').lower()
         r = subprocess.run(['pgrep', '-f', 'Google Chrome'],
                            capture_output=True, timeout=5)
