@@ -29,8 +29,21 @@ if not IS_WIN:
         pass
 
 # ── Логування у файл + термінал ──────────────────────────────
-_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.log")
-_log_file_handle = open(_LOG_FILE, "a", encoding="utf-8", errors="replace", buffering=1)
+# Log MUST go to a user-writable directory. On Windows the packaged app sits
+# inside Program Files which is read-only — silent open() failure left the log
+# empty and made debugging impossible. Prefer STOCK_DATA_DIR (set by Tauri),
+# fall back to script dir for dev runs.
+_LOG_DIR  = os.environ.get("STOCK_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+try: os.makedirs(_LOG_DIR, exist_ok=True)
+except Exception: pass
+_LOG_FILE = os.path.join(_LOG_DIR, "app.log")
+try:
+    _log_file_handle = open(_LOG_FILE, "a", encoding="utf-8", errors="replace", buffering=1)
+except Exception:
+    # Last-resort: temp dir. We'd rather have a log than nothing.
+    import tempfile as _tf
+    _LOG_FILE = os.path.join(_tf.gettempdir(), "stock_automation_app.log")
+    _log_file_handle = open(_LOG_FILE, "a", encoding="utf-8", errors="replace", buffering=1)
 atexit.register(lambda: _log_file_handle.close())
 
 def _app_log(msg: str):
@@ -3907,14 +3920,43 @@ def api_ms_remove_from_group():
     return jsonify({'status': 'ok'})
 
 def _is_chrome_running():
-    """Returns True if Google Chrome is currently running (would lock cookies file)."""
+    """Returns True if Google Chrome is currently running (would lock cookies file).
+    Cross-platform: pgrep on Unix, tasklist on Windows."""
     import subprocess
     try:
+        if IS_WIN:
+            r = subprocess.run(
+                ['tasklist', '/FI', 'IMAGENAME eq chrome.exe', '/NH'],
+                capture_output=True, timeout=5, text=True)
+            return 'chrome.exe' in (r.stdout or '').lower()
         r = subprocess.run(['pgrep', '-f', 'Google Chrome'],
                            capture_output=True, timeout=5)
         return r.returncode == 0
     except Exception:
         return False
+
+def _chrome_cookies_path():
+    """Path to Chrome's cookies SQLite. Schema location differs per OS:
+       - macOS: ~/Library/Application Support/Google/Chrome/Default/Cookies
+       - Windows: %LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default\\Network\\Cookies
+                  (older Chromes: ...\\Default\\Cookies)
+       Returns the first existing path, or '' if none."""
+    candidates = []
+    if IS_WIN:
+        local = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~/AppData/Local')
+        candidates = [
+            os.path.join(local, 'Google', 'Chrome', 'User Data', 'Default', 'Network', 'Cookies'),
+            os.path.join(local, 'Google', 'Chrome', 'User Data', 'Default', 'Cookies'),
+        ]
+    else:
+        candidates = [
+            os.path.expanduser("~/Library/Application Support/Google/Chrome/Default/Cookies"),
+            os.path.expanduser("~/.config/google-chrome/Default/Cookies"),  # Linux
+        ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return ''
 
 
 # ═══════════════════════════════════════════════════════════
@@ -4180,29 +4222,40 @@ def api_import_chrome_cookies():
     requested = (data.get('source') or '').lower()
     stocks = data.get('stocks') or list(_STOCK_COOKIE_DOMAINS.keys())
 
-    safari_cookies_path = os.path.expanduser(
-        "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
-    chrome_cookies_path = os.path.expanduser(
-        "~/Library/Application Support/Google/Chrome/Default/Cookies")
+    # OS-aware path resolution. Safari exists ONLY on macOS.
+    safari_cookies_path = (
+        os.path.expanduser("~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
+        if IS_MAC else ''
+    )
+    chrome_cookies_path = _chrome_cookies_path()
 
     # Decide which source to use
     if requested in ('safari', 'chrome'):
         source = requested
-    else:
-        # Auto-detect: prefer macOS default browser, fallback to whatever exists
-        detected = _detect_default_browser()
-        if detected == 'safari' and os.path.exists(safari_cookies_path):
-            source = 'safari'
-        elif detected == 'chrome' and os.path.exists(chrome_cookies_path):
-            source = 'chrome'
-        elif detected in (None, 'edge', 'firefox', 'arc') and os.path.exists(safari_cookies_path):
-            # Unsupported default → try Safari first since most macOS users have it
-            source = 'safari'
-        elif os.path.exists(chrome_cookies_path):
-            source = 'chrome'
-        else:
+        if source == 'safari' and not IS_MAC:
             return jsonify({'status': 'error',
-                            'msg': f'Default browser ({detected or "unknown"}) not supported. Only Safari/Chrome.'}), 404
+                            'msg': 'Safari is only available on macOS. Use Chrome on Windows.'}), 400
+    else:
+        # Auto-detect
+        if IS_WIN:
+            # Windows has no Safari — always try Chrome
+            source = 'chrome' if chrome_cookies_path else 'none'
+        else:
+            detected = _detect_default_browser()
+            if detected == 'safari' and os.path.exists(safari_cookies_path):
+                source = 'safari'
+            elif detected == 'chrome' and os.path.exists(chrome_cookies_path):
+                source = 'chrome'
+            elif detected in (None, 'edge', 'firefox', 'arc') and os.path.exists(safari_cookies_path):
+                source = 'safari'
+            elif os.path.exists(chrome_cookies_path):
+                source = 'chrome'
+            else:
+                return jsonify({'status': 'error',
+                                'msg': f'Default browser ({detected or "unknown"}) not supported. Only Safari/Chrome.'}), 404
+        if source == 'none':
+            return jsonify({'status': 'error',
+                            'msg': 'Chrome cookies not found. Install Chrome and log in to a stock site first.'}), 404
 
     if source == 'safari':
         if _is_safari_running():
