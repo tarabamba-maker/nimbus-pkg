@@ -7,6 +7,16 @@ from datetime import datetime, timedelta
 IS_MAC = sys.platform == 'darwin'
 IS_WIN = sys.platform == 'win32'
 
+# Windows consoles default to cp1252, which can't encode the emoji used in our
+# log lines (🚀✅⚠️…) — any such print() would raise UnicodeEncodeError and crash
+# the backend at startup. Force UTF-8 on stdout/stderr (no-op on macOS).
+if IS_WIN:
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+
 # Windows-only kwargs for subprocess to suppress cmd-window flashes.
 # subprocess.CREATE_NO_WINDOW = 0x0800_0000. We pass as creationflags.
 _SUBPROC_NOWINDOW = (
@@ -79,11 +89,20 @@ def _ensure_playwright_browsers():
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as _pw:
-            # Actually launch — this catches version mismatch (old cache, new lib)
-            browser = _pw.chromium.launch(headless=True)
+            # Windows drives the user's system Chrome (channel='chrome') — never
+            # bundle or download Playwright's Chromium. Just verify Chrome runs.
+            if IS_WIN:
+                browser = _pw.chromium.launch(headless=True, channel="chrome")
+            else:
+                # macOS: launch bundled chromium — catches version mismatch too.
+                browser = _pw.chromium.launch(headless=True)
             browser.close()
             return
     except Exception as ex:
+        if IS_WIN:
+            print(f"[Playwright] System Chrome launch failed: {ex} — "
+                  "встанови Google Chrome (він обов'язковий на Windows).")
+            return
         print(f"[Playwright] Browser launch failed: {ex} — installing chromium + headless-shell...")
     try:
         subprocess.run(
@@ -510,6 +529,13 @@ _STEALTH_JS = """
 """
 
 def _apply_stealth(ctx):
+    # _STEALTH_JS spoofs navigator.platform=MacIntel + Apple WebGL to match the
+    # macOS UA on bundled Chromium. On Windows/Linux we drive REAL system Chrome,
+    # which is already consistent and trusted — injecting Mac signals there makes
+    # the fingerprint mismatch the real platform (Win32 UA vs MacIntel) and trips
+    # DataDome instantly. So apply stealth on macOS only.
+    if not IS_MAC:
+        return
     ctx.add_init_script(_STEALTH_JS)
 
 _LOGIN_SIGNALS = ["auth", "sign-in", "login", "signin", "ims-na1"]
@@ -542,9 +568,24 @@ def _open_browser_context(p, profile_dir, headless, off_screen=False, channel=No
         # Strip Playwright's automation flags that DataDome fingerprints on
         ignore_default_args=["--enable-automation", "--enable-blink-features=IdleDetection"],
     )
-    if channel:
-        chrome_app = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        if os.path.exists(chrome_app):
+    # The hardcoded UA above is a macOS string. On Windows it would mismatch the
+    # real platform signals of system Chrome (a DataDome red flag) — drop it so
+    # Chrome presents its own consistent Windows UA.
+    if not IS_MAC:
+        kwargs.pop('user_agent', None)
+    if IS_WIN:
+        # On Windows ALWAYS drive the user's real system Chrome. This (a) gets
+        # past DataDome, and (b) means we never need Playwright's bundled Chromium
+        # — so the packaged app ships only Python + deps, not a ~150 MB browser.
+        # System Chrome is a hard requirement anyway (the cookie/login flow needs
+        # it). Playwright locates it via channel='chrome'.
+        kwargs['channel'] = 'chrome'
+    elif channel:
+        if IS_MAC:
+            chrome_app = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            if os.path.exists(chrome_app):
+                kwargs['channel'] = channel
+        else:
             kwargs['channel'] = channel
     return p.chromium.launch_persistent_context(**kwargs)
 
@@ -658,7 +699,9 @@ def _adobe_collect_direct():
         for item in history:
             asset_id = str(item.get("id", ""))
             price    = float(item.get("commissionAmount", 0))
-            thumb    = item.get("thumbnailUrl", "")
+            # Use the clean 110px preview (no watermark) for display, not the
+            # watermarked thumbnailUrl Adobe returns by default.
+            thumb    = _adobe_clean_thumb_url(item.get("thumbnailUrl", ""))
             sale_full = item.get("saleDate", "")
             if not asset_id or not sale_full[:10]: continue
             if is_already_saved("Adobe Stock", asset_id, price, sale_full):
@@ -765,7 +808,7 @@ def _adobe_collect_direct():
             for item in d.get("sales", {}).get("history", []):
                 asset_id = str(item.get("id", ""))
                 price    = float(item.get("commissionAmount", 0))
-                thumb    = item.get("thumbnailUrl", "")
+                thumb    = _adobe_clean_thumb_url(item.get("thumbnailUrl", ""))
                 sale_full = item.get("saleDate", "")
                 if not asset_id or not sale_full[:10]: continue
                 if is_already_saved("Adobe Stock", asset_id, price, sale_full): continue
@@ -1713,8 +1756,9 @@ def _getty_collect_direct():
     csrf = csrf_match.group(1)
     # Contract ID lives in HTML too; extract or use stored
     cid_match = re.search(r'(?:contractId|data-contract[\w-]*)["\s=:]+["\']?(\d+:True)', r.text)
-    contract_id = cid_match.group(1) if cid_match else "8368474:True"
-    _sync_log(f"🔑 Getty direct: CSRF + contract={contract_id}")
+    # Per-account contract is resolved properly from AvailableContracts below
+    # (Step 2). The HTML regex is only a best-effort first guess.
+    contract_id = cid_match.group(1) if cid_match else ""
 
     # Step 2: list available periods
     session.headers["Accept"] = "application/json"
@@ -1724,7 +1768,23 @@ def _getty_collect_direct():
     except Exception as e:
         _sync_log(f"⚠️ Getty direct: AvailableStatementPeriod failed: {e} — fallback")
         return False
-    raw_periods = (avail.get("Options") or {}).get("AvailableStatementPeriods", [])
+    _opts = avail.get("Options") or {}
+    raw_periods = _opts.get("AvailableStatementPeriods", [])
+
+    # Resolve THIS account's contract from the export form's contract dropdown
+    # (AvailableContracts) — pick the selected one, else the first real contract.
+    # Never hardcode: a baked-in contract id belongs to another account and makes
+    # every statement export come back empty.
+    contracts = _opts.get("AvailableContracts") or []
+    sel = next((c for c in contracts if c.get("Selected") and c.get("Value")), None) \
+        or next((c for c in contracts if c.get("Value")), None)
+    if sel and sel.get("Value"):
+        contract_id = sel["Value"]
+    if not contract_id:
+        _sync_log("⚠️ Getty direct: no contract found in AvailableContracts — fallback")
+        return False
+    _sync_log(f"🔑 Getty direct: contract={contract_id} ({(sel or {}).get('Text','')[:40]})")
+
     periods = []
     for p_obj in raw_periods:
         val = p_obj.get("Value", "")
@@ -1786,6 +1846,8 @@ def _getty_collect_direct():
             continue
         content = tr.text
         if not content or "Asset Number" not in content:
+            # No data for this period — do NOT mark it done, so a later sync (or
+            # a fixed contract) retries it instead of freezing it empty forever.
             continue
         reader = _csv.DictReader(_io.StringIO(content), delimiter="\t")
         before = total_saved
@@ -2584,8 +2646,11 @@ def _ms_plus_collect_global(pw_page):
     _sync_log(f"✅ Microstock+: {total_files} записів, ms_library.json = {len(merged)} всього")
 
 
-def _run_collector_global(p, profile_dir, stock_name, start_url, headless):
-    """Відкриває браузер і запускає потрібний колектор."""
+def _run_collector_global(p, profile_dir, stock_name, start_url, headless, allow_login=False):
+    """Відкриває браузер і запускає потрібний колектор.
+    allow_login=True (single-stock button) opens a login window if the session
+    expired; allow_login=False (Sync All) just logs that the stock needs login
+    and skips it — so unwanted stocks don't pop windows on every full sync."""
     wait_cond = "networkidle" if stock_name == "Shutterstock" else "domcontentloaded"
     # Shutterstock: use real Chrome (channel='chrome') instead of bundled Chromium.
     # DataDome blocks the Playwright Chromium build by fingerprint; system Chrome
@@ -2600,6 +2665,9 @@ def _run_collector_global(p, profile_dir, stock_name, start_url, headless):
     # Getty має свою login-логіку всередині колектора (чекає у тому самому вікні).
     # Не закриваємо браузер — просто йдемо далі.
     if _is_login_url(pw_page.url) and stock_name != "Getty Images":
+        if not allow_login:
+            _sync_log(f"[{stock_name}] 🔒 потрібен логін — натисни кнопку «{stock_name}» щоб увійти")
+            return browser, pw_page
         browser.close()
         _do_login_flow_global(p, profile_dir, start_url, stock_name, wait_cond)
         browser = _open_browser_context(p, profile_dir, headless)
@@ -2611,6 +2679,9 @@ def _run_collector_global(p, profile_dir, stock_name, start_url, headless):
     if stock_name == "Adobe Stock":
         result = _adobe_api_collect_global(pw_page)
         if result == "needs_login":
+            if not allow_login:
+                _sync_log(f"[{stock_name}] 🔒 потрібен логін — натисни кнопку «{stock_name}» щоб увійти")
+                return browser, pw_page
             browser.close()
             _do_login_flow_global(p, profile_dir, start_url, stock_name, wait_cond)
             browser = _open_browser_context(p, profile_dir, headless)
@@ -2639,8 +2710,10 @@ def _run_collector_global(p, profile_dir, stock_name, start_url, headless):
     return browser, pw_page
 
 
-def _collect_one_stock_global(name, url):
-    """Збирає один сток у власному sync_playwright контексті."""
+def _collect_one_stock_global(name, url, allow_login=False):
+    """Збирає один сток у власному sync_playwright контексті.
+    allow_login=True only for an explicit single-stock request (a stock button);
+    Sync All passes False so missing logins are logged, not popped as windows."""
     from playwright.sync_api import sync_playwright as _spw
     import shutil
 
@@ -2758,6 +2831,9 @@ def _collect_one_stock_global(name, url):
             _ms_empty = not os.path.exists(MS_LIBRARY_FILE)
             _should_login = (_db_is_empty and name != "Microstock+") or \
                             (name == "Microstock+" and _ms_empty)
+            if _should_login and not allow_login:
+                _sync_log(f"[{name}] 🔒 не залогінено — натисни кнопку «{name}» щоб увійти (пропускаю у Sync All)")
+                return
             if _should_login:
                 _sync_log(f"[{name}] 🖥️ перший запуск — видимий браузер, чекаю поки залогінишся")
                 # Force pre-login flow: opens visible browser, waits for user to close window
@@ -2789,7 +2865,7 @@ def _collect_one_stock_global(name, url):
                 headless = has_ccw
                 _sync_log(f"[{name}] {'🤖 headless (сесія активна)' if has_ccw else '🖥️ видимий (потрібен логін)'}")
             _sync_log(f"[{name}] ⏳ Starting...")
-            browser, _ = _run_collector_global(_p, stock_profile, name, url, headless)
+            browser, _ = _run_collector_global(_p, stock_profile, name, url, headless, allow_login)
             _sync_log(f"[{name}] ✅ Done")
             browser.close()
     except Exception as ex:
@@ -3977,32 +4053,149 @@ def _chrome_cookies_path():
 # Mac collectors filter by domain in-place — Windows path returns ALL cookies
 # (filtering happens at call site).
 
-def _load_chrome_cookies_windows():
-    """Read all Chrome cookies on Windows via browser_cookie3 (handles DPAPI
-    decryption of master key + AES-GCM of values). Returns list of dicts.
-    Returns [] if browser_cookie3 isn't installed or Chrome isn't found."""
+def _dpapi_unprotect(data: bytes) -> bytes:
+    """Unwrap a DPAPI-protected blob in the current user context (ctypes, no
+    pywin32 dependency)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [('cbData', wintypes.DWORD),
+                    ('pbData', ctypes.POINTER(ctypes.c_char))]
+
+    buf = ctypes.create_string_buffer(data, len(data))
+    blob_in = DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    blob_out = DATA_BLOB()
+    if not ctypes.windll.crypt32.CryptUnprotectData(
+            ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)):
+        raise OSError('CryptUnprotectData failed')
     try:
-        import browser_cookie3 as _bc3
-    except ImportError:
-        _app_log("⚠️ browser_cookie3 not installed — Windows cookie reading disabled. "
-                 "Install with: pip install browser-cookie3")
+        n = blob_out.cbData
+        out = ctypes.create_string_buffer(n)
+        ctypes.memmove(out, blob_out.pbData, n)
+        return out.raw
+    finally:
+        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+
+
+def _decrypt_chrome_cookie_db(cookie_db):
+    """Decrypt one Chrome cookie SQLite directly. Handles v10/v11 (AES-256-GCM
+    under a DPAPI-wrapped key) and legacy raw-DPAPI values. v20 (App-Bound
+    Encrypted, Chrome 127+) cookies can't be decrypted outside Chrome itself and
+    are skipped (browser_cookie3 instead raises on the first one, aborting the
+    whole read). Finds the matching 'Local State' by walking up from cookie_db.
+    Returns list of {'name','value','domain'}."""
+    import json, base64, sqlite3, shutil, tempfile
+
+    if not cookie_db or not os.path.exists(cookie_db):
         return []
-    out = []
+
+    # Locate Local State (holds the encrypted master key) above the DB.
+    local_state = ''
+    d = os.path.dirname(cookie_db)
+    for _ in range(5):
+        cand = os.path.join(d, 'Local State')
+        if os.path.exists(cand):
+            local_state = cand
+            break
+        nd = os.path.dirname(d)
+        if nd == d:
+            break
+        d = nd
+
+    aes_key = None
     try:
-        jar = _bc3.chrome()
-        for c in jar:
-            out.append({
-                'name':   c.name,
-                'value':  c.value,
-                'domain': c.domain.lstrip('.'),
-            })
+        ls = json.load(open(local_state, encoding='utf-8'))
+        enc_key = base64.b64decode(ls['os_crypt']['encrypted_key'])
+        if enc_key[:5] == b'DPAPI':
+            aes_key = _dpapi_unprotect(enc_key[5:])
     except Exception as e:
-        _app_log(f"⚠️ Chrome cookie read failed: {e}")
+        _app_log(f"⚠️ Chrome master key load failed ({cookie_db}): {e}")
+
+    # Chrome keeps a lock on the live DB — read from a copy.
+    tmp = tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False).name
+    try:
+        shutil.copyfile(cookie_db, tmp)
+        con = sqlite3.connect(tmp)
+        rows = con.execute(
+            'SELECT host_key, name, encrypted_value, value FROM cookies').fetchall()
+        con.close()
+    except Exception as e:
+        _app_log(f"⚠️ Chrome cookie DB read failed ({cookie_db}): {e}")
+        return []
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+    from Cryptodome.Cipher import AES
+    out, n_v20, n_fail = [], 0, 0
+    for host, name, ev, plain in rows:
+        ev = bytes(ev) if ev else b''
+        try:
+            if not ev:
+                val = plain or ''
+            elif ev[:3] in (b'v10', b'v11'):
+                if aes_key is None:
+                    n_fail += 1
+                    continue
+                dec = AES.new(aes_key, AES.MODE_GCM, nonce=ev[3:15]) \
+                    .decrypt_and_verify(ev[15:-16], ev[-16:])
+                # Chrome 124+ prepends a 32-byte SHA-256(domain) integrity hash.
+                val = dec[32:].decode('utf-8', 'replace')
+            elif ev[:3] == b'v20':
+                n_v20 += 1
+                continue
+            else:
+                val = _dpapi_unprotect(ev).decode('utf-8', 'replace')
+        except Exception:
+            n_fail += 1
+            continue
+        out.append({'name': name, 'value': val, 'domain': host.lstrip('.')})
+
+    if n_v20:
+        _app_log(f"ℹ️ {os.path.basename(os.path.dirname(os.path.dirname(cookie_db)))}: "
+                 f"{n_v20} v20 cookies skipped, {len(out)} readable")
+    return out
+
+
+def _load_chrome_cookies_windows():
+    """Native Chrome cookies (rarely useful on Chrome 127+ — they're v20). Kept
+    for completeness; variant 3 reads the app's own profiles instead."""
+    return _decrypt_chrome_cookie_db(_chrome_cookies_path())
+
+
+def _load_appprofile_cookies_windows():
+    """Variant 3: aggregate cookies from the app's own Chrome profiles, where the
+    user logged in via real Chrome (`_windows_browser_login`). Automation-launched
+    Chrome keeps App-Bound Encryption OFF, so those cookies are plain v10 and
+    decrypt directly — no Playwright needed. Each profile holds only its stock's
+    cookies; callers filter by domain, so merging is safe."""
+    import glob
+    roots = {_BASE_DIR, os.getcwd()}
+    profiles = set()
+    for r in roots:
+        profiles.update(glob.glob(os.path.join(r, 'chrome_profile*')))
+        profiles.update(glob.glob(os.path.join(r, '*_profile')))
+    seen, out = set(), []
+    for prof in profiles:
+        for sub in (os.path.join(prof, 'Default', 'Network', 'Cookies'),
+                    os.path.join(prof, 'Default', 'Cookies')):
+            if os.path.exists(sub):
+                for c in _decrypt_chrome_cookie_db(sub):
+                    k = (c['domain'], c['name'])
+                    if k not in seen:
+                        seen.add(k)
+                        out.append(c)
+                break
     return out
 
 def _load_browser_cookies():
     """OS-agnostic: returns all browser cookies as list of dicts.
-    On macOS: Safari binarycookies. On Windows: Chrome via browser_cookie3."""
+    On macOS: Safari binarycookies. On Windows: the app's own Chrome login
+    profiles (variant 3), since Chrome 127+ App-Bound Encryption makes the
+    user's native Chrome cookies unreadable from outside Chrome."""
     if IS_MAC:
         path = os.path.expanduser(
             "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
@@ -4014,7 +4207,7 @@ def _load_browser_cookies():
             _app_log(f"⚠️ Safari cookies parse failed: {e}")
             return []
     if IS_WIN:
-        return _load_chrome_cookies_windows()
+        return _load_appprofile_cookies_windows()
     return []
 
 
@@ -4218,6 +4411,100 @@ def _detect_default_browser():
     return None
 
 
+# Login landing pages per stock — same URLs the sync login flow uses.
+_STOCK_LOGIN_URLS = {
+    "Adobe Stock":   "https://contributor.stock.adobe.com/en/insights/sales-earnings",
+    "Shutterstock":  "https://submit.shutterstock.com/earnings",
+    "Depositphotos": "https://depositphotos.com/account/sales-history.html",
+    "Getty Images":  "https://accountmanagement.gettyimages.com/Reports/Export",
+    "Microstock+":   "https://microstock.plus/myfiles",
+}
+
+
+def _stock_profile_dir(stock_name):
+    """Profile dir a collector reads for this stock (matches the sync loop)."""
+    if stock_name == "Getty Images":
+        return os.path.abspath("getty_profile")
+    return os.path.abspath(f"chrome_profile_{stock_name.replace(' ', '_')}")
+
+
+def _clear_profile_locks(profile_dir):
+    for _lf in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        _lp = os.path.join(profile_dir, _lf)
+        if os.path.exists(_lp):
+            try:
+                os.remove(_lp)
+            except Exception:
+                pass
+
+
+def _windows_browser_login(stocks):
+    """Variant 3 (Windows): Chrome 127+ App-Bound Encryption makes the user's
+    native Chrome cookies undecryptable outside Chrome. Instead, open ONE real
+    (non-automation) Chrome window with one tab per stock on the app's seed
+    profile so the user logs into everything at once, then closes the window.
+    The sessions persist in the profile and are read back by _load_browser_cookies
+    (via the profile aggregator) — nothing else to press. Blocks until the window
+    is closed (max 10 min). `stocks` may be a single-item list for re-login of one
+    expired stock."""
+    from playwright.sync_api import sync_playwright as _spw
+    login_prof = os.path.abspath("chrome_profile")
+    os.makedirs(login_prof, exist_ok=True)
+    _clear_profile_locks(login_prof)
+
+    targets = [(s, _STOCK_LOGIN_URLS[s]) for s in stocks if s in _STOCK_LOGIN_URLS]
+    if not targets:
+        return [{'stock': s, 'imported': 0, 'msg': 'no login url'} for s in stocks]
+
+    opened = []
+    try:
+        with _spw() as p:
+            vis = _open_browser_context(p, login_prof, headless=False, channel="chrome")
+            _apply_stealth(vis)
+            # Shutterstock's DataDome rejects a stale/flagged token outright (it
+            # serves a blank block page instead of the login form). Clear its
+            # cookies first so it issues a fresh, clean token. Other stocks just
+            # redirect to a normal login when stale, so leave their cookies.
+            if any(n == "Shutterstock" for n, _ in targets):
+                try:
+                    for d in set(c.get('domain', '') for c in vis.cookies()
+                                 if 'shutterstock' in c.get('domain', '')):
+                        try:
+                            vis.clear_cookies(domain=d)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            # Shutterstock's DataDome is the most aggressive and flags request
+            # bursts — open it first, then stagger the rest so 5 tabs don't all
+            # hit at once (which gets Shutterstock challenged even on real Chrome).
+            targets.sort(key=lambda t: 0 if t[0] == "Shutterstock" else 1)
+            for i, (name, url) in enumerate(targets):
+                pg = vis.pages[0] if (i == 0 and vis.pages) else vis.new_page()
+                try:
+                    pg.goto(url, timeout=90000)
+                except Exception:
+                    pass
+                opened.append(name)
+                time.sleep(3 if name == "Shutterstock" else 1.5)
+            _sync_log("👤 Залогінься у КОЖНІЙ вкладці (" + ", ".join(opened) +
+                      ") і ЗАКРИЙ ВІКНО — далі все підхопиться автоматично (макс 10 хв)")
+            try:
+                vis.wait_for_event("close", timeout=600000)
+            except Exception:
+                _sync_log("⏱ 10-хв timeout — закриваю вікно логіну")
+            finally:
+                try:
+                    vis.close()
+                except Exception:
+                    pass
+    except Exception as e:
+        _app_log(f"[win-login] failed: {e}")
+        return [{'stock': s, 'imported': 0, 'error': str(e)} for s in opened or stocks]
+
+    return [{'stock': s, 'imported': 1, 'msg': 'login window closed'} for s in opened]
+
+
 @flask_app.route('/api/import-chrome-cookies', methods=['POST'])
 def api_import_chrome_cookies():
     """Imports cookies from user's native browser → all stock profiles.
@@ -4227,6 +4514,16 @@ def api_import_chrome_cookies():
     data = request.get_json(force=True, silent=True) or {}
     requested = (data.get('source') or '').lower()
     stocks = data.get('stocks') or list(_STOCK_COOKIE_DOMAINS.keys())
+
+    # Windows: Chrome 127+ App-Bound Encryption (v20) makes the user's native
+    # Chrome cookies undecryptable outside Chrome, and copying the encrypted
+    # blobs into another profile fails (key is path-bound). Instead, log in
+    # directly in the app's own Chrome profile (variant 3).
+    if IS_WIN:
+        results = _windows_browser_login(stocks)
+        total = sum(r.get('imported', 0) for r in results)
+        return jsonify({'status': 'ok', 'source': 'app-browser-login',
+                        'total_imported': total, 'per_stock': results})
 
     # OS-aware path resolution. Safari exists ONLY on macOS.
     safari_cookies_path = (
@@ -5319,6 +5616,16 @@ def api_rebuild_matches():
                         tuple(sorted((p.get('stockids') or {}).items())))).encode())
     _cur_lib_fp = _h.hexdigest()
 
+    # Guard against stale/foreign state. _matches_state.json can be carried over
+    # from another machine (e.g. moving the data dir Mac→Windows), where
+    # asset_meta rowids belong to a different table. A saved cursor beyond the
+    # current max can't be trusted → drop it so a full rebuild runs instead of
+    # a false "nothing changed" cache hit.
+    if _last_am_rowid is not None and _last_am_rowid > _cur_am_rowid:
+        _last_am_rowid = None
+    if _last_mm_rowid is not None and _last_mm_rowid > _cur_mm_rowid:
+        _last_mm_rowid = None
+
     am_unchanged  = (_last_am_rowid == _cur_am_rowid)
     mm_unchanged  = (_last_mm_rowid == _cur_mm_rowid)
     lib_unchanged = (_last_lib_fp == _cur_lib_fp)
@@ -5645,7 +5952,7 @@ def api_sync_start():
         _sync_state["log"]     = []
         try:
             _sync_log(f"🚀 Single-stock sync: {name}")
-            _collect_one_stock_global(name, u)
+            _collect_one_stock_global(name, u, allow_login=True)
             _sync_log(f"✅ {name}: done")
         except Exception as ex:
             _sync_log(f"🛑 {name}: {ex}")

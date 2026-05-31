@@ -59,3 +59,8 @@ microstock_profile/**
 
 # Claude settings
 .claude/
+
+# Windows: embeddable Python bundle is built in CI, never committed
+pyembed/
+py-embed.zip
+get-pip.py

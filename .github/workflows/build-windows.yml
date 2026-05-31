@@ -49,6 +49,31 @@ jobs:
         working-directory: ui-tauri
         run: npm ci
 
+      # ── 4b. Bundle embeddable Python + deps (fresh-PC, no system Python) ───
+      # Ships an embeddable CPython with all runtime deps pre-installed as a
+      # Tauri resource (see tauri.windows.conf.json → resources: pyembed).
+      # lib.rs::find_python3 picks pyembed/python.exe first. No Playwright
+      # Chromium is bundled — on Windows the app drives the user's system Chrome
+      # (channel='chrome'), which is a hard requirement anyway.
+      - name: Bundle embeddable Python
+        shell: pwsh
+        run: |
+          $ver = "3.12.10"
+          Invoke-WebRequest "https://www.python.org/ftp/python/$ver/python-$ver-embed-amd64.zip" -OutFile py-embed.zip
+          Expand-Archive py-embed.zip -DestinationPath pyembed -Force
+          # Enable site-packages: uncomment `import site`, add Lib\site-packages
+          $pth = (Get-ChildItem pyembed -Filter "python*._pth" | Select-Object -First 1).FullName
+          (Get-Content $pth) -replace '^\s*#\s*import site\s*$','import site' | Set-Content $pth
+          Add-Content $pth "Lib\site-packages"
+          # Bootstrap pip, install runtime deps INTO the embeddable interpreter
+          Invoke-WebRequest https://bootstrap.pypa.io/get-pip.py -OutFile get-pip.py
+          .\pyembed\python.exe get-pip.py --no-warn-script-location
+          .\pyembed\python.exe -m pip install --no-warn-script-location flask flask-cors playwright pillow beautifulsoup4 requests browser-cookie3
+          # The app invokes `python3` in a few places — provide the alias.
+          Copy-Item pyembed\python.exe pyembed\python3.exe -Force
+          # Sanity: every import the launcher checks must resolve from the bundle
+          .\pyembed\python.exe -c "import flask, flask_cors, playwright, PIL, bs4, requests, browser_cookie3; print('pyembed OK')"
+
       # ── 5. Build Tauri app for Windows ────────────────────────────────────
       - name: Build Tauri
         working-directory: ui-tauri

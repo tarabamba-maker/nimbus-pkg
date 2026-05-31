@@ -89,6 +89,25 @@ fn python_has_deps(python: &str) -> bool {
 }
 
 fn find_python3(project_root: Option<&std::path::Path>) -> Option<String> {
+    // 0) Bundled Python shipped next to main.py (pyembed/). This is what makes a
+    //    fresh PC work with no system Python — the Windows installer ships an
+    //    embeddable Python with all deps pre-installed (see build-windows.yml +
+    //    tauri.windows.conf.json). Checked first so we never depend on whatever
+    //    Python the user may or may not have.
+    if let Some(root) = project_root {
+        #[cfg(target_os = "windows")]
+        let bundled = root.join("pyembed").join("python.exe");
+        #[cfg(not(target_os = "windows"))]
+        let bundled = root.join("pyembed").join("bin").join("python3");
+        if bundled.exists() {
+            let bs = bundled.to_string_lossy().to_string();
+            if python_has_deps(&bs) {
+                log_line(&format!("python found in bundled pyembed: {bs}"));
+                return Some(bs);
+            }
+        }
+    }
+
     // 1) Project venv — most reliable; paths differ by OS
     if let Some(root) = project_root {
         #[cfg(target_os = "windows")]
