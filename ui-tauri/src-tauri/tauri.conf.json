@@ -37,6 +37,7 @@
       "../../sync_state.py",
       "../../cookies.py",
       "../../matching_engine.py",
+      "../../image_utils.py",
       "../../collectors"
     ],
     "icon": [

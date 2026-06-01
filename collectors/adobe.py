@@ -31,7 +31,7 @@ def _adobe_collect_direct():
     ⚠️ DO NOT TOUCH — works at 100x speed. Headers `accept: application/json` +
     `x-requested-with: XMLHttpRequest` are mandatory (without them server
     returns HTML login page, not JSON)."""
-    from main import load_img_async
+    from image_utils import load_img_async
     _sync_log("🚀 Adobe direct: старт...")
 
     # Cross-platform: Safari on mac / Chrome on Windows. See _load_browser_cookies.
@@ -254,7 +254,7 @@ def _adobe_collect_direct():
 
 def _adobe_api_collect_global(pw_page):
     """Збирає Adobe Stock через API (browser fetch — обхід CSRF)."""
-    from main import load_img_async
+    from image_utils import load_img_async
     _sync_log("🚀 Adobe API: навігація на contributor portal...")
 
     adobe_url = "https://contributor.stock.adobe.com/en/insights/sales-earnings"

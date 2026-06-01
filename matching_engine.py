@@ -30,11 +30,8 @@ _RELEVANT_STOCKS = {'adobestock', 'shutterstock', 'istock', 'esp', 'depositphoto
 from db import DB_NAME
 from utils import _hamming_hex, _dhash_from_path
 from sync_state import _sync_log, _sync_stop_flag, _sync_state
+from image_utils import load_ms_library
 
-
-def load_ms_library():
-    from main import load_ms_library as _lml
-    return _lml()
 
 
 def _hash_based_matches(existing_matches, threshold=4, incremental_from_rowid=None):

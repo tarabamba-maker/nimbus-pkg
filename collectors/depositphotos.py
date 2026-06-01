@@ -14,7 +14,7 @@ from collectors.browser import _is_login_url
 
 def _depositphotos_collect(pw_page):
     """Collect Depositphotos sales via HTML scraping of /sales/pageN.html?ajax=true"""
-    from main import load_img_async
+    from image_utils import load_img_async
     from bs4 import BeautifulSoup
     import re
 

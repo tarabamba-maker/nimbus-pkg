@@ -32,7 +32,7 @@ def _ms_plus_collect_direct():
 
     ⚠️ DO NOT TOUCH — works reliably when Safari MS+ session is valid.
     Tested: 163 folders + paginated photos returned in <1 minute."""
-    from main import load_ms_library, save_ms_library
+    from image_utils import load_ms_library, save_ms_library
 
     _sync_log("🚀 Microstock+ direct: старт...")
 
@@ -266,7 +266,7 @@ def _ms_plus_collect_global(pw_page):
       POST /contentdb/content/contentlist      → фото в кожній папці (paged по 250)
     Структура збереженого запису: {filename, group, stockids: {adobestock, shutterstock, ...}}.
     """
-    from main import load_ms_library, save_ms_library
+    from image_utils import load_ms_library, save_ms_library
 
     _sync_log("🚀 Microstock+: оновлюю бібліотеку stockids...")
 

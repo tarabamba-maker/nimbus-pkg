@@ -49,7 +49,7 @@ def _shutterstock_api_collect_direct():
     5. The 'accts_contributor' cookie check (not just 'datadome') ensures the
        user is actually logged in, not just has a trust token.
     """
-    from main import load_img_async
+    from image_utils import load_img_async
 
     _sync_log("🚀 Shutterstock direct API: старт...")
 
@@ -188,7 +188,7 @@ def _shutterstock_api_collect_direct():
 
 def _shutterstock_api_collect_global(pw_page):
     """Збирає Shutterstock через aggregate API + media_stats/day per-photo."""
-    from main import load_img_async
+    from image_utils import load_img_async
 
     _sync_log("🚀 Shutterstock API: старт...")
 
