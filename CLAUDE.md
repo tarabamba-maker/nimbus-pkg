@@ -498,53 +498,47 @@ main.py imports all of the above from sync_state.py.
 **Step 3 — collectors/ ✅ DONE**
 All collectors extracted. Final package structure:
 - `collectors/__init__.py` — empty
-- `collectors/browser.py` ✅ — `_STEALTH_JS`, `_apply_stealth`, `_is_login_url`, `_open_browser_context`, `_do_login_flow_global`
-- `collectors/adobe.py` ✅ — `_adobe_collect_direct`, `_adobe_api_collect_global`
-- `collectors/shutterstock.py` ✅ — `_shutterstock_api_collect_direct`, `_shutterstock_api_collect_global`
-- `collectors/getty.py` ✅ — `_getty_collect_direct`, `_getty_api_collect_global`
-- `collectors/depositphotos.py` ✅ — `_depositphotos_collect`
-- `collectors/ms_plus.py` ✅ — `_ms_plus_collect_direct`, `_ms_plus_collect_global`
+- `collectors/browser.py` — `_STEALTH_JS`, `_apply_stealth`, `_is_login_url`, `_open_browser_context`, `_do_login_flow_global`
+- `collectors/adobe.py` — `_adobe_collect_direct`, `_adobe_api_collect_global`
+- `collectors/shutterstock.py` — `_shutterstock_api_collect_direct`, `_shutterstock_api_collect_global`
+- `collectors/getty.py` — `_getty_collect_direct`, `_getty_api_collect_global`
+- `collectors/depositphotos.py` — `_depositphotos_collect`
+- `collectors/ms_plus.py` — `_ms_plus_collect_direct`, `_ms_plus_collect_global`
 
 Orchestrators (`_run_collector_global`, `_collect_one_stock_global`, `_sync_all_global`) stay in main.py.
-Lazy imports pattern: `from main import load_img_async` inside function body for remaining main.py deps.
+
+**cookies.py ✅ DONE**
+All browser cookie helpers extracted from main.py to `cookies.py`:
+`_load_browser_cookies`, `_parse_safari_binarycookies`, `_decrypt_chrome_cookie_db`,
+`_load_appprofile_cookies_windows`, `_inject_cookies_via_playwright`,
+`_import_cookies_for_stock`, `_windows_browser_login` + related helpers/constants.
+Collectors import `_load_browser_cookies` directly from `cookies` (no more circular lazy import).
 
 **⚠️ TAURI BUNDLING — REQUIRED after adding any new module:**
 - Every new `.py` file or package MUST be added to `tauri.conf.json` → `bundle.resources`
-- Directories (like `collectors/`) are added as a single entry: `"../../collectors"` — Tauri preserves the directory structure (all files end up at `_up_/_up_/collectors/` next to `main.py`)
-- Individual files: `"../../db.py"`, `"../../sync_state.py"` etc.
+- Directories (like `collectors/`) are added as a single entry: `"../../collectors"` — Tauri preserves the directory structure
+- Individual files: `"../../db.py"`, `"../../cookies.py"` etc.
 - After adding: rebuild (`npm run tauri build`) + reinstall (`cp -r ... /Applications/`)
 - Verify with: `find "/Applications/Stock Automation.app/Contents" -name "*.py"`
 - Symptom of missing module: backend fails silently, some tabs show cached data, others empty
 
-**⚠️ TESTING AFTER EACH COLLECTOR MOVE:**
-1. `python3 -c "import ast; ast.parse(open('collectors/X.py').read())"` — syntax OK
+**⚠️ TESTING PROTOCOL (apply after every module extraction):**
+1. `python3 -c "import ast; ast.parse(open('NEW_FILE.py').read())"` — new file syntax OK
 2. `python3 -c "import ast; ast.parse(open('main.py').read())"` — main.py syntax OK
-3. Flask start test: run `python3 main.py` for 6s, check no ImportError in output
-4. Only then commit. Do NOT skip even if "obviously correct."
+3. Flask start: `python3 main.py` for 6s — no ImportError in output
+4. Only then commit. No exceptions.
 
-**Step 4 — routes (optional)**
+**Step 4 — matching_engine.py (next, HIGH VALUE)**
+Extract pure computation functions from main.py (~600 lines):
+- `_hash_based_matches` — pHash clustering with incremental rowid cursor
+- `_ms_visual_matches` — MS+ visual matching (pHash + RGB delta)
+- `_filename_fallback_matches` — filename-based fallback matcher
+- `_apply_manual_overrides` — apply user overrides from `_match_overrides.json`
+These functions have no Flask deps — pure data-in, data-out.
+`api_rebuild_matches` route stays in main.py but calls functions from matching_engine.
+
+**Step 5 — routes/ (optional, lowest priority)**
 Flask Blueprints: move `@flask_app.route(...)` functions to `routes/` or `api.py`.
-Lowest priority — routes already well-documented in this CLAUDE.md.
-
-**Step 3 — collectors/ (HIGH VALUE)**
-Create `collectors/` package. One file per stock:
-- `collectors/adobe.py` — `_adobe_api_collect_global`, `_adobe_collect_playwright`
-- `collectors/shutterstock.py` — `_shutterstock_api_collect_global`, SS playwright fallback
-- `collectors/getty.py` — `_getty_collect_direct`, `_getty_api_collect_global`
-- `collectors/depositphotos.py` — `_depositphotos_collect_direct`, playwright fallback
-- `collectors/ms_plus.py` — `_microstock_plus_collect_direct`, `_ms_plus_collect_global`
-Each collector imports from db.py + utils.py. sync state (`_sync_stop_flag`, `_sync_log`,
-`load_img_async`) passed as dependencies or imported from a shared `sync_state.py`.
-
-**Step 3.5 — platform/ (optional, after collectors)**
-Split Mac/Windows specific code:
-- `platform/cookies_mac.py` — Safari binarycookies reader
-- `platform/cookies_win.py` — `_decrypt_chrome_cookie_db`, `_load_appprofile_cookies_windows`
-- `platform/browser.py` — stealth JS (Mac-only), channel='chrome' (Windows)
-
-**Step 4 — routes (optional)**
-Flask Blueprints: move `@flask_app.route(...)` functions to `routes/` or `api.py`.
-Lowest priority — routes already well-documented in this CLAUDE.md.
 
 **Test after each step:**
 1. `python3 -c "import ast; ast.parse(open('main.py').read())"` — syntax OK
