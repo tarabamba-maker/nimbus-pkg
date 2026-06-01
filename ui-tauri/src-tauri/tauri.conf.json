@@ -31,7 +31,9 @@
     "createUpdaterArtifacts": true,
     "resources": [
       "../../main.py",
-      "../../import_getty.py"
+      "../../import_getty.py",
+      "../../utils.py",
+      "../../db.py"
     ],
     "icon": [
       "icons/32x32.png",
