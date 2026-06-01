@@ -512,6 +512,20 @@ Created `collectors/` package. Files so far:
 - Constants (RECIPES_DIR etc): computed from STOCK_DATA_DIR env var at module level
 - Orchestrators (`_run_collector_global`, `_collect_one_stock_global`, `_sync_all_global`) stay in main.py
 
+**⚠️ TAURI BUNDLING — REQUIRED after adding any new module:**
+- Every new `.py` file or package MUST be added to `tauri.conf.json` → `bundle.resources`
+- Directories (like `collectors/`) are added as a single entry: `"../../collectors"` — Tauri preserves the directory structure (all files end up at `_up_/_up_/collectors/` next to `main.py`)
+- Individual files: `"../../db.py"`, `"../../sync_state.py"` etc.
+- After adding: rebuild (`npm run tauri build`) + reinstall (`cp -r ... /Applications/`)
+- Verify with: `find "/Applications/Stock Automation.app/Contents" -name "*.py"`
+- Symptom of missing module: backend fails silently, some tabs show cached data, others empty
+
+**⚠️ TESTING AFTER EACH COLLECTOR MOVE:**
+1. `python3 -c "import ast; ast.parse(open('collectors/X.py').read())"` — syntax OK
+2. `python3 -c "import ast; ast.parse(open('main.py').read())"` — main.py syntax OK
+3. Flask start test: run `python3 main.py` for 6s, check no ImportError in output
+4. Only then commit. Do NOT skip even if "obviously correct."
+
 **Step 4 — routes (optional)**
 Flask Blueprints: move `@flask_app.route(...)` functions to `routes/` or `api.py`.
 Lowest priority — routes already well-documented in this CLAUDE.md.

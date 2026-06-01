@@ -34,7 +34,8 @@
       "../../import_getty.py",
       "../../utils.py",
       "../../db.py",
-      "../../sync_state.py"
+      "../../sync_state.py",
+      "../../collectors"
     ],
     "icon": [
       "icons/32x32.png",
