@@ -1295,6 +1295,39 @@ def api_groups_get():
             'photos': photos,
         })
 
+    # ── MS+-only groups: in ms_library but not yet in photo_groups ───────────
+    # Show groups even when no sales exist yet. Photos use basepath as pseudo-id
+    # and ms_thumb as the thumbnail. Earnings = $0.
+    represented_groups = set(g['name'] for g in result)
+    ms_lib_groups: dict = {}
+    for photo in lib:
+        gname = photo.get('group', '')
+        if gname and gname not in represented_groups:
+            ms_lib_groups.setdefault(gname, []).append(photo)
+
+    for gname, photos_raw in ms_lib_groups.items():
+        photos = []
+        for ph in photos_raw:
+            bp = ph.get('basepath', '') or ph.get('filename', '')
+            if not bp:
+                continue
+            photos.append({
+                'asset_id':    bp,
+                'filename':    ph.get('filename', ''),
+                'thumb':       ph.get('thumb', ''),
+                'earnings':    0.0,
+                'sales_count': 0,
+                'by_stock':    {},
+            })
+        if not photos:
+            continue
+        result.append({
+            'name': gname, 'count': len(photos),
+            'total': 0.0, 'sales': 0,
+            'by_stock': {},
+            'photos': photos,
+        })
+
     result.sort(key=lambda x: x['total'], reverse=True)
 
     # Truncate photos list for preview mode — frontend fetches the full list
