@@ -35,6 +35,7 @@
       "../../utils.py",
       "../../db.py",
       "../../sync_state.py",
+      "../../cookies.py",
       "../../collectors"
     ],
     "icon": [

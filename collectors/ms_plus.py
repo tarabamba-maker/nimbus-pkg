@@ -15,6 +15,7 @@ import requests as req_lib
 from PIL import Image, ImageOps
 
 from sync_state import _sync_log, _sync_stop_flag
+from cookies import _load_browser_cookies
 
 _BASE_DIR = os.environ.get(
     "STOCK_DATA_DIR",
@@ -31,7 +32,7 @@ def _ms_plus_collect_direct():
 
     ⚠️ DO NOT TOUCH — works reliably when Safari MS+ session is valid.
     Tested: 163 folders + paginated photos returned in <1 minute."""
-    from main import load_ms_library, save_ms_library, _load_browser_cookies
+    from main import load_ms_library, save_ms_library
 
     _sync_log("🚀 Microstock+ direct: старт...")
 

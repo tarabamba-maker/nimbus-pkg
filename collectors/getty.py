@@ -20,6 +20,7 @@ import requests as req_lib
 
 from db import is_already_saved, DB_NAME
 from sync_state import _sync_log, _sync_stop_flag, _save_record
+from cookies import _load_browser_cookies
 
 _BASE_DIR = os.environ.get(
     "STOCK_DATA_DIR",
@@ -34,7 +35,7 @@ def _getty_collect_direct():
     Reads ccw + accountmanagement cookies from Safari, fetches CSRF token from
     /Reports/Export HTML, then POSTs to /Reports/Export per month period
     to download TSV statements. Returns True on success."""
-    from main import load_img_async, _load_browser_cookies, _app_log
+    from main import load_img_async, _app_log
 
     _sync_log("🚀 Getty direct: старт...")
 

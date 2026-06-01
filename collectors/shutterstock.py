@@ -16,6 +16,7 @@ import requests as req_lib
 
 from db import is_already_saved, DB_NAME
 from sync_state import _sync_log, _sync_stop_flag, _save_record
+from cookies import _load_browser_cookies
 
 _BASE_DIR = os.environ.get(
     "STOCK_DATA_DIR",
@@ -48,7 +49,7 @@ def _shutterstock_api_collect_direct():
     5. The 'accts_contributor' cookie check (not just 'datadome') ensures the
        user is actually logged in, not just has a trust token.
     """
-    from main import load_img_async, _load_browser_cookies
+    from main import load_img_async
 
     _sync_log("🚀 Shutterstock direct API: старт...")
 

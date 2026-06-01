@@ -17,6 +17,7 @@ import requests as req_lib
 from db import is_already_saved, DB_NAME
 from utils import _adobe_clean_thumb_url
 from sync_state import _sync_log, _sync_stop_flag, _save_record
+from cookies import _load_browser_cookies
 
 _BASE_DIR   = os.environ.get("STOCK_DATA_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 RECIPES_DIR = os.path.join(_BASE_DIR, "recipes")
@@ -30,7 +31,7 @@ def _adobe_collect_direct():
     ⚠️ DO NOT TOUCH — works at 100x speed. Headers `accept: application/json` +
     `x-requested-with: XMLHttpRequest` are mandatory (without them server
     returns HTML login page, not JSON)."""
-    from main import load_img_async, _load_browser_cookies
+    from main import load_img_async
     _sync_log("🚀 Adobe direct: старт...")
 
     # Cross-platform: Safari on mac / Chrome on Windows. See _load_browser_cookies.
