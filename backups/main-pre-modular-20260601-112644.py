@@ -2,25 +2,6 @@ import ssl, time, threading, sqlite3, os, re, json, base64, atexit, sys
 from io import BytesIO
 from datetime import datetime, timedelta
 
-from utils import (
-    _adobe_clean_thumb_url,
-    _hamming_hex,
-    _dhash_from_path,
-    _dpapi_unprotect,
-)
-from db import init_db, is_already_saved, save_to_db
-from sync_state import (
-    _sync_state, _sync_stop_flag, _sync_all_active,
-    _session_new_keys, _session_new_keys_lock, _sync_log_lock,
-    _sync_log, _save_record,
-)
-from collectors.browser import (
-    _STEALTH_JS, _apply_stealth,
-    _LOGIN_SIGNALS, _is_login_url,
-    _open_browser_context, _do_login_flow_global,
-)
-from collectors.adobe import _adobe_collect_direct, _adobe_api_collect_global
-
 # Platform: 'darwin' (macOS), 'win32' (Windows), 'linux'.
 # Used for browser-cookie source selection (Safari on mac vs Chrome on Windows).
 IS_MAC = sys.platform == 'darwin'
@@ -214,7 +195,16 @@ os.makedirs(MATCH_CACHE_DIR, exist_ok=True)
 os.makedirs(MS_CACHE_DIR, exist_ok=True)
 os.makedirs(ICON_CACHE_DIR, exist_ok=True)
 
-# _adobe_clean_thumb_url → utils.py
+def _adobe_clean_thumb_url(thumb_url: str) -> str:
+    """
+    Конвертує будь-який Adobe ftcdn.net URL у чисту 110px версію без watermark.
+    as2.ftcdn.net/jpg/.../110_F_{id}_{hash}.jpg
+    """
+    if not thumb_url or "ftcdn.net" not in thumb_url:
+        return thumb_url
+    url = re.sub(r'/\d+_F_', '/110_F_', thumb_url)
+    url = re.sub(r'https?://[^/]+\.ftcdn\.net', 'https://as2.ftcdn.net', url)
+    return url
 
 RECIPES_DIR            = os.path.join(_BASE_DIR, "recipes")
 MATCHES_FILE           = os.path.join(RECIPES_DIR, "_cross_stock_matches.json")
@@ -274,9 +264,138 @@ _STOCK_KEY = {
     "Pond5": "pond5", "Alamy": "alamy",
 }
 
-# init_db → db.py
-# is_already_saved → db.py
-# save_to_db → db.py
+def init_db():
+    with sqlite3.connect(DB_NAME, timeout=15) as c:
+        # Concurrency + speed PRAGMAs. WAL lets readers run in parallel with
+        # writers; synchronous=NORMAL is safe with WAL and 2-5× faster than
+        # FULL on heavy insert sessions. journal_mode is persistent on the DB
+        # file, but cheap to set every startup.
+        try:
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA synchronous=NORMAL")
+            c.execute("PRAGMA temp_store=MEMORY")
+            c.execute("PRAGMA mmap_size=268435456")
+        except Exception: pass
+        c.execute('''CREATE TABLE IF NOT EXISTS sales (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset_id TEXT, photo_name TEXT,
+            stock TEXT DEFAULT "Adobe Stock",
+            price REAL, thumb_url TEXT,
+            date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            filename TEXT)''')
+        try: c.execute("ALTER TABLE sales ADD COLUMN filename TEXT")
+        except Exception: pass
+        # Covers is_already_saved() (stock+asset_id+date prefix) and feed/stats
+        # range scans by date. Without this each dedup check is a full table scan.
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sales_dedup ON sales(stock, asset_id, date)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sales_date  ON sales(date)")
+
+        # Per-asset perceptual hash + dominant RGB + aspect_ratio for visual matching.
+        c.execute('''CREATE TABLE IF NOT EXISTS asset_meta (
+            stock TEXT NOT NULL,
+            asset_id TEXT NOT NULL,
+            thumb_hash TEXT,
+            aspect_ratio REAL,
+            r INTEGER, g INTEGER, b INTEGER,
+            updated_at TEXT,
+            PRIMARY KEY (stock, asset_id))''')
+        for col, sqltype in [("r", "INTEGER"), ("g", "INTEGER"), ("b", "INTEGER")]:
+            try: c.execute(f"ALTER TABLE asset_meta ADD COLUMN {col} {sqltype}")
+            except Exception: pass
+        c.execute("CREATE INDEX IF NOT EXISTS idx_asset_meta_hash ON asset_meta(thumb_hash)")
+
+        # MS+ reference thumbnails (img_cache_ms/*.jpg) — used as ground-truth base
+        # for visual matching. fname = disk filename WITHOUT .jpg extension.
+        c.execute('''CREATE TABLE IF NOT EXISTS ms_meta (
+            fname TEXT PRIMARY KEY,
+            thumb_hash TEXT,
+            aspect_ratio REAL,
+            r INTEGER, g INTEGER, b INTEGER,
+            updated_at TEXT)''')
+        c.execute("CREATE INDEX IF NOT EXISTS idx_ms_meta_hash ON ms_meta(thumb_hash)")
+
+        # Таблиця фотографій — єдине джерело правди
+        c.execute('''CREATE TABLE IF NOT EXISTS photos (
+            id TEXT PRIMARY KEY,
+            stock_ids TEXT DEFAULT "{}",
+            thumb_url TEXT DEFAULT "",
+            ms_folder TEXT DEFAULT "",
+            groups TEXT DEFAULT "[]",
+            earnings TEXT DEFAULT "{}",
+            updated_at TEXT DEFAULT "")''')
+        # Індекс (stock_key, asset_id) → photo_id для швидкого lookup
+        c.execute('''CREATE TABLE IF NOT EXISTS photo_assets (
+            stock_key TEXT NOT NULL,
+            asset_id TEXT NOT NULL,
+            photo_id TEXT NOT NULL,
+            PRIMARY KEY (stock_key, asset_id))''')
+        c.commit()
+
+
+def is_already_saved(stock, asset_id, price, date_str):
+    """Returns True if this exact sale already exists in the DB.
+
+    Two-pass strategy to handle both old (date-only) and new (datetime) records:
+    1. If date_str has a time component (ISO from Adobe): exact datetime match
+       against records stored with time.  Different sales of the same photo on
+       the same day have different timestamps → correctly allowed.
+    2. Fallback: price±0.005 + day match via substr(date,1,10). Matches BOTH
+       legacy 10-char and current 19-char rows.
+
+    ⚠️ DO NOT add `AND LENGTH(date)=10` — past bug: with all current rows in
+    19-char format, that filter matched nothing → SS daily aggregates were
+    re-inserted as duplicates every sync (6,241 dups deleted 2026-05-19).
+    """
+    if not asset_id:
+        return False
+    try:
+        raw = str(date_str)
+        day = raw[:10]
+        for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d"):
+            try:
+                day = datetime.strptime(raw[:10], fmt).strftime("%Y-%m-%d")
+                break
+            except ValueError:
+                pass
+        p = float(price) if price else 0.0
+        with sqlite3.connect(DB_NAME, timeout=15) as c:
+            # Pass 1: exact datetime (new records stored with HH:MM:SS)
+            if 'T' in raw or (' ' in raw and len(raw) > 10):
+                dt_norm = raw.replace('T', ' ').split('+')[0].split('Z')[0][:19]
+                row = c.execute(
+                    'SELECT 1 FROM sales WHERE stock=? AND asset_id=? AND date=?',
+                    (stock, str(asset_id), dt_norm)
+                ).fetchone()
+                if row:
+                    return True
+            # Pass 2: price + day fallback — matches records stored in ANY
+            # date format ("2026-04-29" or "2026-04-29 00:00:00") since SS/
+            # Deposit collectors pass date-only strings while existing rows
+            # are mixed-format. Old LENGTH(date)=10 restriction caused all
+            # SS daily aggregates to be re-inserted as duplicates every sync.
+            row = c.execute(
+                'SELECT 1 FROM sales WHERE stock=? AND asset_id=? '
+                'AND substr(date,1,10)=? AND ABS(price - ?) < 0.005',
+                (stock, str(asset_id), day, p)
+            ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+def save_to_db(d):
+    try:
+        stock = d.get('stock', 'Adobe Stock')
+        aid   = str(d.get('asset_id', ''))
+        price = float(d.get('price') or 0)
+        with sqlite3.connect(DB_NAME, timeout=15) as c:
+            c.execute(
+                'INSERT INTO sales (asset_id,photo_name,stock,price,thumb_url,date,filename) '
+                'VALUES (?,?,?,?,?,?,?)',
+                (aid, d.get('photo_name'), stock, price,
+                 d.get('thumb_url'), d.get('date'), d.get('filename')))
+            c.commit()
+    except Exception as e:
+        print(f"[DB] {e}")
 
 # ═══════════════════════════════════════════════════════════
 # FLASK
@@ -286,7 +405,43 @@ flask_app = Flask(__name__)
 flask_app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500 MB cap
 CORS(flask_app)
 
-# _save_record → sync_state.py
+def _save_record(d: dict):
+    """In-process save (no HTTP). Used by collectors as the ONLY save path.
+
+    ⚠️ DO NOT switch back to `_http_executor.submit(requests.post('/update', ...))`:
+    sync thread completes before background POSTs reach Flask → SSE 'done' fires
+    with stale DB → UI shows old data. The bug took 2 sessions to diagnose.
+
+    Also appends the inserted key to _session_new_keys for backend-tracked
+    blue-highlight diff (client reads via /api/sync/recent-keys). The dedup
+    guard before insert prevents already-known sales from polluting that list."""
+    if not d: return
+    raw_date = d.get('date'); dt = datetime.now()
+    if raw_date:
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z",
+                    "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(raw_date.split('+')[0].split('Z')[0], fmt)
+                break
+            except Exception: pass
+    d['date']  = dt.strftime("%Y-%m-%d %H:%M:%S")
+    d['stock'] = d.get('stock', 'Adobe Stock')
+    # Dedup guard: skip if already in DB (collectors call this without checking).
+    # Without this, re-syncs would balloon _session_new_keys with duplicates.
+    try:
+        if is_already_saved(d['stock'], d.get('asset_id', ''), d.get('price', 0), d['date']):
+            return
+    except Exception:
+        pass
+    save_to_db(d)
+    # Record the key for client blue-highlight diff. Uses 10-char date prefix
+    # so it matches /api/feed which slices date to YYYY-MM-DD.
+    try:
+        key = f"{d.get('asset_id','')}|{d['date'][:10]}|{d['stock']}|{float(d.get('price') or 0):.2f}"
+        with _session_new_keys_lock:
+            _session_new_keys.append(key)
+    except Exception:
+        pass
 
 @flask_app.route('/update', methods=['POST'])
 def api_update():
@@ -299,26 +454,745 @@ def api_update():
 # TAURI API — використовується Svelte UI
 # ═══════════════════════════════════════════════════════════
 
-# _sync_state, _sync_stop_flag, _sync_all_active → sync_state.py
-# _session_new_keys, _session_new_keys_lock, _sync_log_lock → sync_state.py
-# _sync_log → sync_state.py
-# _save_record → sync_state.py
+# Глобальний стан синку для /api/sync/status
+_sync_state: dict = {"running": False, "log": [], "progress": ""}
+_sync_stop_flag: list  = [False]   # [0] = True → зупинити синк
+_sync_all_active: list = [False]   # [0] = True → синк вже запущено
+# Keys of sales inserted during the CURRENT/MOST-RECENT sync session.
+# Cleared at the start of each sync, appended by _save_record per insert.
+# Client reads via GET /api/sync/recent-keys to paint blue highlights —
+# this is more reliable than client-side diffing of cached items.
+_session_new_keys: list = []
+_session_new_keys_lock = threading.Lock()
 _headless_mode: bool   = True
 _headless_lock = threading.Lock()
+_sync_log_lock = threading.Lock()  # guards _sync_state["log"] reads/writes
+
+def _sync_log(msg: str):
+    with _sync_log_lock:
+        _sync_state["log"].append(msg)
+        _sync_state["log"] = _sync_state["log"][-200:]
+        _sync_state["progress"] = msg
 
 
 # ───────────────────────────────────────────────────────────
 # Playwright-колектори (top-level, без Flet)
 # ───────────────────────────────────────────────────────────
 
-# _STEALTH_JS, _apply_stealth → collectors/browser.py
-# _LOGIN_SIGNALS, _is_login_url → collectors/browser.py
-# _open_browser_context → collectors/browser.py
-# _do_login_flow_global → collectors/browser.py
+_STEALTH_JS = """
+    // Hide webdriver flag
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    // Realistic plugin shape (not just an array of numbers)
+    Object.defineProperty(navigator, 'plugins', {get: () => {
+        return [
+            {name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format'},
+            {name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: ''},
+            {name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: ''},
+            {name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: ''},
+            {name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: ''},
+        ];
+    }});
+    Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+    Object.defineProperty(navigator, 'platform', {get: () => 'MacIntel'});
+    Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+    Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+    Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 0});
+    // chrome object
+    window.chrome = {
+        runtime: {},
+        loadTimes: function() {},
+        csi: function() {},
+        app: {}
+    };
+    // Permissions API spoof
+    if (navigator.permissions && navigator.permissions.query) {
+        const origQuery = navigator.permissions.query;
+        navigator.permissions.query = (p) => p.name === 'notifications'
+            ? Promise.resolve({state: Notification.permission})
+            : origQuery(p);
+    }
+    // WebGL vendor/renderer (real Mac M1/Intel values)
+    try {
+        const getParam = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(p) {
+            if (p === 37445) return 'Apple Inc.';                      // UNMASKED_VENDOR_WEBGL
+            if (p === 37446) return 'Apple M1';                        // UNMASKED_RENDERER_WEBGL
+            return getParam.call(this, p);
+        };
+    } catch (e) {}
+    // Hide CDP traces in console
+    try {
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+    } catch (e) {}
+"""
+
+def _apply_stealth(ctx):
+    # _STEALTH_JS spoofs navigator.platform=MacIntel + Apple WebGL to match the
+    # macOS UA on bundled Chromium. On Windows/Linux we drive REAL system Chrome,
+    # which is already consistent and trusted — injecting Mac signals there makes
+    # the fingerprint mismatch the real platform (Win32 UA vs MacIntel) and trips
+    # DataDome instantly. So apply stealth on macOS only.
+    if not IS_MAC:
+        return
+    ctx.add_init_script(_STEALTH_JS)
+
+_LOGIN_SIGNALS = ["auth", "sign-in", "login", "signin", "ims-na1"]
+
+def _is_login_url(url_str):
+    return any(x in url_str.lower() for x in _LOGIN_SIGNALS)
+
+def _open_browser_context(p, profile_dir, headless, off_screen=False, channel=None):
+    """Open a Playwright persistent browser context.
+    channel='chrome' uses the system-installed Chrome instead of bundled Chromium
+    — reduces DataDome detection on Shutterstock. Falls back to chromium if
+    Chrome binary isn't found."""
+    extra = ["--window-position=0,2000", "--window-size=1280,900"] if off_screen else []
+    kwargs = dict(
+        user_data_dir=profile_dir,
+        headless=headless,
+        no_viewport=True,
+        user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/130.0.0.0 Safari/537.36"),
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-session-crashed-bubble",
+            "--disable-features=IsolateOrigins,site-per-process",
+        ] + extra,
+        # Strip Playwright's automation flags that DataDome fingerprints on
+        ignore_default_args=["--enable-automation", "--enable-blink-features=IdleDetection"],
+    )
+    # The hardcoded UA above is a macOS string. On Windows it would mismatch the
+    # real platform signals of system Chrome (a DataDome red flag) — drop it so
+    # Chrome presents its own consistent Windows UA.
+    if not IS_MAC:
+        kwargs.pop('user_agent', None)
+    if IS_WIN:
+        # On Windows ALWAYS drive the user's real system Chrome. This (a) gets
+        # past DataDome, and (b) means we never need Playwright's bundled Chromium
+        # — so the packaged app ships only Python + deps, not a ~150 MB browser.
+        # System Chrome is a hard requirement anyway (the cookie/login flow needs
+        # it). Playwright locates it via channel='chrome'.
+        kwargs['channel'] = 'chrome'
+    elif channel:
+        if IS_MAC:
+            chrome_app = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            if os.path.exists(chrome_app):
+                kwargs['channel'] = channel
+        else:
+            kwargs['channel'] = channel
+    return p.chromium.launch_persistent_context(**kwargs)
+
+def _do_login_flow_global(p, profile_dir, target_url, stock_label, wait_cond):
+    """Відкриває видимий браузер, чекає поки юзер залогіниться і закриє вікно."""
+    _sync_log(f"🔒 {stock_label}: потрібна авторизація — відкриваю браузер...")
+    # Shutterstock: use real Chrome for login too (matches collector engine)
+    channel = "chrome" if stock_label == "Shutterstock" else None
+    vis = _open_browser_context(p, profile_dir, headless=False, channel=channel)
+    _apply_stealth(vis)
+    vp = vis.pages[0] if vis.pages else vis.new_page()
+    try:
+        vp.goto(target_url, wait_until=wait_cond, timeout=90000)
+    except Exception:
+        pass
+    _sync_log(f"👤 {stock_label}: залогуйся і ЗАКРИЙ ВІКНО БРАУЗЕРА — збір продовжиться автоматично (макс 10 хв)")
+    try:
+        # 10-min cap — if user walks away, sync still recovers instead of hanging forever
+        vis.wait_for_event("close", timeout=600000)
+    except Exception:
+        _sync_log(f"⏱ {stock_label}: 10-хв timeout — закриваю браузер примусово")
+    finally:
+        try: vis.close()
+        except Exception: pass
+    _sync_log(f"✅ {stock_label}: браузер закрито, продовжую збір...")
 
 
-# _adobe_collect_direct → collectors/adobe.py
-# _adobe_api_collect_global → collectors/adobe.py
+def _adobe_collect_direct():
+    """Adobe Stock via direct requests + Safari cookies. NO Playwright.
+    Calls contributor.stock.adobe.com/en/insights/sales-earnings with Adobe
+    session cookies extracted from Safari. Returns True on success.
+
+    ⚠️ DO NOT TOUCH — works at 100x speed. Headers `accept: application/json` +
+    `x-requested-with: XMLHttpRequest` are mandatory (without them server
+    returns HTML login page, not JSON)."""
+    _sync_log("🚀 Adobe direct: старт...")
+
+    # Cross-platform: Safari on mac / Chrome on Windows. See _load_browser_cookies.
+    try:
+        all_cookies = _load_browser_cookies()
+    except Exception as e:
+        _sync_log(f"⚠️ Adobe direct: cookies read failed: {e} — fallback")
+        return False
+    if not all_cookies:
+        _sync_log("⚠️ Adobe direct: no browser cookies — log in to Adobe in Safari (mac) / Chrome (win)")
+        return False
+
+    adobe_cookies = {c['name']: c['value'] for c in all_cookies
+                     if 'adobe.com' in c.get('domain', '').lower()
+                     or 'adobelogin.com' in c.get('domain', '').lower()}
+    if 'RDC' not in adobe_cookies and 'ftauth_token' not in adobe_cookies and 'IMS' not in str(adobe_cookies):
+        _sync_log(f"⚠️ Adobe direct: no session cookie (have {len(adobe_cookies)}) — fallback")
+        return False
+    _sync_log(f"🔑 Adobe direct: {len(adobe_cookies)} cookies")
+
+    base = "https://contributor.stock.adobe.com"
+    session = req_lib.Session()
+    session.cookies.update(adobe_cookies)
+    session.headers.update({
+        "Accept": "application/json",
+        "x-requested-with": "XMLHttpRequest",
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                       "Version/17.5 Safari/605.1.15"),
+    })
+
+    def _get_page(path):
+        try:
+            r = session.get(base + path, timeout=20)
+            if r.status_code != 200:
+                return {"error": r.status_code}
+            try:
+                return r.json()
+            except Exception:
+                txt = r.text[:200]
+                if any(x in txt.lower() for x in ['sign-in', 'login', 'ims-na1', 'adobelogin']):
+                    return {"error": "not_json", "preview": txt, "needs_login": True}
+                return {"error": "not_json", "preview": txt}
+        except Exception as e:
+            return {"error": str(e)}
+
+    # Pass 1: recent sales (pages 1..N, no date filter)
+    total_saved = 0
+    page1 = _get_page(f"/en/insights/sales-earnings?limit=1000&page=1&pv={int(time.time()*1000)}")
+    if "error" in page1:
+        if page1.get('needs_login'):
+            _sync_log("⚠️ Adobe direct: сесія expired в Safari — fallback to Playwright")
+        else:
+            _sync_log(f"⚠️ Adobe direct: page 1 error {page1.get('error')} — fallback")
+        return False
+    pagination = page1.get("view", {}).get("pagination", {})
+    total_pages = pagination.get("pages", 1)
+    total_items = pagination.get("total", 0)
+    _sync_log(f"   → recent: {total_pages} стор., {total_items} записів")
+
+    # ⚠️ CRITICAL: stop_pages early-exit MUST use `break`, not `return True`.
+    # Past bug (v0.9.32→v0.9.41): `return True` killed the whole function,
+    # silently skipping Pass 2 forever. Symptom: log shows "Adobe direct
+    # recent: +N" then "done" without any "📅 Adobe direct: ..." chunk lines.
+    stop_pages = False
+    for pg in range(1, total_pages + 1):
+        if _sync_stop_flag[0]: return True
+        if stop_pages: break   # exit Pass 1 only — Pass 2 below still runs
+        data = page1 if pg == 1 else _get_page(
+            f"/en/insights/sales-earnings?limit=1000&page={pg}&pv={int(time.time()*1000)}")
+        if "error" in data:
+            _sync_log(f"  ⚠️ page={pg}: {data['error']}")
+            continue
+        history = data.get("sales", {}).get("history", [])
+        page_old = 0; page_new = 0
+        for item in history:
+            asset_id = str(item.get("id", ""))
+            price    = float(item.get("commissionAmount", 0))
+            # Use the clean 110px preview (no watermark) for display, not the
+            # watermarked thumbnailUrl Adobe returns by default.
+            thumb    = _adobe_clean_thumb_url(item.get("thumbnailUrl", ""))
+            sale_full = item.get("saleDate", "")
+            if not asset_id or not sale_full[:10]: continue
+            if is_already_saved("Adobe Stock", asset_id, price, sale_full):
+                page_old += 1
+                continue
+            page_new += 1
+            photo_name = item.get("title") or item.get("originalName") or asset_id
+            orig = item.get("originalName") or ""
+            fname = orig.rsplit(".", 1)[0] if orig and "." in orig else orig
+            rec = {"asset_id": asset_id, "photo_name": photo_name, "stock": "Adobe Stock",
+                   "price": price, "thumb_url": thumb, "date": sale_full, "filename": fname}
+            if thumb:
+                load_img_async(asset_id, thumb, None, is_adobe=True, stock="Adobe Stock")
+            _save_record(rec)
+            total_saved += 1
+        if page_new == 0 and page_old >= 100:
+            _sync_log(f"⏭️  Adobe: page {pg} all duplicates — stop")
+            stop_pages = True
+        if pg < total_pages:
+            time.sleep(0.1)
+
+    _sync_log(f"✅ Adobe direct recent: +{total_saved}")
+
+    # Pass 2: historical chunks back 10 years.
+    # Chunk size: 360 days (Adobe's documented max is 364; using 360 leaves
+    # 4 days of safety margin in case Adobe tightens the limit).
+    # Cuts Pass 2 from ~40 chunks (90d each) to ~10 chunks → ~10s faster sync.
+    proc_file = os.path.join(RECIPES_DIR, "_processed_dates.json")
+    try:
+        with open(proc_file) as f:
+            all_proc = json.load(f)
+    except Exception:
+        all_proc = {}
+    adobe_done = set(all_proc.get("Adobe Stock", []))
+
+    # First-sale guard: any chunk whose ENTIRE range falls before the user's
+    # first known Adobe sale is unconditionally empty and never needs re-check.
+    # For empty chunks in the post-first-sale window we DON'T mark them done →
+    # they get re-checked next sync (cheap 1-request probe; protects against
+    # API breakage that would otherwise silently lose history).
+    try:
+        with sqlite3.connect(DB_NAME, timeout=15) as _c:
+            _r = _c.execute(
+                "SELECT substr(MIN(date),1,10) FROM sales WHERE stock='Adobe Stock'"
+            ).fetchone()
+            _first_sale_str = _r[0] if _r and _r[0] else None
+        first_sale_d = (datetime.strptime(_first_sale_str, '%Y-%m-%d').date()
+                        if _first_sale_str else None)
+    except Exception:
+        first_sale_d = None
+
+    def _months_in_range(start, end):
+        months = set()
+        d = start.replace(day=1)
+        while d <= end:
+            months.add(d.strftime("%Y-%m"))
+            d = d.replace(month=d.month % 12 + 1) if d.month < 12 else d.replace(year=d.year+1, month=1)
+        return months
+
+    now = datetime.now()
+    chunk_end = now - timedelta(days=1)
+    cutoff    = now - timedelta(days=365 * 10)
+    hist_saved = 0
+    while chunk_end > cutoff:
+        if _sync_stop_flag[0]: break
+        chunk_start = max(chunk_end - timedelta(days=359), cutoff)
+        months = _months_in_range(chunk_start, chunk_end)
+        if months.issubset(adobe_done):
+            chunk_end = chunk_start - timedelta(days=1); continue
+        # Pre-first-sale chunk: skip entirely + mark all months done forever.
+        if first_sale_d and chunk_end.date() < first_sale_d:
+            adobe_done.update(months)
+            all_proc["Adobe Stock"] = sorted(adobe_done)
+            try:
+                with open(proc_file, "w") as f: json.dump(all_proc, f, indent=2)
+            except Exception: pass
+            chunk_end = chunk_start - timedelta(days=1); continue
+        s_str = chunk_start.strftime("%Y-%m-%d")
+        e_str = chunk_end.strftime("%Y-%m-%d")
+        _sync_log(f"📅 Adobe direct: {s_str} → {e_str}")
+
+        ts = int(time.time() * 1000)
+        d0 = _get_page(f"/en/insights/sales-earnings"
+                      f"?end_date={e_str}&start_date={s_str}"
+                      f"&time_range=day&timestamp={ts}&pv={ts}&limit=1000&page=1")
+        if "error" in d0:
+            _sync_log(f"  ⚠️ {d0['error']} — skip chunk")
+            chunk_end = chunk_start - timedelta(days=1); continue
+
+        range_pages = d0.get("view", {}).get("pagination", {}).get("pages", 1)
+        range_total = d0.get("view", {}).get("pagination", {}).get("total", 0)
+        _sync_log(f"   → {range_total} records, {range_pages} pages")
+
+        chunk_new = 0
+        for pg in range(1, range_pages + 1):
+            if _sync_stop_flag[0]: break
+            ts = int(time.time() * 1000)
+            d = d0 if pg == 1 else _get_page(
+                f"/en/insights/sales-earnings"
+                f"?end_date={e_str}&start_date={s_str}"
+                f"&time_range=day&timestamp={ts}&pv={ts}&limit=1000&page={pg}")
+            if "error" in d:
+                _sync_log(f"  ⚠️ page={pg}: {d['error']}"); continue
+            for item in d.get("sales", {}).get("history", []):
+                asset_id = str(item.get("id", ""))
+                price    = float(item.get("commissionAmount", 0))
+                thumb    = _adobe_clean_thumb_url(item.get("thumbnailUrl", ""))
+                sale_full = item.get("saleDate", "")
+                if not asset_id or not sale_full[:10]: continue
+                if is_already_saved("Adobe Stock", asset_id, price, sale_full): continue
+                photo_name = item.get("title") or item.get("originalName") or asset_id
+                orig = item.get("originalName") or ""
+                fname = orig.rsplit(".", 1)[0] if orig and "." in orig else orig
+                rec = {"asset_id": asset_id, "photo_name": photo_name, "stock": "Adobe Stock",
+                       "price": price, "thumb_url": thumb, "date": sale_full, "filename": fname}
+                if thumb:
+                    load_img_async(asset_id, thumb, None, is_adobe=True, stock="Adobe Stock")
+                _save_record(rec)
+                chunk_new += 1; hist_saved += 1
+            if pg < range_pages: time.sleep(0.1)
+
+        if chunk_new > 0:
+            _sync_log(f"   ✚ {chunk_new} new")
+        # Only mark months as "done" if Adobe actually returned records for this
+        # chunk. Empty responses might be a temporary API breakage (history: 2021-2023
+        # was lost this way once). Re-checking an empty chunk next sync costs 1 request.
+        if range_total > 0:
+            adobe_done.update(months)
+            all_proc["Adobe Stock"] = sorted(adobe_done)
+            try:
+                with open(proc_file, "w") as f: json.dump(all_proc, f, indent=2)
+            except Exception: pass
+        chunk_end = chunk_start - timedelta(days=1)
+        time.sleep(0.2)
+
+    _sync_log(f"✅ Adobe direct ВСЬОГО: {total_saved + hist_saved}")
+    return True
+
+
+def _depositphotos_collect_direct():
+    """Depositphotos via direct requests + Safari cookies + HTML scrape.
+    NO Playwright. Returns True on success.
+
+    ⚠️ DO NOT TOUCH — depositphotos.com responds to HTML/AJAX requests with
+    user's session cookies, no anti-bot challenge. /sales.html (page 1) +
+    /sales/pageN.html?ajax=true (later pages)."""
+    _sync_log("🚀 Depositphotos direct: старт...")
+    from bs4 import BeautifulSoup
+
+    try:
+        all_cookies = _load_browser_cookies()
+    except Exception as e:
+        _sync_log(f"⚠️ Deposit direct: cookies read failed: {e} — fallback")
+        return False
+    if not all_cookies:
+        _sync_log("⚠️ Deposit direct: no browser cookies — log in to Deposit in Safari (mac) / Chrome (win)")
+        return False
+
+    dp_cookies = {c['name']: c['value'] for c in all_cookies
+                  if 'depositphotos.com' in c.get('domain', '').lower()}
+    if not dp_cookies or 'ART' not in dp_cookies:
+        _sync_log(f"⚠️ Deposit direct: no ART cookie (have {len(dp_cookies)}) — fallback")
+        return False
+    _sync_log(f"🔑 Deposit direct: {len(dp_cookies)} cookies")
+
+    base = "https://depositphotos.com"
+    session = req_lib.Session()
+    session.cookies.update(dp_cookies)
+    session.headers.update({
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                       "Version/17.5 Safari/605.1.15"),
+        "Accept": "text/html, */*; q=0.01",
+        "x-requested-with": "XMLHttpRequest",
+    })
+
+    # Determine page cap
+    try:
+        with sqlite3.connect(DB_NAME, timeout=15) as _c:
+            _dp_count = _c.execute("SELECT COUNT(*) FROM sales WHERE stock='Depositphotos'").fetchone()[0]
+    except Exception:
+        _dp_count = 0
+    PAGE_CAP = 500 if _dp_count == 0 else 30
+
+    # Date parsers from existing HTML scrape
+    import re as _re
+    MONTH_MAP = {"Jan":"01","Feb":"02","Mar":"03","Apr":"04","May":"05","Jun":"06",
+                 "Jul":"07","Aug":"08","Sep":"09","Oct":"10","Nov":"11","Dec":"12"}
+    def _pdate(s):
+        m = _re.match(r"(\w+)\.(\d+),\s*(\d+)", s.strip())
+        if not m: return None
+        return f"{m.group(3)}-{MONTH_MAP.get(m.group(1),'00')}-{m.group(2).zfill(2)}"
+    def _pprice(s):
+        try: return float(s.strip().lstrip("$"))
+        except: return 0.0
+
+    def _extract_rows(html):
+        if "%%%%" in html:
+            html = html.split("%%%%")[-1]
+        soup = BeautifulSoup(html, "html.parser")
+        rows = []
+        for tr in soup.select("table tr"):
+            tds = tr.find_all("td")
+            if len(tds) < 9:
+                continue
+            img = tds[0].find("img")
+            link = tds[1].find("a")
+            if not link: continue
+            href = link.get("href", "")
+            # href can be "/565981674" or "/565981674/title" — match either
+            m = _re.search(r"/(\d+)(?:/|$)", href)
+            if not m: continue
+            asset_id = m.group(1)
+            title    = link.get_text(strip=True)
+            date     = _pdate(tds[3].get_text(strip=True))
+            price    = _pprice(tds[8].get_text(strip=True))
+            if not date: continue
+            thumb = img.get("src", "") if img else ""
+            if thumb.startswith("//"):
+                thumb = "https:" + thumb
+            rows.append({"asset_id": asset_id, "title": title,
+                         "date": date, "price": price,
+                         "thumb": thumb})
+        return rows
+
+    total_saved = 0
+    page_num = 1
+    streak = 0
+    last_known = ''
+    try:
+        with sqlite3.connect(DB_NAME, timeout=15) as _c:
+            r = _c.execute("SELECT MAX(date) FROM sales WHERE stock='Depositphotos'").fetchone()
+            last_known = (r[0] or '')[:10] if r else ''
+    except Exception: pass
+
+    while not _sync_stop_flag[0] and page_num <= PAGE_CAP:
+        url = "/sales.html" if page_num == 1 else f"/sales/page{page_num}.html?ajax=true"
+        try:
+            r = session.get(base + url, timeout=30)
+            if r.status_code != 200:
+                _sync_log(f"  ⚠️ Deposit p{page_num}: HTTP {r.status_code}")
+                if r.status_code == 403:
+                    _sync_log("🛑 Deposit direct: 403 — fallback")
+                    return False
+                break
+            html = r.text
+        except Exception as e:
+            _sync_log(f"  ⚠️ Deposit p{page_num}: {e}")
+            break
+
+        rows = _extract_rows(html)
+        if not rows:
+            _sync_log(f"  ✓ Deposit p{page_num}: empty — done")
+            break
+
+        new_in_page = 0
+        page_max = ''
+        for row in rows:
+            if row["date"] > page_max: page_max = row["date"]
+            if is_already_saved("Depositphotos", row["asset_id"], row["price"], row["date"]):
+                continue
+            save_to_db({"stock": "Depositphotos", "asset_id": row["asset_id"],
+                        "price": row["price"], "date": row["date"],
+                        "title": row["title"], "thumb_url": row["thumb"]})
+            if row["thumb"]:
+                load_img_async(row["asset_id"], row["thumb"], None, False, stock="Depositphotos")
+            new_in_page += 1; total_saved += 1
+
+        _sync_log(f"  📄 Deposit p{page_num}: +{new_in_page} new (max date {page_max})")
+        if new_in_page == 0:
+            streak += 1
+            if streak >= 2 or (last_known and page_max and page_max <= last_known):
+                _sync_log("  ✓ Deposit: caught up — stopping")
+                break
+        else:
+            streak = 0
+        page_num += 1
+        time.sleep(0.3)
+
+    _sync_log(f"✅ Deposit direct: +{total_saved}")
+    return True
+
+
+def _adobe_api_collect_global(pw_page):
+    """Збирає Adobe Stock через API (browser fetch — обхід CSRF)."""
+    _sync_log("🚀 Adobe API: навігація на contributor portal...")
+
+    adobe_url = "https://contributor.stock.adobe.com/en/insights/sales-earnings"
+    if "contributor.stock.adobe.com" not in pw_page.url:
+        pw_page.goto(adobe_url, wait_until="networkidle", timeout=45000)
+        time.sleep(3)
+
+    if any(x in pw_page.url.lower() for x in ["login", "signin", "auth", "ims-na1"]):
+        _sync_log("🔒 Adobe: потрібна авторизація")
+        return "needs_login"
+
+    def _fetch_page(pg):
+        ts = int(time.time() * 1000)
+        url = f"/en/insights/sales-earnings?limit=1000&page={pg}&pv={ts}"
+        js = f"""
+        async () => {{
+            try {{
+                const r = await fetch("{url}", {{
+                    headers: {{"accept": "application/json", "x-requested-with": "XMLHttpRequest"}},
+                    credentials: "same-origin"
+                }});
+                if (!r.ok) return {{error: r.status}};
+                const text = await r.text();
+                try {{ return JSON.parse(text); }}
+                catch(e) {{ return {{error: "not_json", preview: text.slice(0,200)}}; }}
+            }} catch(e) {{ return {{error: e.toString()}}; }}
+        }}"""
+        try:
+            return pw_page.evaluate(js)
+        except Exception as ex:
+            return {"error": str(ex)}
+
+    _sync_log("🔍 Тест API (page=1)...")
+    td = _fetch_page(1)
+    if "error" in td:
+        preview = td.get("preview", "")
+        if td["error"] == "not_json" and any(x in preview.lower() for x in ["sign-in","login","ims-na1","adobelogin"]):
+            _sync_log("🔒 Adobe: сесія закінчилась — потрібна авторизація")
+            return "needs_login"
+        _sync_log(f"🛑 Adobe тест провалився: {td['error']}")
+        return None
+
+    pagination = td.get("view", {}).get("pagination", {})
+    total_pages = pagination.get("pages", 1)
+    total_items = pagination.get("total", 0)
+    _sync_log(f"   → сторінок: {total_pages}, записів всього: {total_items}")
+
+    total_saved = 0
+    all_seen = 0
+    for pg in range(1, total_pages + 1):
+        data = td if pg == 1 else _fetch_page(pg)
+        if "error" in data:
+            _sync_log(f"  ⚠️ page={pg}: {data['error']}")
+            continue
+        history = data.get("sales", {}).get("history", [])
+        _sync_log(f"📄 page={pg}/{total_pages}: {len(history)} записів")
+
+        page_new = 0
+        page_old = 0
+        stop_early = False
+        for item in history:
+            asset_id   = str(item.get("id", ""))
+            price      = float(item.get("commissionAmount", 0))
+            thumb      = item.get("thumbnailUrl", "")
+            sale_full  = item.get("saleDate", "")        # full ISO: "2026-05-03T01:13:34+00:00"
+            sale_dt    = sale_full[:10]                  # "2026-05-03" — display/filter only
+            photo_name = item.get("title") or item.get("originalName") or asset_id
+            orig_name  = item.get("originalName") or ""
+            fname_no_ext = orig_name.rsplit(".", 1)[0] if orig_name and "." in orig_name else orig_name
+            if not asset_id or not sale_dt:
+                continue
+            all_seen += 1
+            # Dedup on full datetime: same sale re-synced has same timestamp;
+            # different sales of the same photo have different timestamps.
+            if is_already_saved("Adobe Stock", asset_id, price, sale_full):
+                page_old += 1
+                if pg == 1 and page_old >= 100:
+                    _sync_log(f"⏹ Adobe: 100 збережених на стор.1 — зупиняємось")
+                    stop_early = True
+                    break
+                continue
+            rec = {"asset_id": asset_id, "photo_name": photo_name, "stock": "Adobe Stock",
+                   "price": price, "thumb_url": thumb, "date": sale_full,
+                   "filename": fname_no_ext}
+            if thumb:
+                load_img_async(asset_id, thumb, None, is_adobe=True, stock="Adobe Stock")
+            _save_record(rec)
+            total_saved += 1
+            page_new += 1
+
+        if stop_early:
+            break
+        if pg < total_pages:
+            time.sleep(0.3)
+
+    _sync_log(f"✅ Adobe API (останні): {total_saved} нових з {all_seen} перевірених")
+
+    # ── Історичний збір по 90-денних чанках назад ────────────────────────
+    proc_file = os.path.join(RECIPES_DIR, "_processed_dates.json")
+    try:
+        with open(proc_file) as f:
+            all_proc = json.load(f)
+    except Exception:
+        all_proc = {}
+    adobe_done = set(all_proc.get("Adobe Stock", []))
+
+    def _fetch_range(start_str, end_str, pg):
+        ts = int(time.time() * 1000)
+        url = (f"/en/insights/sales-earnings"
+               f"?end_date={end_str}&start_date={start_str}"
+               f"&time_range=day&timestamp={ts}&pv={ts}"
+               f"&limit=1000&page={pg}")
+        js = f"""async () => {{
+            try {{
+                const r = await fetch("{url}", {{
+                    headers: {{"accept": "application/json", "x-requested-with": "XMLHttpRequest"}},
+                    credentials: "same-origin"
+                }});
+                if (!r.ok) return {{error: r.status}};
+                const text = await r.text();
+                try {{ return JSON.parse(text); }}
+                catch(e) {{ return {{error: "not_json", preview: text.slice(0,100)}}; }}
+            }} catch(e) {{ return {{error: e.toString()}}; }}
+        }}"""
+        try:
+            return pw_page.evaluate(js)
+        except Exception as ex:
+            return {"error": str(ex)}
+
+    def _months_in_range(start, end):
+        months = set()
+        d = start.replace(day=1)
+        while d <= end:
+            months.add(d.strftime("%Y-%m"))
+            d = d.replace(month=d.month % 12 + 1) if d.month < 12 else d.replace(year=d.year+1, month=1)
+        return months
+
+    now = datetime.now()
+    chunk_end = now - timedelta(days=1)
+    cutoff    = now - timedelta(days=365 * 10)
+    hist_saved = 0
+
+    while chunk_end > cutoff:
+        chunk_start = max(chunk_end - timedelta(days=89), cutoff)
+        months = _months_in_range(chunk_start, chunk_end)
+
+        if months.issubset(adobe_done):
+            chunk_end = chunk_start - timedelta(days=1)
+            continue
+
+        s_str = chunk_start.strftime("%Y-%m-%d")
+        e_str = chunk_end.strftime("%Y-%m-%d")
+        _sync_log(f"📅 Adobe: {s_str} → {e_str}")
+
+        d0 = _fetch_range(s_str, e_str, 1)
+        if "error" in d0:
+            _sync_log(f"  ⚠️ {d0['error']} — пропускаю чанк")
+            chunk_end = chunk_start - timedelta(days=1)
+            continue
+
+        range_pages = d0.get("view", {}).get("pagination", {}).get("pages", 1)
+        range_total = d0.get("view", {}).get("pagination", {}).get("total", 0)
+        _sync_log(f"   → {range_total} записів, {range_pages} стор.")
+
+        chunk_new = 0
+        for pg in range(1, range_pages + 1):
+            d = d0 if pg == 1 else _fetch_range(s_str, e_str, pg)
+            if "error" in d:
+                _sync_log(f"  ⚠️ page={pg}: {d['error']}")
+                continue
+            for item in d.get("sales", {}).get("history", []):
+                asset_id   = str(item.get("id", ""))
+                price      = float(item.get("commissionAmount", 0))
+                thumb      = item.get("thumbnailUrl", "")
+                sale_full  = item.get("saleDate", "")
+                sale_dt    = sale_full[:10]
+                photo_name = item.get("title") or item.get("originalName") or asset_id
+                orig_name  = item.get("originalName") or ""
+                fname_no_ext = orig_name.rsplit(".", 1)[0] if orig_name and "." in orig_name else orig_name
+                if not asset_id or not sale_dt:
+                    continue
+                if is_already_saved("Adobe Stock", asset_id, price, sale_full):
+                    continue
+                rec = {"asset_id": asset_id, "photo_name": photo_name,
+                       "stock": "Adobe Stock", "price": price,
+                       "thumb_url": thumb, "date": sale_full, "filename": fname_no_ext}
+                if thumb:
+                    load_img_async(asset_id, thumb, None, is_adobe=True, stock="Adobe Stock")
+                _save_record(rec)
+                chunk_new += 1
+                hist_saved += 1
+            if pg < range_pages:
+                time.sleep(0.3)
+
+        if chunk_new > 0:
+            _sync_log(f"   ✚ {chunk_new} нових")
+
+        adobe_done.update(months)
+        all_proc["Adobe Stock"] = sorted(adobe_done)
+        with open(proc_file, "w") as f:
+            json.dump(all_proc, f, indent=2)
+
+        chunk_end = chunk_start - timedelta(days=1)
+        time.sleep(0.5)
+
+    _sync_log(f"✅ Adobe (всього нових): {total_saved + hist_saved}")
 
 
 def _shutterstock_api_collect_direct():
@@ -3179,7 +4053,29 @@ def _chrome_cookies_path():
 # Mac collectors filter by domain in-place — Windows path returns ALL cookies
 # (filtering happens at call site).
 
-# _dpapi_unprotect → utils.py
+def _dpapi_unprotect(data: bytes) -> bytes:
+    """Unwrap a DPAPI-protected blob in the current user context (ctypes, no
+    pywin32 dependency)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [('cbData', wintypes.DWORD),
+                    ('pbData', ctypes.POINTER(ctypes.c_char))]
+
+    buf = ctypes.create_string_buffer(data, len(data))
+    blob_in = DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    blob_out = DATA_BLOB()
+    if not ctypes.windll.crypt32.CryptUnprotectData(
+            ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)):
+        raise OSError('CryptUnprotectData failed')
+    try:
+        n = blob_out.cbData
+        out = ctypes.create_string_buffer(n)
+        ctypes.memmove(out, blob_out.pbData, n)
+        return out.raw
+    finally:
+        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
 
 
 def _decrypt_chrome_cookie_db(cookie_db):
@@ -5368,7 +6264,30 @@ def img_stock_icon(name):
     return resp
 
 # ── Perceptual hash (dHash) for cross-stock visual matching ──────────────────
-# _dhash_from_path → utils.py
+def _dhash_from_path(path):
+    """
+    Compute 64-bit dHash + dominant RGB from an image file.
+    Returns (hex_string, aspect_ratio, r, g, b) or (None, None, None, None, None).
+    """
+    try:
+        img = Image.open(path)
+        ar = round(img.width / img.height, 3) if img.height else 1.0
+        # Single resize → use for both hash (grayscale) and RGB (color)
+        rgb_small = img.convert('RGB').resize((9, 8), Image.Resampling.LANCZOS)
+        gray_px = list(rgb_small.convert('L').getdata())
+        rgb_px  = list(rgb_small.getdata())
+        bits = 0
+        for row in range(8):
+            base = row * 9
+            for col in range(8):
+                bits = (bits << 1) | (1 if gray_px[base + col] > gray_px[base + col + 1] else 0)
+        n = len(rgb_px)
+        r_avg = sum(p[0] for p in rgb_px) // n
+        g_avg = sum(p[1] for p in rgb_px) // n
+        b_avg = sum(p[2] for p in rgb_px) // n
+        return f"{bits:016x}", ar, r_avg, g_avg, b_avg
+    except Exception:
+        return None, None, None, None, None
 
 def _save_asset_meta(stock, asset_id, path):
     """Compute hash + dominant RGB for thumbnail at path and persist to asset_meta."""
@@ -5387,7 +6306,12 @@ def _save_asset_meta(stock, asset_id, path):
     except Exception:
         pass
 
-# _hamming_hex → utils.py
+def _hamming_hex(h1, h2):
+    """Hamming distance between two 16-char hex strings. 0 = identical, 64 = totally different."""
+    try:
+        return bin(int(h1, 16) ^ int(h2, 16)).count('1')
+    except Exception:
+        return 64
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_img(asset_id, url, stock=None):

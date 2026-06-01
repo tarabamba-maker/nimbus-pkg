@@ -4,7 +4,7 @@
 
 Desktop sales aggregator for photo stocks. Playwright logs into stock sites, collects sales data, saves to local SQLite DB. Flask — local HTTP server (port 8000). SvelteKit+Tauri — desktop UI.
 
-**Flet has been fully removed.** `main.py` is Flask-only (~6400 lines, modularization in progress). UI is `ui-tauri/` (SvelteKit + Tauri).
+**Flet has been fully removed.** `main.py` is Flask-only (~5500 lines, modularization in progress). UI is `ui-tauri/` (SvelteKit + Tauri).
 
 **Current version: v0.9.50** (Mac + Windows, GitHub Actions CI builds both).
 **Windows port: COMPLETE** (v0.9.50 merged). Key Windows fixes:
@@ -482,14 +482,39 @@ Pure functions with zero app dependencies moved to `utils.py`:
 - `main.py` imports them: `from utils import ...`
 - `_parse_safari_binarycookies` stays in main.py (more complete version with httpOnly/expires fields)
 
-**Step 2 — db.py (NEXT)**
-Create `db.py`. Move: `init_db`, `save_to_db`, `is_already_saved`.
-⚠️ Shared state to handle:
-- `_session_new_keys` + `_session_new_keys_lock` (appended by `_save_record` after insert)
-- `_sync_log` (called from `_save_record` context)
-- `DB_NAME` constant
-Approach: pass DB_NAME as param OR import from a `config.py` constants file.
-`_save_record` stays in main.py for now (calls `_sync_log`, `load_img_async` etc).
+**Step 2 — db.py ✅ DONE**
+`init_db`, `save_to_db`, `is_already_saved` moved to `db.py`.
+DB_NAME computed from STOCK_DATA_DIR env var (same logic as main.py). Both resolve to same path.
+main.py: `from db import init_db, is_already_saved, save_to_db`
+
+**Step 2.5 — sync_state.py ✅ DONE**
+Shared mutable sync state moved to `sync_state.py` (no circular imports):
+- `_sync_state`, `_sync_stop_flag`, `_sync_all_active`
+- `_session_new_keys` + lock, `_sync_log_lock`
+- `_sync_log`, `_save_record`
+main.py imports all of the above from sync_state.py.
+`_headless_mode` + `_headless_lock` stay in main.py (only used by orchestrators + Flask route).
+
+**Step 3 — collectors/ (IN PROGRESS)**
+Created `collectors/` package. Files so far:
+- `collectors/__init__.py` — empty
+- `collectors/browser.py` ✅ — `_STEALTH_JS`, `_apply_stealth`, `_is_login_url`, `_open_browser_context`, `_do_login_flow_global`
+- `collectors/adobe.py` ✅ — `_adobe_collect_direct`, `_adobe_api_collect_global`
+- `collectors/shutterstock.py` — TODO
+- `collectors/getty.py` — TODO
+- `collectors/depositphotos.py` — TODO
+- `collectors/ms_plus.py` — TODO
+
+**Pattern for remaining collectors:**
+- Import from: `sync_state`, `db`, `utils`, `collectors.browser`
+- For `load_img_async` / `load_match_thumb` / `_load_browser_cookies` (still in main.py):
+  use lazy import inside function body: `from main import load_img_async`
+- Constants (RECIPES_DIR etc): computed from STOCK_DATA_DIR env var at module level
+- Orchestrators (`_run_collector_global`, `_collect_one_stock_global`, `_sync_all_global`) stay in main.py
+
+**Step 4 — routes (optional)**
+Flask Blueprints: move `@flask_app.route(...)` functions to `routes/` or `api.py`.
+Lowest priority — routes already well-documented in this CLAUDE.md.
 
 **Step 3 — collectors/ (HIGH VALUE)**
 Create `collectors/` package. One file per stock:

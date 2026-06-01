@@ -1,0 +1,161 @@
+"""
+collectors/browser.py — Playwright browser helpers shared by all stock collectors.
+
+Moved here from main.py (logic unchanged — only location changed):
+  - _STEALTH_JS
+  - _apply_stealth
+  - _LOGIN_SIGNALS, _is_login_url
+  - _open_browser_context
+  - _do_login_flow_global
+"""
+
+import os
+import sys
+
+from sync_state import _sync_log
+
+IS_MAC = sys.platform == 'darwin'
+IS_WIN = sys.platform == 'win32'
+
+# ── Stealth JS ────────────────────────────────────────────────────────────────
+
+_STEALTH_JS = """
+    // Hide webdriver flag
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    // Realistic plugin shape (not just an array of numbers)
+    Object.defineProperty(navigator, 'plugins', {get: () => {
+        return [
+            {name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format'},
+            {name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: ''},
+            {name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: ''},
+            {name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: ''},
+            {name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: ''},
+        ];
+    }});
+    Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+    Object.defineProperty(navigator, 'platform', {get: () => 'MacIntel'});
+    Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+    Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+    Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 0});
+    // chrome object
+    window.chrome = {
+        runtime: {},
+        loadTimes: function() {},
+        csi: function() {},
+        app: {}
+    };
+    // Permissions API spoof
+    if (navigator.permissions && navigator.permissions.query) {
+        const origQuery = navigator.permissions.query;
+        navigator.permissions.query = (p) => p.name === 'notifications'
+            ? Promise.resolve({state: Notification.permission})
+            : origQuery(p);
+    }
+    // WebGL vendor/renderer (real Mac M1/Intel values)
+    try {
+        const getParam = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(p) {
+            if (p === 37445) return 'Apple Inc.';                      // UNMASKED_VENDOR_WEBGL
+            if (p === 37446) return 'Apple M1';                        // UNMASKED_RENDERER_WEBGL
+            return getParam.call(this, p);
+        };
+    } catch (e) {}
+    // Hide CDP traces in console
+    try {
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+    } catch (e) {}
+"""
+
+
+def _apply_stealth(ctx):
+    # _STEALTH_JS spoofs navigator.platform=MacIntel + Apple WebGL to match the
+    # macOS UA on bundled Chromium. On Windows/Linux we drive REAL system Chrome,
+    # which is already consistent and trusted — injecting Mac signals there makes
+    # the fingerprint mismatch the real platform (Win32 UA vs MacIntel) and trips
+    # DataDome instantly. So apply stealth on macOS only.
+    if not IS_MAC:
+        return
+    ctx.add_init_script(_STEALTH_JS)
+
+
+# ── Login detection ───────────────────────────────────────────────────────────
+
+_LOGIN_SIGNALS = ["auth", "sign-in", "login", "signin", "ims-na1"]
+
+def _is_login_url(url_str):
+    return any(x in url_str.lower() for x in _LOGIN_SIGNALS)
+
+
+# ── Browser context ───────────────────────────────────────────────────────────
+
+def _open_browser_context(p, profile_dir, headless, off_screen=False, channel=None):
+    """Open a Playwright persistent browser context.
+    channel='chrome' uses the system-installed Chrome instead of bundled Chromium
+    — reduces DataDome detection on Shutterstock. Falls back to chromium if
+    Chrome binary isn't found."""
+    extra = ["--window-position=0,2000", "--window-size=1280,900"] if off_screen else []
+    kwargs = dict(
+        user_data_dir=profile_dir,
+        headless=headless,
+        no_viewport=True,
+        user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/130.0.0.0 Safari/537.36"),
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-session-crashed-bubble",
+            "--disable-features=IsolateOrigins,site-per-process",
+        ] + extra,
+        # Strip Playwright's automation flags that DataDome fingerprints on
+        ignore_default_args=["--enable-automation", "--enable-blink-features=IdleDetection"],
+    )
+    # The hardcoded UA above is a macOS string. On Windows it would mismatch the
+    # real platform signals of system Chrome (a DataDome red flag) — drop it so
+    # Chrome presents its own consistent Windows UA.
+    if not IS_MAC:
+        kwargs.pop('user_agent', None)
+    if IS_WIN:
+        # On Windows ALWAYS drive the user's real system Chrome. This (a) gets
+        # past DataDome, and (b) means we never need Playwright's bundled Chromium
+        # — so the packaged app ships only Python + deps, not a ~150 MB browser.
+        # System Chrome is a hard requirement anyway (the cookie/login flow needs
+        # it). Playwright locates it via channel='chrome'.
+        kwargs['channel'] = 'chrome'
+    elif channel:
+        if IS_MAC:
+            chrome_app = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            if os.path.exists(chrome_app):
+                kwargs['channel'] = channel
+        else:
+            kwargs['channel'] = channel
+    return p.chromium.launch_persistent_context(**kwargs)
+
+
+def _do_login_flow_global(p, profile_dir, target_url, stock_label, wait_cond):
+    """Відкриває видимий браузер, чекає поки юзер залогіниться і закриє вікно."""
+    _sync_log(f"🔒 {stock_label}: потрібна авторизація — відкриваю браузер...")
+    # Shutterstock: use real Chrome for login too (matches collector engine)
+    channel = "chrome" if stock_label == "Shutterstock" else None
+    vis = _open_browser_context(p, profile_dir, headless=False, channel=channel)
+    _apply_stealth(vis)
+    vp = vis.pages[0] if vis.pages else vis.new_page()
+    try:
+        vp.goto(target_url, wait_until=wait_cond, timeout=90000)
+    except Exception:
+        pass
+    _sync_log(f"👤 {stock_label}: залогуйся і ЗАКРИЙ ВІКНО БРАУЗЕРА — збір продовжиться автоматично (макс 10 хв)")
+    try:
+        # 10-min cap — if user walks away, sync still recovers instead of hanging forever
+        vis.wait_for_event("close", timeout=600000)
+    except Exception:
+        _sync_log(f"⏱ {stock_label}: 10-хв timeout — закриваю браузер примусово")
+    finally:
+        try: vis.close()
+        except Exception: pass
+    _sync_log(f"✅ {stock_label}: браузер закрито, продовжую збір...")
