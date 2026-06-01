@@ -228,8 +228,7 @@
       <button class="icon-btn" onclick={() => darkMode = !darkMode} title="Toggle theme">
         {#if darkMode}<Sun size={15} strokeWidth={1.8} />{:else}<Moon size={15} strokeWidth={1.8} />{/if}
       </button>
-      <button class="icon-btn" onclick={loadStats} title="Refresh stats"><RefreshCw size={14} strokeWidth={1.8} /></button>
-      <button class="icon-btn" onclick={() => showColorSettings = true} title="Stock colors"><Settings size={14} strokeWidth={1.8} /></button>
+<button class="icon-btn" onclick={() => showColorSettings = true} title="Stock colors"><Settings size={14} strokeWidth={1.8} /></button>
     </div>
   </div>
 
