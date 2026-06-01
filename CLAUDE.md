@@ -538,7 +538,14 @@ Pure hash matching functions extracted from main.py:
 Flask routes (`api_rebuild_matches`, `api_compute_hashes`, `api_compute_ms_hashes`,
 `api_refresh_istock_thumbs`) stay in main.py. `load_ms_library` bridged via lazy import.
 
-**Current state: main.py ~3262 lines** (was 6444 at start of modularization).
+**image_utils.py ✅ DONE**
+Image/library helpers extracted from main.py:
+`_save_asset_meta`, `load_img`, `load_match_thumb`, `load_img_async`,
+`_img_executor`, `_http_executor`, `load_groups`, `save_groups`,
+`load_ms_library`, `save_ms_library`.
+All collectors import `load_img_async` directly from `image_utils` (no more circular lazy import).
+
+**Current state: main.py ~3200 lines** (was 6444 at start — −3244 lines extracted).
 Module map:
 | File | Contents |
 |------|---------|
@@ -546,6 +553,7 @@ Module map:
 | `db.py` | DB layer: `init_db`, `is_already_saved`, `save_to_db` |
 | `sync_state.py` | Sync state: `_sync_state`, `_sync_stop_flag`, `_sync_log`, `_save_record`, `_session_new_keys` |
 | `cookies.py` | Browser cookies: Safari binarycookies, Chrome decrypt, `_load_browser_cookies`, import flows |
+| `image_utils.py` | Image cache: `load_img`, `load_img_async`, `load_match_thumb`, `load_ms_library`, `save_ms_library`, `load_groups`, `save_groups` |
 | `matching_engine.py` | pHash matching: `_hash_based_matches`, `_ms_visual_matches`, `_filename_fallback_matches`, `_apply_manual_overrides` |
 | `collectors/browser.py` | Playwright helpers: stealth JS, `_open_browser_context`, `_do_login_flow_global` |
 | `collectors/adobe.py` | Adobe collector |
@@ -553,7 +561,7 @@ Module map:
 | `collectors/getty.py` | Getty/iStock collector |
 | `collectors/depositphotos.py` | Depositphotos collector |
 | `collectors/ms_plus.py` | Microstock+ collector |
-| `main.py` | Flask app, orchestrators, routes (~3262 lines) |
+| `main.py` | Flask app, orchestrators, routes (~3200 lines) |
 
 **Step 5 — routes/ (optional, lowest priority)**
 Flask Blueprints: move `@flask_app.route(...)` functions to `routes/` or `api.py`.
