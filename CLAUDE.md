@@ -545,32 +545,120 @@ Image/library helpers extracted from main.py:
 `load_ms_library`, `save_ms_library`.
 All collectors import `load_img_async` directly from `image_utils` (no more circular lazy import).
 
-**Current state: main.py ~3200 lines** (was 6444 at start — −3244 lines extracted).
+**orchestrator.py ✅ DONE**
+Sync orchestration extracted from main.py (~320 lines):
+`_run_collector_global`, `_collect_one_stock_global`, `_sync_all_global`.
+`STOCK_URLS` imported from `config.py`. Lazy imports remain for `flask_app` + `api_rebuild_matches`
+(circular dep — resolved in Step 5 via Blueprint callback pattern).
+
+**config.py ✅ DONE**
+Central constants: `STOCK_URLS`. Previously duplicated in main.py + orchestrator.py.
+
+**sync_state.py** — also contains `_app_log` + log file handle (moved from main.py).
+
+**Current state: main.py ~2884 lines** (was 6444 at start — **−55%**).
 Module map:
 | File | Contents |
 |------|---------|
+| `config.py` | `STOCK_URLS` |
 | `utils.py` | Pure utils: `_adobe_clean_thumb_url`, `_hamming_hex`, `_dhash_from_path`, `_dpapi_unprotect` |
 | `db.py` | DB layer: `init_db`, `is_already_saved`, `save_to_db` |
-| `sync_state.py` | Sync state: `_sync_state`, `_sync_stop_flag`, `_sync_log`, `_save_record`, `_session_new_keys` |
+| `sync_state.py` | Sync state + `_app_log` + log file: `_sync_state`, `_sync_stop_flag`, `_sync_log`, `_save_record`, `_session_new_keys` |
 | `cookies.py` | Browser cookies: Safari binarycookies, Chrome decrypt, `_load_browser_cookies`, import flows |
 | `image_utils.py` | Image cache: `load_img`, `load_img_async`, `load_match_thumb`, `load_ms_library`, `save_ms_library`, `load_groups`, `save_groups` |
 | `matching_engine.py` | pHash matching: `_hash_based_matches`, `_ms_visual_matches`, `_filename_fallback_matches`, `_apply_manual_overrides` |
+| `orchestrator.py` | Sync orchestration: `_run_collector_global`, `_collect_one_stock_global`, `_sync_all_global` |
 | `collectors/browser.py` | Playwright helpers: stealth JS, `_open_browser_context`, `_do_login_flow_global` |
 | `collectors/adobe.py` | Adobe collector |
 | `collectors/shutterstock.py` | Shutterstock collector |
 | `collectors/getty.py` | Getty/iStock collector |
 | `collectors/depositphotos.py` | Depositphotos collector |
 | `collectors/ms_plus.py` | Microstock+ collector |
-| `main.py` | Flask app, orchestrators, routes (~3200 lines) |
+| `main.py` | Flask app init + 50 routes (~2884 lines) |
 
-**Step 5 — routes/ (optional, lowest priority)**
-Flask Blueprints: move `@flask_app.route(...)` functions to `routes/` or `api.py`.
+---
 
-**Test after each step:**
-1. `python3 -c "import ast; ast.parse(open('main.py').read())"` — syntax OK
-2. Start the app: `python3 main.py` → Flask starts on port 8000
-3. Trigger one sync (Refresh button) — collectors run, data appears
-4. Git commit with clear message: "refactor step N: ..."
+## Step 5 — Flask Blueprints (IN PROGRESS — next session)
+
+**Goal:** main.py → ~200 lines (init + blueprint registration only).
+**Rule:** move code verbatim, no logic rewrites. Test after each blueprint.
+**Circular dep fix:** `_sync_all_global(rebuild_fn=None)` — pass `api_rebuild_matches` as callback from `api_sync_start` instead of lazy import.
+
+### Blueprint plan
+
+| File | Routes | ~Lines |
+|------|--------|--------|
+| `routes/__init__.py` | empty | — |
+| `routes/feed.py` | `/api/feed`, `/api/sales`, `/api/stats`, `/api/stock-list`, `/api/stock-colors`, `/update` | ~250 |
+| `routes/groups.py` | `/api/groups`, `/api/group-photos`, `/api/photo-groups/*`, `/api/groups/match-*`, `/api/ms-library/*`, `/api/group-names` | ~450 |
+| `routes/sync.py` | `/api/sync/*`, `/api/inspector/*` | ~300 |
+| `routes/matching.py` | `/api/rebuild-matches`, `/api/matches`, `/api/match-override`, `/api/compute-*`, `/api/refresh-istock-thumbs` | ~400 |
+| `routes/admin.py` | `/api/export`, `/api/import-raw`, `/api/import-chrome-cookies`, `/api/reset*`, `/api/full-reset`, `/api/deduplicate`, `/api/rebuild-*`, `/api/rebuild-from-db` | ~500 |
+| `routes/images.py` | `/img/cache/<aid>`, `/img/placeholder`, `/img/ms/<fname>`, `/img/stock-icon/<name>` | ~120 |
+
+### Shared deps each route file will need
+```python
+from flask import Blueprint, request, jsonify, abort, send_file
+from db import DB_NAME
+from image_utils import load_ms_library, load_groups, save_groups, load_img_async
+from matching_engine import _apply_manual_overrides, _hash_based_matches, ...
+from sync_state import _sync_log, _sync_state, _sync_stop_flag, ...
+```
+
+### Globals that stay in main.py (used by routes via import)
+- `flask_app` — the Flask app instance (Blueprints register to it)
+- `_BASE_DIR`, `RECIPES_DIR`, `CACHE_DIR`, `MS_CACHE_DIR`, etc. — path constants
+- `_headless_mode`, `_headless_lock` — sync toggle
+- `_RELEVANT_STOCKS`, `_STOCK_KEY`, `MATCHES_FILE`, `GROUPS_FILE` etc.
+
+### Approach for shared globals
+Create `app_globals.py` with all path constants + shared state that routes need:
+```python
+# app_globals.py — path constants and shared Flask-level state
+import os
+_BASE_DIR = os.environ.get("STOCK_DATA_DIR", ...)
+CACHE_DIR = ...; RECIPES_DIR = ...; etc.
+MATCHES_FILE = ...; GROUPS_FILE = ...; etc.
+_RELEVANT_STOCKS = {...}
+```
+Routes import from `app_globals`. No circular deps (app_globals has no Flask/route imports).
+
+### Order of extraction (safest first)
+1. `routes/images.py` — simplest, no shared state
+2. `routes/feed.py` — read-only DB queries
+3. `routes/sync.py` — sync state only
+4. `routes/groups.py` — most complex, save for later
+5. `routes/matching.py` — calls matching_engine functions
+6. `routes/admin.py` — biggest, most dangerous
+
+### Circular dep resolution for orchestrator.py
+Before doing Blueprints, fix the last lazy import:
+```python
+# orchestrator.py — _sync_all_global signature change:
+def _sync_all_global(rebuild_matches_fn=None):
+    ...
+    if rebuild_matches_fn:
+        resp = rebuild_matches_fn()
+```
+```python
+# routes/sync.py (or main.py) — pass the function:
+from orchestrator import _sync_all_global
+from routes.matching import api_rebuild_matches  # after matching blueprint
+threading.Thread(target=lambda: _sync_all_global(api_rebuild_matches)).start()
+```
+
+### Tauri bundling after Step 5
+Add `routes/` directory to BOTH `tauri.conf.json` and `tauri.windows.conf.json`:
+```json
+"../../routes"
+```
+
+### Testing protocol (same as always)
+1. `ast.parse` each new routes file
+2. `ast.parse` main.py
+3. Flask start 6s — no ImportError
+4. Browser test: open each tab, trigger sync
+5. Commit: `"refactor step 5: routes/X.py blueprint"`
 
 #### Auto-update mechanism (high priority — user-requested)
 The user wants the desktop app to auto-update from a cloud source. Approach:
