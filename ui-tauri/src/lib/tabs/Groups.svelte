@@ -192,11 +192,23 @@
       });
       if (!resp.ok) { rebuildMsg = `Error ${resp.status}`; rebuilding = false; return; }
       const r = await resp.json();
-      rebuildMsg = `🚀 ${r.msg || 'Запущено у фоні'} — слідкуй у Browser tab`;
-      // Open global SSE stream so log is visible in Browser tab when user switches there
+      rebuildMsg = `🚀 ${r.msg || 'Запущено у фоні'} — очікую завершення…`;
       clearSyncLog();
       startSyncStream();
-      onGroupsChange?.();
+      // Poll until sync finishes, then reload groups
+      const _pollDone = async () => {
+        for (let i = 0; i < 180; i++) {  // max 15 min
+          await new Promise(res => setTimeout(res, 5000));
+          try {
+            const st = await fetch(API_BASE + '/api/sync/status').then(r => r.json());
+            if (!st.running) break;
+          } catch {}
+        }
+        rebuildMsg = '✅ Rebuild завершено — оновлюю групи…';
+        onGroupsChange?.();
+        setTimeout(() => rebuildMsg = '', 4000);
+      };
+      _pollDone();
     } catch (e) { rebuildMsg = `❌ ${e}`; }
     rebuilding = false;
     _rebuildTimer = setTimeout(() => rebuildMsg = '', 8000);

@@ -2756,6 +2756,45 @@ def api_sync_recent_keys():
     with _session_new_keys_lock:
         return jsonify(list(_session_new_keys))
 
+
+@flask_app.route('/api/sync/recent-items', methods=['GET'])
+def api_sync_recent_items():
+    """Return full sale records for all keys in _session_new_keys.
+    Used by Downloads tab to place ALL new items (including old-dated Shutterstock
+    incremental records) at the top of the feed, regardless of their date."""
+    with _session_new_keys_lock:
+        keys = list(_session_new_keys)
+    if not keys:
+        return jsonify([])
+    # Parse keys: "asset_id|date|stock|price"
+    filters = []
+    for k in keys:
+        parts = k.split('|')
+        if len(parts) == 4:
+            filters.append((parts[0], parts[1][:10], parts[2], parts[3]))
+    if not filters:
+        return jsonify([])
+    with sqlite3.connect(DB_NAME, timeout=15) as conn:
+        result = []
+        for asset_id, date_prefix, stock, price_str in filters:
+            try:
+                price = float(price_str)
+            except ValueError:
+                continue
+            row = conn.execute(
+                "SELECT id, asset_id, price, thumb_url, date, stock FROM sales "
+                "WHERE asset_id=? AND stock=? AND ABS(price-?)<=0.005 AND date LIKE ?",
+                (asset_id, stock, price, date_prefix + '%')
+            ).fetchone()
+            if row:
+                result.append({
+                    'id': row[0], 'asset_id': row[1], 'price': row[2],
+                    'thumb_url': row[3], 'date': (row[4] or '')[:10], 'stock': row[5]
+                })
+    # Sort by date DESC so most recent new items appear first within the new block
+    result.sort(key=lambda x: x['date'], reverse=True)
+    return jsonify(result)
+
 @flask_app.route('/api/sync/stream')
 def api_sync_stream():
     """SSE stream для live логів синхронізації."""

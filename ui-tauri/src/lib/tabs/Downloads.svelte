@@ -126,12 +126,17 @@
         _newKeys = await fetch(API_BASE + '/api/sync/recent-keys').then(r => r.json()) || [];
         newSaleKeys.set(new Set(_newKeys));
       } catch { newSaleKeys.set(new Set()); }
-      // Bubble all new sales to the top regardless of their date, mixed across stocks.
+      // Fetch ALL new items from backend (includes old-dated Shutterstock records
+      // that are on page 5+) and prepend them before the regular feed.
       if (_newKeys.length > 0) {
-        const keySet = new Set(_newKeys);
-        const newItems = items.filter(it => keySet.has(_k(it)));
-        const oldItems = items.filter(it => !keySet.has(_k(it)));
-        items = [...newItems, ...oldItems];
+        try {
+          const newItems = await fetch(API_BASE + '/api/sync/recent-items').then(r => r.json()) || [];
+          if (newItems.length > 0) {
+            const newIds = new Set(newItems.map(it => it.id));
+            const oldItems = items.filter(it => !newIds.has(it.id));
+            items = [...newItems, ...oldItems];
+          }
+        } catch {}
       }
       downloadsCache.write({
         items, totalCount, period: get(currentPeriod), stock,
