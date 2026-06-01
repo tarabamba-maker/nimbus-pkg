@@ -1917,9 +1917,12 @@ def api_rebuild_groups():
     if data.get('confirm') != 'REBUILD':
         return jsonify({'status': 'error', 'msg': 'send {"confirm":"REBUILD"} to proceed'}), 400
 
-    # 1. Wipe group/match data files
+    # 1. Wipe group/match data files + state cursors so MS+ does full re-fetch
+    # and rebuild-matches doesn't early-exit on stale fingerprints.
     for fname in ('photo_groups.json', '_manual_overrides.json',
-                  '_cross_stock_matches.json', 'ms_library.json'):
+                  '_cross_stock_matches.json', 'ms_library.json',
+                  '_ms_dirs_state.json', '_matches_state.json',
+                  '_ms_group_snapshot.json'):
         fp = os.path.join(RECIPES_DIR, fname)
         if os.path.exists(fp):
             try: os.remove(fp)
