@@ -121,10 +121,18 @@
       await load(true, true);
       // Reliable new-sale tracking: backend records inserted keys during sync,
       // we fetch them here. No client-side diff timing issues.
+      let _newKeys = [];
       try {
-        const keys = await fetch(API_BASE + '/api/sync/recent-keys').then(r => r.json());
-        newSaleKeys.set(new Set(keys || []));
+        _newKeys = await fetch(API_BASE + '/api/sync/recent-keys').then(r => r.json()) || [];
+        newSaleKeys.set(new Set(_newKeys));
       } catch { newSaleKeys.set(new Set()); }
+      // Bubble all new sales to the top regardless of their date, mixed across stocks.
+      if (_newKeys.length > 0) {
+        const keySet = new Set(_newKeys);
+        const newItems = items.filter(it => keySet.has(_k(it)));
+        const oldItems = items.filter(it => !keySet.has(_k(it)));
+        items = [...newItems, ...oldItems];
+      }
       downloadsCache.write({
         items, totalCount, period: get(currentPeriod), stock,
       });
