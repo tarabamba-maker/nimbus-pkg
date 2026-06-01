@@ -5,6 +5,7 @@ No Flask/route imports here — safe to import from any route file without circu
 
 import json
 import os
+import sqlite3
 
 _BASE_DIR = os.environ.get(
     "STOCK_DATA_DIR",
@@ -63,3 +64,34 @@ def _load_overrides() -> dict:
 def _save_overrides(d: dict):
     with open(MANUAL_OVERRIDES_FILE, "w") as f:
         json.dump({"linked": d.get("linked", {}), "unlinked": d.get("unlinked", {})}, f, indent=2)
+
+
+def _query_earnings_batch(ids_iterable):
+    """Query sales DB for a set of asset_ids; return earnings + thumb_map dicts."""
+    earnings: dict = {}
+    thumb_map: dict = {}
+    ids_list = list(set(str(i) for i in ids_iterable if i))
+    if not ids_list:
+        return earnings, thumb_map
+    with sqlite3.connect(DB_NAME, timeout=15) as conn:
+        for off in range(0, len(ids_list), 800):
+            chunk = ids_list[off:off + 800]
+            phs = ','.join('?' * len(chunk))
+            rows = conn.execute(
+                f"SELECT asset_id, stock, SUM(price), COUNT(*), MAX(thumb_url) FROM sales"
+                f" WHERE asset_id IN ({phs})"
+                f" GROUP BY asset_id, stock",
+                chunk,
+            ).fetchall()
+            for r in rows:
+                aid = str(r[0]); sk = r[1]; thumb = r[4]
+                if aid not in earnings:
+                    earnings[aid] = {'_total': 0.0, '_count': 0}
+                earnings[aid]['_total'] += float(r[2] or 0)
+                earnings[aid]['_count'] += r[3] or 0
+                earnings[aid].setdefault(sk, {'total': 0.0, 'count': 0})
+                earnings[aid][sk]['total'] += float(r[2] or 0)
+                earnings[aid][sk]['count'] += r[3] or 0
+                if thumb and aid not in thumb_map:
+                    thumb_map[aid] = thumb
+    return earnings, thumb_map
