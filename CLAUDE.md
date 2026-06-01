@@ -526,7 +526,9 @@ Collectors import `_load_browser_cookies` directly from `cookies` (no more circu
 1. `python3 -c "import ast; ast.parse(open('NEW_FILE.py').read())"` — new file syntax OK
 2. `python3 -c "import ast; ast.parse(open('main.py').read())"` — main.py syntax OK
 3. Flask start: `python3 main.py` for 6s — no ImportError in output
-4. Only then commit. No exceptions.
+4. API smoke test: `python3 test_api.py` — 15/15 green (requires Flask running)
+5. Build + install: `npm run tauri build` → `cp -r "...bundle/macos/Stock Automation.app" /Applications/`
+6. Only then commit. No exceptions.
 
 **matching_engine.py ✅ DONE**
 Pure hash matching functions extracted from main.py:
@@ -657,6 +659,7 @@ Add `routes/` directory to BOTH `tauri.conf.json` and `tauri.windows.conf.json`:
 1. `ast.parse` each new routes file
 2. `ast.parse` main.py
 3. Flask start 6s — no ImportError
+4. `python3 test_api.py` — 15/15 green
 4. Browser test: open each tab, trigger sync
 5. Commit: `"refactor step 5: routes/X.py blueprint"`
 
