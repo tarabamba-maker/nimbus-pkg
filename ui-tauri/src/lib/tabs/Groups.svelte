@@ -347,6 +347,9 @@
     tgtG.count = (tgtG.count || 0) + (srcG.count || 0);
     tgtG.total = (tgtG.total || 0) + (srcG.total || 0);
     groups = groups.filter(g => g.name !== source);
+    // Write back into the central store so $effect doesn't overwrite local changes
+    // when the user switches tabs and comes back.
+    groupsList.set([...groups]);
   }
 
   async function mergeGroup() {
