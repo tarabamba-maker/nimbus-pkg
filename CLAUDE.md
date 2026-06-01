@@ -4,7 +4,16 @@
 
 Desktop sales aggregator for photo stocks. Playwright logs into stock sites, collects sales data, saves to local SQLite DB. Flask — local HTTP server (port 8000). SvelteKit+Tauri — desktop UI.
 
-**Flet has been fully removed.** `main.py` is now Flask-only (2144 lines). UI is `ui-tauri/` (SvelteKit + Tauri).
+**Flet has been fully removed.** `main.py` is Flask-only (~6400 lines, modularization in progress). UI is `ui-tauri/` (SvelteKit + Tauri).
+
+**Current version: v0.9.50** (Mac + Windows, GitHub Actions CI builds both).
+**Windows port: COMPLETE** (v0.9.50 merged). Key Windows fixes:
+- UTF-8 stdout/stderr (emoji crash fix)
+- Chrome ABE v20: uses app-profile cookies via system Chrome (`channel='chrome'`)
+- Getty contract ID: reads from `AvailableContracts` API (was hardcoded wrong)
+- `_apply_stealth`: no-op on non-Mac (Mac UA spoofs caused DataDome blocks on Windows)
+- Bundled embeddable Python in CI (`pyembed/`, `tauri.windows.conf.json`)
+- `allow_login` flag: Sync All skips locked stocks; per-stock button opens login
 
 ## Stack
 
@@ -19,7 +28,9 @@ Desktop sales aggregator for photo stocks. Playwright logs into stock sites, col
 ## Files
 
 ```
-main.py              — Flask backend (API routes + Playwright collectors)
+main.py              — Flask backend (API routes + Playwright collectors) [MODULARIZATION IN PROGRESS]
+utils.py             — Pure utility functions (moved from main.py, Step 1 done):
+                        _adobe_clean_thumb_url, _hamming_hex, _dhash_from_path, _dpapi_unprotect
 sales.db             — sales database
 import_getty.py      — one-shot TSV import for Getty/iStock statements
 recipes/             — JSON state files
@@ -458,6 +469,53 @@ updates → all other tabs (and PhotoPopup) immediately see the change.
         Browser Start) increments the tick, all tabs auto-reload their data.
 
 ### 🔜 Next sessions
+
+#### Modularization (IN PROGRESS — top priority)
+**Rule: move code only, NEVER rewrite logic inside functions.**
+**git tag `pre-modular-20260601-112644` + `backups/main-pre-modular-*.py` = safe rollback point.**
+
+Current state: `main.py` ~6400 lines. `utils.py` created (Step 1 done).
+
+**Step 1 — utils.py ✅ DONE**
+Pure functions with zero app dependencies moved to `utils.py`:
+- `_adobe_clean_thumb_url`, `_hamming_hex`, `_dhash_from_path`, `_dpapi_unprotect`
+- `main.py` imports them: `from utils import ...`
+- `_parse_safari_binarycookies` stays in main.py (more complete version with httpOnly/expires fields)
+
+**Step 2 — db.py (NEXT)**
+Create `db.py`. Move: `init_db`, `save_to_db`, `is_already_saved`.
+⚠️ Shared state to handle:
+- `_session_new_keys` + `_session_new_keys_lock` (appended by `_save_record` after insert)
+- `_sync_log` (called from `_save_record` context)
+- `DB_NAME` constant
+Approach: pass DB_NAME as param OR import from a `config.py` constants file.
+`_save_record` stays in main.py for now (calls `_sync_log`, `load_img_async` etc).
+
+**Step 3 — collectors/ (HIGH VALUE)**
+Create `collectors/` package. One file per stock:
+- `collectors/adobe.py` — `_adobe_api_collect_global`, `_adobe_collect_playwright`
+- `collectors/shutterstock.py` — `_shutterstock_api_collect_global`, SS playwright fallback
+- `collectors/getty.py` — `_getty_collect_direct`, `_getty_api_collect_global`
+- `collectors/depositphotos.py` — `_depositphotos_collect_direct`, playwright fallback
+- `collectors/ms_plus.py` — `_microstock_plus_collect_direct`, `_ms_plus_collect_global`
+Each collector imports from db.py + utils.py. sync state (`_sync_stop_flag`, `_sync_log`,
+`load_img_async`) passed as dependencies or imported from a shared `sync_state.py`.
+
+**Step 3.5 — platform/ (optional, after collectors)**
+Split Mac/Windows specific code:
+- `platform/cookies_mac.py` — Safari binarycookies reader
+- `platform/cookies_win.py` — `_decrypt_chrome_cookie_db`, `_load_appprofile_cookies_windows`
+- `platform/browser.py` — stealth JS (Mac-only), channel='chrome' (Windows)
+
+**Step 4 — routes (optional)**
+Flask Blueprints: move `@flask_app.route(...)` functions to `routes/` or `api.py`.
+Lowest priority — routes already well-documented in this CLAUDE.md.
+
+**Test after each step:**
+1. `python3 -c "import ast; ast.parse(open('main.py').read())"` — syntax OK
+2. Start the app: `python3 main.py` → Flask starts on port 8000
+3. Trigger one sync (Refresh button) — collectors run, data appears
+4. Git commit with clear message: "refactor step N: ..."
 
 #### Auto-update mechanism (high priority — user-requested)
 The user wants the desktop app to auto-update from a cloud source. Approach:
