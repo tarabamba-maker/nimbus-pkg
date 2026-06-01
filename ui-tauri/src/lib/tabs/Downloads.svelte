@@ -121,23 +121,12 @@
       await load(true, true);
       // Reliable new-sale tracking: backend records inserted keys during sync,
       // we fetch them here. No client-side diff timing issues.
-      let _newKeys = [];
+      // Feed is ORDER BY id DESC — new inserts are naturally at the top.
+      // Just fetch keys for blue highlight coloring.
       try {
-        _newKeys = await fetch(API_BASE + '/api/sync/recent-keys').then(r => r.json()) || [];
-        newSaleKeys.set(new Set(_newKeys));
+        const keys = await fetch(API_BASE + '/api/sync/recent-keys').then(r => r.json());
+        newSaleKeys.set(new Set(keys || []));
       } catch { newSaleKeys.set(new Set()); }
-      // Fetch ALL new items from backend (includes old-dated Shutterstock records
-      // that are on page 5+) and prepend them before the regular feed.
-      if (_newKeys.length > 0) {
-        try {
-          const newItems = await fetch(API_BASE + '/api/sync/recent-items').then(r => r.json()) || [];
-          if (newItems.length > 0) {
-            const newIds = new Set(newItems.map(it => it.id));
-            const oldItems = items.filter(it => !newIds.has(it.id));
-            items = [...newItems, ...oldItems];
-          }
-        } catch {}
-      }
       downloadsCache.write({
         items, totalCount, period: get(currentPeriod), stock,
       });

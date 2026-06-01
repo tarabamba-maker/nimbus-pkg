@@ -778,7 +778,7 @@ def api_feed():
         total_count = conn.execute(f"SELECT COUNT(*) FROM sales {ws}", params).fetchone()[0]
         rows = conn.execute(
             f"SELECT id, asset_id, price, thumb_url, date, stock "
-            f"FROM sales {ws} ORDER BY date DESC, id DESC LIMIT ? OFFSET ?",
+            f"FROM sales {ws} ORDER BY id DESC LIMIT ? OFFSET ?",
             params + [per_pg, (page_n - 1) * per_pg]).fetchall()
 
     # Per-stock aggregates expanded via cross-stock matches
