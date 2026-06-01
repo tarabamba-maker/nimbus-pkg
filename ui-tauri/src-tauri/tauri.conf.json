@@ -38,6 +38,7 @@
       "../../cookies.py",
       "../../matching_engine.py",
       "../../image_utils.py",
+      "../../config.py",
       "../../orchestrator.py",
       "../../collectors"
     ],

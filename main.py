@@ -12,7 +12,7 @@ from db import init_db, is_already_saved, save_to_db
 from sync_state import (
     _sync_state, _sync_stop_flag, _sync_all_active,
     _session_new_keys, _session_new_keys_lock, _sync_log_lock,
-    _sync_log, _save_record,
+    _sync_log, _save_record, _app_log,
 )
 from collectors.browser import (
     _STEALTH_JS, _apply_stealth,
@@ -94,26 +94,7 @@ if not IS_WIN:
 # inside Program Files which is read-only — silent open() failure left the log
 # empty and made debugging impossible. Prefer STOCK_DATA_DIR (set by Tauri),
 # fall back to script dir for dev runs.
-_LOG_DIR  = os.environ.get("STOCK_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
-try: os.makedirs(_LOG_DIR, exist_ok=True)
-except Exception: pass
-_LOG_FILE = os.path.join(_LOG_DIR, "app.log")
-try:
-    _log_file_handle = open(_LOG_FILE, "a", encoding="utf-8", errors="replace", buffering=1)
-except Exception:
-    # Last-resort: temp dir. We'd rather have a log than nothing.
-    import tempfile as _tf
-    _LOG_FILE = os.path.join(_tf.gettempdir(), "stock_automation_app.log")
-    _log_file_handle = open(_LOG_FILE, "a", encoding="utf-8", errors="replace", buffering=1)
-atexit.register(lambda: _log_file_handle.close())
-
-def _app_log(msg: str):
-    ts  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] {msg}"
-    try: print(line, flush=True)
-    except Exception: pass
-    try: _log_file_handle.write(line + "\n")
-    except Exception: pass
+# _app_log, _log_file_handle → sync_state.py
 
 # Завантажуємо .env
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -282,13 +263,7 @@ STOCKS = [
     "Adobe Stock", "Shutterstock", "Getty Images", "Depositphotos",
 ]
 
-STOCK_URLS = {
-    "Adobe Stock":   "https://contributor.stock.adobe.com/en/sales",
-    "Shutterstock":  "https://submit.shutterstock.com/earnings",
-    "Getty Images":  "https://esp.gettyimages.com/contribute/stats",
-    "Depositphotos": "https://depositphotos.com/account/sales-history.html",
-    "Microstock+":   "https://microstock.plus/myfiles",
-}
+from config import STOCK_URLS
 
 # ═══════════════════════════════════════════════════════════
 # БД

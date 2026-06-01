@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 import requests as req_lib
 
 from db import is_already_saved, DB_NAME
-from sync_state import _sync_log, _sync_stop_flag, _save_record
+from sync_state import _sync_log, _sync_stop_flag, _save_record, _app_log
 from cookies import _load_browser_cookies
 
 _BASE_DIR = os.environ.get(

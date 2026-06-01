@@ -1,18 +1,45 @@
 """
-sync_state.py — Shared mutable sync state and record-saving helper.
+sync_state.py — Shared mutable sync state, logging, and record-saving helper.
 NO Flask, NO Playwright dependencies. Safe to import from collectors/.
 
 Moved here from main.py (logic unchanged — only location changed):
   - _sync_state, _sync_stop_flag, _sync_all_active
   - _session_new_keys + lock, _sync_log_lock
-  - _sync_log
+  - _sync_log, _app_log
   - _save_record
 """
 
+import atexit
+import os
+import tempfile
 import threading
 from datetime import datetime
 
 from db import is_already_saved, save_to_db
+
+# ── App-level file logger ─────────────────────────────────────────────────────
+
+_LOG_DIR  = os.environ.get("STOCK_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+try:
+    os.makedirs(_LOG_DIR, exist_ok=True)
+except Exception:
+    pass
+_LOG_FILE = os.path.join(_LOG_DIR, "app.log")
+try:
+    _log_file_handle = open(_LOG_FILE, "a", encoding="utf-8", errors="replace", buffering=1)
+except Exception:
+    _LOG_FILE = os.path.join(tempfile.gettempdir(), "stock_automation_app.log")
+    _log_file_handle = open(_LOG_FILE, "a", encoding="utf-8", errors="replace", buffering=1)
+atexit.register(lambda: _log_file_handle.close())
+
+
+def _app_log(msg: str):
+    ts   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    try: print(line, flush=True)
+    except Exception: pass
+    try: _log_file_handle.write(line + "\n")
+    except Exception: pass
 
 
 # ── Sync state ────────────────────────────────────────────────────────────────

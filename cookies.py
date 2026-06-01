@@ -32,13 +32,13 @@ _BASE_DIR = os.environ.get(
 
 from utils import _dpapi_unprotect
 from collectors.browser import _open_browser_context, _apply_stealth
-from sync_state import _sync_log
+from sync_state import _sync_log, _app_log
 
 
-def _app_log_lazy(msg):
+def _app_log(msg):
     try:
         from main import _app_log
-        _app_log_lazy(msg)
+        _app_log(msg)
     except Exception:
         print(msg)
 
@@ -130,7 +130,7 @@ def _decrypt_chrome_cookie_db(cookie_db):
         if enc_key[:5] == b'DPAPI':
             aes_key = _dpapi_unprotect(enc_key[5:])
     except Exception as e:
-        _app_log_lazy(f"⚠️ Chrome master key load failed ({cookie_db}): {e}")
+        _app_log(f"⚠️ Chrome master key load failed ({cookie_db}): {e}")
 
     # Chrome keeps a lock on the live DB — read from a copy.
     tmp = tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False).name
@@ -141,7 +141,7 @@ def _decrypt_chrome_cookie_db(cookie_db):
             'SELECT host_key, name, encrypted_value, value FROM cookies').fetchall()
         con.close()
     except Exception as e:
-        _app_log_lazy(f"⚠️ Chrome cookie DB read failed ({cookie_db}): {e}")
+        _app_log(f"⚠️ Chrome cookie DB read failed ({cookie_db}): {e}")
         return []
     finally:
         try:
@@ -175,7 +175,7 @@ def _decrypt_chrome_cookie_db(cookie_db):
         out.append({'name': name, 'value': val, 'domain': host.lstrip('.')})
 
     if n_v20:
-        _app_log_lazy(f"ℹ️ {os.path.basename(os.path.dirname(os.path.dirname(cookie_db)))}: "
+        _app_log(f"ℹ️ {os.path.basename(os.path.dirname(os.path.dirname(cookie_db)))}: "
                  f"{n_v20} v20 cookies skipped, {len(out)} readable")
     return out
 
@@ -224,7 +224,7 @@ def _load_browser_cookies():
         try:
             return _parse_safari_binarycookies(path)
         except Exception as e:
-            _app_log_lazy(f"⚠️ Safari cookies parse failed: {e}")
+            _app_log(f"⚠️ Safari cookies parse failed: {e}")
             return []
     if IS_WIN:
         return _load_appprofile_cookies_windows()
@@ -323,7 +323,7 @@ def _inject_cookies_via_playwright(stock_name, cookies):
                 ctx.close()
         return len(pw_cookies)
     except Exception as e:
-        _app_log_lazy(f"[cookies] inject {stock_name} failed: {e}")
+        _app_log(f"[cookies] inject {stock_name} failed: {e}")
         return 0
 
 
@@ -519,7 +519,7 @@ def _windows_browser_login(stocks):
                 except Exception:
                     pass
     except Exception as e:
-        _app_log_lazy(f"[win-login] failed: {e}")
+        _app_log(f"[win-login] failed: {e}")
         return [{'stock': s, 'imported': 0, 'error': str(e)} for s in opened or stocks]
 
     return [{'stock': s, 'imported': 1, 'msg': 'login window closed'} for s in opened]

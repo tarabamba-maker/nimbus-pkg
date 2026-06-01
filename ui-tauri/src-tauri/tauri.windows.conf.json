@@ -10,6 +10,7 @@
       "../../cookies.py",
       "../../image_utils.py",
       "../../matching_engine.py",
+      "../../config.py",
       "../../orchestrator.py",
       "../../collectors",
       "../../pyembed"

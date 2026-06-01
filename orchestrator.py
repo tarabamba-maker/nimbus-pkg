@@ -32,17 +32,7 @@ RECIPES_DIR          = os.path.join(_BASE_DIR, "recipes")
 MS_LIBRARY_FILE      = os.path.join(RECIPES_DIR, "ms_library.json")
 PROCESSED_DATES_FILE = os.path.join(RECIPES_DIR, "_processed_dates.json")
 
-STOCK_URLS = {
-    "Adobe Stock":   "https://contributor.stock.adobe.com/en/sales",
-    "Shutterstock":  "https://submit.shutterstock.com/earnings",
-    "Getty Images":  "https://esp.gettyimages.com/contribute/stats",
-    "Depositphotos": "https://depositphotos.com/account/sales-history.html",
-    "Microstock+":   "https://microstock.plus/myfiles",
-}
-
-# _depositphotos_collect_direct is not yet implemented — placeholder
-def _depositphotos_collect_direct():
-    return False
+from config import STOCK_URLS
 
 
 def _run_collector_global(p, profile_dir, stock_name, start_url, headless, allow_login=False):
@@ -130,13 +120,6 @@ def _collect_one_stock_global(name, url, allow_login=False):
             _sync_log("[Adobe Stock] direct API failed — fallback to Playwright")
         except Exception as ex:
             _sync_log(f"[Adobe Stock] direct API exception: {ex} — fallback")
-    if name == "Depositphotos":
-        try:
-            if _depositphotos_collect_direct():
-                return
-            _sync_log("[Depositphotos] direct failed — fallback to Playwright")
-        except Exception as ex:
-            _sync_log(f"[Depositphotos] direct exception: {ex} — fallback")
     if name == "Shutterstock":
         try:
             if _shutterstock_api_collect_direct():
