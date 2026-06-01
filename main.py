@@ -2,6 +2,13 @@ import ssl, time, threading, sqlite3, os, re, json, base64, atexit, sys
 from io import BytesIO
 from datetime import datetime, timedelta
 
+from utils import (
+    _adobe_clean_thumb_url,
+    _hamming_hex,
+    _dhash_from_path,
+    _dpapi_unprotect,
+)
+
 # Platform: 'darwin' (macOS), 'win32' (Windows), 'linux'.
 # Used for browser-cookie source selection (Safari on mac vs Chrome on Windows).
 IS_MAC = sys.platform == 'darwin'
@@ -195,16 +202,7 @@ os.makedirs(MATCH_CACHE_DIR, exist_ok=True)
 os.makedirs(MS_CACHE_DIR, exist_ok=True)
 os.makedirs(ICON_CACHE_DIR, exist_ok=True)
 
-def _adobe_clean_thumb_url(thumb_url: str) -> str:
-    """
-    Конвертує будь-який Adobe ftcdn.net URL у чисту 110px версію без watermark.
-    as2.ftcdn.net/jpg/.../110_F_{id}_{hash}.jpg
-    """
-    if not thumb_url or "ftcdn.net" not in thumb_url:
-        return thumb_url
-    url = re.sub(r'/\d+_F_', '/110_F_', thumb_url)
-    url = re.sub(r'https?://[^/]+\.ftcdn\.net', 'https://as2.ftcdn.net', url)
-    return url
+# _adobe_clean_thumb_url → utils.py
 
 RECIPES_DIR            = os.path.join(_BASE_DIR, "recipes")
 MATCHES_FILE           = os.path.join(RECIPES_DIR, "_cross_stock_matches.json")
@@ -4053,29 +4051,7 @@ def _chrome_cookies_path():
 # Mac collectors filter by domain in-place — Windows path returns ALL cookies
 # (filtering happens at call site).
 
-def _dpapi_unprotect(data: bytes) -> bytes:
-    """Unwrap a DPAPI-protected blob in the current user context (ctypes, no
-    pywin32 dependency)."""
-    import ctypes
-    from ctypes import wintypes
-
-    class DATA_BLOB(ctypes.Structure):
-        _fields_ = [('cbData', wintypes.DWORD),
-                    ('pbData', ctypes.POINTER(ctypes.c_char))]
-
-    buf = ctypes.create_string_buffer(data, len(data))
-    blob_in = DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
-    blob_out = DATA_BLOB()
-    if not ctypes.windll.crypt32.CryptUnprotectData(
-            ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)):
-        raise OSError('CryptUnprotectData failed')
-    try:
-        n = blob_out.cbData
-        out = ctypes.create_string_buffer(n)
-        ctypes.memmove(out, blob_out.pbData, n)
-        return out.raw
-    finally:
-        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+# _dpapi_unprotect → utils.py
 
 
 def _decrypt_chrome_cookie_db(cookie_db):
@@ -6264,30 +6240,7 @@ def img_stock_icon(name):
     return resp
 
 # ── Perceptual hash (dHash) for cross-stock visual matching ──────────────────
-def _dhash_from_path(path):
-    """
-    Compute 64-bit dHash + dominant RGB from an image file.
-    Returns (hex_string, aspect_ratio, r, g, b) or (None, None, None, None, None).
-    """
-    try:
-        img = Image.open(path)
-        ar = round(img.width / img.height, 3) if img.height else 1.0
-        # Single resize → use for both hash (grayscale) and RGB (color)
-        rgb_small = img.convert('RGB').resize((9, 8), Image.Resampling.LANCZOS)
-        gray_px = list(rgb_small.convert('L').getdata())
-        rgb_px  = list(rgb_small.getdata())
-        bits = 0
-        for row in range(8):
-            base = row * 9
-            for col in range(8):
-                bits = (bits << 1) | (1 if gray_px[base + col] > gray_px[base + col + 1] else 0)
-        n = len(rgb_px)
-        r_avg = sum(p[0] for p in rgb_px) // n
-        g_avg = sum(p[1] for p in rgb_px) // n
-        b_avg = sum(p[2] for p in rgb_px) // n
-        return f"{bits:016x}", ar, r_avg, g_avg, b_avg
-    except Exception:
-        return None, None, None, None, None
+# _dhash_from_path → utils.py
 
 def _save_asset_meta(stock, asset_id, path):
     """Compute hash + dominant RGB for thumbnail at path and persist to asset_meta."""
@@ -6306,12 +6259,7 @@ def _save_asset_meta(stock, asset_id, path):
     except Exception:
         pass
 
-def _hamming_hex(h1, h2):
-    """Hamming distance between two 16-char hex strings. 0 = identical, 64 = totally different."""
-    try:
-        return bin(int(h1, 16) ^ int(h2, 16)).count('1')
-    except Exception:
-        return 64
+# _hamming_hex → utils.py
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_img(asset_id, url, stock=None):
