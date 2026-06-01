@@ -12,7 +12,9 @@
       "../../matching_engine.py",
       "../../config.py",
       "../../orchestrator.py",
+      "../../app_globals.py",
       "../../collectors",
+      "../../routes",
       "../../pyembed"
     ]
   }

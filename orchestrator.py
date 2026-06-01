@@ -197,9 +197,8 @@ def _collect_one_stock_global(name, url, allow_login=False):
                 except Exception: pass
     try:
         with _spw() as _p:
-            from main import _headless_mode, _headless_lock
-            with _headless_lock:
-                headless = _headless_mode
+            from sync_state import get_headless
+            headless = get_headless()
             # First-time/rebuild mode: force visible browser + login wait for ALL stocks.
             # User just wiped DB → likely needs to verify logins everywhere.
             _db_is_empty = False

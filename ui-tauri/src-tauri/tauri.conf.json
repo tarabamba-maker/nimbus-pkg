@@ -40,7 +40,9 @@
       "../../image_utils.py",
       "../../config.py",
       "../../orchestrator.py",
-      "../../collectors"
+      "../../app_globals.py",
+      "../../collectors",
+      "../../routes"
     ],
     "icon": [
       "icons/32x32.png",

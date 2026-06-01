@@ -56,6 +56,21 @@ _session_new_keys: list = []
 _session_new_keys_lock = threading.Lock()
 _sync_log_lock = threading.Lock()  # guards _sync_state["log"] reads/writes
 
+# Headless mode toggle — use a list so importers get a shared mutable reference.
+# DO NOT use a plain bool — `from sync_state import _headless_mode` makes a copy.
+_headless_flag: list = [True]   # _headless_flag[0] = current headless setting
+_headless_lock = threading.Lock()
+
+
+def get_headless() -> bool:
+    with _headless_lock:
+        return _headless_flag[0]
+
+
+def set_headless(val: bool):
+    with _headless_lock:
+        _headless_flag[0] = val
+
 
 def _sync_log(msg: str):
     with _sync_log_lock:
