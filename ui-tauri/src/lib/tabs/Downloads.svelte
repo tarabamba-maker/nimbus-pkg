@@ -230,11 +230,6 @@
           <div class="info">{item.stock} · {item.date?.slice(5, 10)}</div>
           {#if inGroups.length > 0}<div class="group-badge">📁 {inGroups[0]}</div>{/if}
         </div>
-        <div class="dots">
-          {#each Object.keys(item.by_stock||{}) as sk}
-            <span class="dot" style="background:{STOCK_COLORS[sk]||'#888'}" title={sk}></span>
-          {/each}
-        </div>
       </div>
     {/each}
 
