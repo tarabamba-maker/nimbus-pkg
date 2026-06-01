@@ -243,8 +243,9 @@ def _ms_plus_collect_direct():
     # already short-circuits cached rows, but iterating 15k files is wasteful).
     if dl_count > 0:
         try:
-            from main import flask_app, api_compute_ms_hashes
-            with flask_app.test_request_context():
+            from main import flask_app
+            from routes.matching import api_compute_ms_hashes
+            with flask_app.app_context():
                 api_compute_ms_hashes()
             _sync_log("✅ MS+ ms_meta pHashes computed")
         except Exception as ex:

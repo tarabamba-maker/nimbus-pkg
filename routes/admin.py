@@ -334,8 +334,10 @@ def api_rebuild_groups():
             _sync_stop_flag[0] = False
             _collect_one_stock_global("Microstock+", ms_url)
             try:
+                from main import flask_app
                 from routes.matching import api_rebuild_matches
-                resp = api_rebuild_matches()
+                with flask_app.app_context():
+                    resp = api_rebuild_matches()
                 _sync_log(f"✅ Groups rebuilt: {resp.get_json()}")
             except Exception as ex:
                 _sync_log(f"⚠️ rebuild-matches failed: {ex}")

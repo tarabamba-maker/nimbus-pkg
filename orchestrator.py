@@ -334,8 +334,9 @@ def _sync_all_global():
             _sync_log("✅ All stocks collected")
             try:
                 _sync_log("🔗 Auto: rebuilding cross-stock matches...")
-                from main import flask_app, api_rebuild_matches
-                with flask_app.test_request_context():
+                from main import flask_app
+                from routes.matching import api_rebuild_matches
+                with flask_app.app_context():
                     resp = api_rebuild_matches()
                 _sync_log(f"✅ Matches rebuilt: {resp.get_json()}")
             except Exception as ex:
