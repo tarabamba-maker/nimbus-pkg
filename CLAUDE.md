@@ -495,22 +495,18 @@ Shared mutable sync state moved to `sync_state.py` (no circular imports):
 main.py imports all of the above from sync_state.py.
 `_headless_mode` + `_headless_lock` stay in main.py (only used by orchestrators + Flask route).
 
-**Step 3 — collectors/ (IN PROGRESS)**
-Created `collectors/` package. Files so far:
+**Step 3 — collectors/ ✅ DONE**
+All collectors extracted. Final package structure:
 - `collectors/__init__.py` — empty
 - `collectors/browser.py` ✅ — `_STEALTH_JS`, `_apply_stealth`, `_is_login_url`, `_open_browser_context`, `_do_login_flow_global`
 - `collectors/adobe.py` ✅ — `_adobe_collect_direct`, `_adobe_api_collect_global`
-- `collectors/shutterstock.py` — TODO
-- `collectors/getty.py` — TODO
-- `collectors/depositphotos.py` — TODO
-- `collectors/ms_plus.py` — TODO
+- `collectors/shutterstock.py` ✅ — `_shutterstock_api_collect_direct`, `_shutterstock_api_collect_global`
+- `collectors/getty.py` ✅ — `_getty_collect_direct`, `_getty_api_collect_global`
+- `collectors/depositphotos.py` ✅ — `_depositphotos_collect`
+- `collectors/ms_plus.py` ✅ — `_ms_plus_collect_direct`, `_ms_plus_collect_global`
 
-**Pattern for remaining collectors:**
-- Import from: `sync_state`, `db`, `utils`, `collectors.browser`
-- For `load_img_async` / `load_match_thumb` / `_load_browser_cookies` (still in main.py):
-  use lazy import inside function body: `from main import load_img_async`
-- Constants (RECIPES_DIR etc): computed from STOCK_DATA_DIR env var at module level
-- Orchestrators (`_run_collector_global`, `_collect_one_stock_global`, `_sync_all_global`) stay in main.py
+Orchestrators (`_run_collector_global`, `_collect_one_stock_global`, `_sync_all_global`) stay in main.py.
+Lazy imports pattern: `from main import load_img_async` inside function body for remaining main.py deps.
 
 **⚠️ TAURI BUNDLING — REQUIRED after adding any new module:**
 - Every new `.py` file or package MUST be added to `tauri.conf.json` → `bundle.resources`
