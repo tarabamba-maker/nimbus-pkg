@@ -4,6 +4,14 @@
     "resources": [
       "../../main.py",
       "../../import_getty.py",
+      "../../utils.py",
+      "../../db.py",
+      "../../sync_state.py",
+      "../../cookies.py",
+      "../../image_utils.py",
+      "../../matching_engine.py",
+      "../../orchestrator.py",
+      "../../collectors",
       "../../pyembed"
     ]
   }
