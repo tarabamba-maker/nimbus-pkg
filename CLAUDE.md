@@ -28,7 +28,7 @@ Desktop sales aggregator for photo stocks. Playwright logs into stock sites, col
 ## Files
 
 ```
-main.py              — Flask backend (API routes + Playwright collectors) [MODULARIZATION IN PROGRESS]
+main.py              — Flask app init + blueprint registration only (~284 lines)
 utils.py             — Pure utility functions (moved from main.py, Step 1 done):
                         _adobe_clean_thumb_url, _hamming_hex, _dhash_from_path, _dpapi_unprotect
 sales.db             — sales database
@@ -470,11 +470,9 @@ updates → all other tabs (and PhotoPopup) immediately see the change.
 
 ### 🔜 Next sessions
 
-#### Modularization (IN PROGRESS — top priority)
-**Rule: move code only, NEVER rewrite logic inside functions.**
-**git tag `pre-modular-20260601-112644` + `backups/main-pre-modular-*.py` = safe rollback point.**
-
-Current state: `main.py` ~6400 lines. `utils.py` created (Step 1 done).
+#### Modularization ✅ COMPLETE (2026-06-02)
+**main.py: 6444 → 284 lines (−96%). All routes extracted to blueprints.**
+**git tag `pre-modular-20260601-112644` = safe rollback point.**
 
 **Step 1 — utils.py ✅ DONE**
 Pure functions with zero app dependencies moved to `utils.py`:
@@ -558,7 +556,7 @@ Central constants: `STOCK_URLS`. Previously duplicated in main.py + orchestrator
 
 **sync_state.py** — also contains `_app_log` + log file handle (moved from main.py).
 
-**Current state: main.py ~2884 lines** (was 6444 at start — **−55%**).
+**Final state: main.py ~284 lines** (was 6444 at start — **−96%**).
 Module map:
 | File | Contents |
 |------|---------|
@@ -576,11 +574,18 @@ Module map:
 | `collectors/getty.py` | Getty/iStock collector |
 | `collectors/depositphotos.py` | Depositphotos collector |
 | `collectors/ms_plus.py` | Microstock+ collector |
-| `main.py` | Flask app init + 50 routes (~2884 lines) |
+| `main.py` | Flask app init + blueprint registration (~284 lines) |
+| `app_globals.py` | Shared path constants + `_query_earnings_batch`, `_load_matches`, helpers |
+| `routes/images.py` | `/img/*` endpoints |
+| `routes/feed.py` | `/api/feed`, `/api/sales`, `/api/stats`, `/api/stock-*`, `/update` |
+| `routes/sync.py` | `/api/sync/*`, `/api/inspector/*`, `/api/debug/log` |
+| `routes/groups.py` | `/api/groups*`, `/api/photo-groups*`, `/api/group-*`, `/api/ms-library/*` |
+| `routes/matching.py` | `/api/rebuild-matches`, `/api/compute-*`, `/api/matches*`, `/api/match-override` |
+| `routes/admin.py` | `/api/export`, `/api/import-*`, `/api/reset*`, `/api/deduplicate`, `/api/rebuild-*` |
 
 ---
 
-## Step 5 — Flask Blueprints (IN PROGRESS — next session)
+## Step 5 — Flask Blueprints ✅ COMPLETE (2026-06-02)
 
 **Goal:** main.py → ~200 lines (init + blueprint registration only).
 **Rule:** move code verbatim, no logic rewrites. Test after each blueprint.
