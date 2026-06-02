@@ -716,6 +716,53 @@ For each new stock, follow "How to add a new stock" above.
 Відкрити Inspector → вибрати Envato → зайти на `https://author.envato.com/earnings`
 Знайти XHR запити до `api.envato.com` або `author.envato.com/api/`
 
+### Результати дослідження (Inspector + Console тести, 2026-06-02)
+
+**API endpoints знайдені:**
+- `author.envato.com/reports/api/v1/performance/item_performance?shopfront=Elements&start_date=...&end_date=...&sort_by=total_earnings&sort_direction=desc&new_item_only=false&page=N`
+  → `{total_count, total_pages, data:[{item_id(UUID), title, category, filename, url, total_earnings, earnings_change}]}`
+- `author.envato.com/reports/api/v1/earnings/total` → загальна сума all-time
+- `author.envato.com/reports/api/v1/earnings/detail?view=yearly&...` → розбивка по роках
+- Auth: cookie-based (`_author_warehouse_session`) + `x-csrf-token` header
+- CSRF token береться з `<meta name="csrf-token">` на сторінці
+
+**Thumbnail ситуація:**
+- `item_performance` API НЕ повертає thumbnail URLs
+- Author dashboard — таблиця без зображень
+- Thumbnail доступний тільки через item page: `elements.envato.com/item-uuid-redirect/{UUID}`
+- Всі thumbnails мають watermark (`mark-alpha=18` = 18% opacity, та ж сама `watermark4.png`)
+- Підпис `s=` прив'язаний до всіх параметрів → прибрати watermark неможливо
+- DataDome блокує Playwright NAVIGATION але НЕ блокує `fetch()` зсередини браузера
+- `fetch("/item-uuid-redirect/UUID", {credentials:"include"})` з elements.envato.com → повертає HTML з og:image URL ✓
+
+**Стратегія thumbnail:**
+- Не використовуємо Envato thumbnail для відображення
+- Матчимо Envato → MS+ по `filename` (API повертає оригінальну назву файлу)
+- Для camera-дублікатів (однаковий filename) — pHash disambiguate (watermark не заважає: однакові фото = близький pHash, різні = далекий)
+- Після матчу відображаємо MS+ thumbnail (чистий, без watermark)
+- Для фото без MS+ матчу — тимчасово watermarked thumbnail
+
+**Стратегія збору (2 етапи):**
+1. `author.envato.com` → earnings per item (item_performance API, cookie auth)
+2. `elements.envato.com` → thumbnail URLs (fetch() зсередини браузера, XHR не блокується DataDome)
+
+**Архітектура колектора:**
+```python
+def _envato_collect(pw_page):
+    # Step 1: get CSRF token + earnings from author.envato.com
+    pw_page.goto("https://author.envato.com/reports/performance")
+    csrf = pw_page.locator('meta[name="csrf-token"]').get_attribute('content')
+    # fetch item_performance pages (all items, paginated 25/page)
+    
+    # Step 2: navigate to elements.envato.com ONCE for thumbnail fetch
+    pw_page.goto("https://elements.envato.com")
+    # fetch thumbnail URLs via page.evaluate(fetch()) — DataDome allows XHR
+    
+    # Step 3: snapshot-diff logic (see algorithm below)
+```
+
+**Snapshot file:** `recipes/_envato_snapshot.json` → `{item_id: total_earnings}`
+
 **Що шукати в Inspector (чеклист):**
 1. **Endpoint** — URL (напр. `api.envato.com/v2/market/...`)
 2. **Auth** — Bearer header? cookie? CSRF token?
