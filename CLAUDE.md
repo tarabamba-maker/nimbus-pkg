@@ -6,7 +6,7 @@ Desktop sales aggregator for photo stocks. Playwright logs into stock sites, col
 
 **Flet has been fully removed.** `main.py` is Flask-only (~5500 lines, modularization in progress). UI is `ui-tauri/` (SvelteKit + Tauri).
 
-**Current version: v0.9.51** (Mac + Windows, GitHub Actions CI builds both).
+**Current version: v0.9.53** (Mac + Windows, GitHub Actions CI builds both).
 **Windows port: COMPLETE** (v0.9.50 merged). Key Windows fixes:
 - UTF-8 stdout/stderr (emoji crash fix)
 - Chrome ABE v20: uses app-profile cookies via system Chrome (`channel='chrome'`)
@@ -455,6 +455,12 @@ updates → all other tabs (and PhotoPopup) immediately see the change.
 - [x] **Smoke test script** `test_api.py` — 16/16 endpoints, runs against live app
 - [x] **UI:** removed redundant Refresh Stats button from topbar
 - [x] **UI:** removed stock-match dots from Downloads cards (belong in BestSellers only)
+- [x] **Perf: incremental sync** — Adobe Pass 1 and Shutterstock use MAX(date) from DB. Adobe ~1.5min → ~5-10sec after first run
+- [x] **Perf: Depositphotos** — limit=160/page (4x fewer requests), row-level date stop, SQL outside loop
+- [x] **BestSellers multi-select** — Ctrl+click selects cards, select-bar with searchable group dropdown, batch add to group/create new
+- [x] **BestSellers ungrouped filter** — "Ungrouped" pill button, infinite scroll fills viewport properly
+- [x] **GroupContextMenu batch mode** — right-click on multi-selected shows "N photos selected", autofocus search
+- [x] **Groups optimistic delete/rename** — instant local update without full reload (like merge)
 - [x] Stale project files cleaned up
 - [x] **Removed 123RF + Dreamstime collectors entirely** (code + DB rows + UI refs)
 - [x] **Export / Import DB** with native Tauri save dialog (`@tauri-apps/plugin-dialog`+`plugin-fs`)
@@ -689,8 +695,54 @@ cloudflared tunnel --url http://localhost:8000
 For a permanent URL: register on dash.cloudflare.com (free), bind a domain.
 
 #### New stocks (priority order)
-- [ ] **Depositphotos** — inspect earnings page, find API endpoint, write `_depositphotos_api_collect`
-- [ ] **Pond5** — same pattern
-- [ ] **Envato** — same pattern (may need separate `envato_profile/`)
+- [x] **Depositphotos** — HTML scraping (no JSON API found). Optimized: limit=160/page, row-level date stop.
+- [ ] **Envato** — NEXT SESSION PRIORITY. Details below.
+- [ ] **Pond5** — after Envato
 
 For each new stock, follow "How to add a new stock" above.
+
+---
+
+## ⚠️ Envato — наступна сесія (складно, раніше ламало)
+
+### Що відомо
+- Профіль: `chrome_profile_Envato/` (вже створений)
+- Envato має **власне API** (`api.envato.com`) з OAuth токенами
+- Попередня спроба підключення зламала щось в застосунку — причина невідома
+
+### Безпечний план підключення
+
+**Крок 1 — Inspector ПЕРЕД написанням коду**
+Відкрити Inspector → вибрати Envato → зайти на `https://author.envato.com/earnings`
+Знайти XHR запити до `api.envato.com` або `author.envato.com/api/`
+Записати: endpoint URL, headers (особливо Authorization), формат відповіді
+
+**Крок 2 — написати колектор в ізоляції**
+Створити `collectors/envato.py` за патерном adobe.py/shutterstock.py:
+```python
+def _envato_collect(pw_page):
+    # 1. Navigate to earnings page
+    # 2. Fetch API via browser (credentials: 'include')
+    # 3. Parse JSON → _save_record()
+```
+НЕ чіпати main.py, orchestrator.py, config.py поки колектор не протестований окремо.
+
+**Крок 3 — тест в ізоляції**
+```python
+# test_envato.py — запускати окремо, без Flask
+python3 -c "from collectors.envato import _envato_collect; print('import OK')"
+```
+
+**Крок 4 — підключення (тільки після успішного тесту)**
+1. Додати в `config.py`: `"Envato": "https://author.envato.com/earnings"`
+2. Додати в `orchestrator.py` SALES_STOCKS
+3. Додати в `Browser.svelte` INSPECTOR_STOCKS і STOCKS
+4. Додати в `tauri.conf.json` — нічого не треба (collectors/ вже є)
+5. `python3 test_api.py` → 16/16
+
+**Ризики з минулого разу**
+- Envato може використовувати CSRF токени або особливі session cookies
+- `author.envato.com` і `api.envato.com` — різні домени, cookies можуть не передаватись
+- Якщо ламає — `git stash` або `git checkout collectors/envato.py` для відкату
+
+**Rollback**: якщо щось зламалось — `git revert HEAD` або `git checkout main -- collectors/`
