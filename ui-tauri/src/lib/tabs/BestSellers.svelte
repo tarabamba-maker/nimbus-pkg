@@ -2,7 +2,7 @@
   import { API_BASE } from "$lib/api.js";
   import { untrack } from 'svelte';
   import { fly } from 'svelte/transition';
-  import { Link } from 'lucide-svelte';
+  import { Link, Users } from 'lucide-svelte';
   import PhotoPopup from '$lib/PhotoPopup.svelte';
   import GroupContextMenu from '$lib/components/GroupContextMenu.svelte';
   import FilterPills from '$lib/components/FilterPills.svelte';
@@ -37,6 +37,54 @@
   let popup   = $state(/** @type {any} */ (null));
   let ctxMenu = $state(/** @type {{item:any, x:number, y:number}|null} */ (null));
   let sentinel = $state(/** @type {HTMLElement|null} */ (null));
+
+  // Ungrouped filter
+  let ungroupedOnly = $state(false);
+
+  // Multi-select (Ctrl+click)
+  let selected = $state(/** @type {Set<string>} */ (new Set()));
+
+  function toggleSelect(e, item) {
+    if (!e.ctrlKey && !e.metaKey) return false;
+    e.stopPropagation();
+    const s = new Set(selected);
+    if (s.has(item.asset_id)) s.delete(item.asset_id);
+    else s.add(item.asset_id);
+    selected = s;
+    return true;
+  }
+
+  function clearSelection() { selected = new Set(); }
+
+  async function addSelectedToGroup(groupName) {
+    const ids = [...selected];
+    const pg = { ...$photoGroups };
+    if (!pg[groupName]) pg[groupName] = [];
+    for (const id of ids) {
+      if (!pg[groupName].includes(id)) pg[groupName].push(id);
+    }
+    await fetch(API_BASE + '/api/photo-groups', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(pg) });
+    photoGroups.set(pg);
+    clearSelection();
+  }
+
+  let newGroupName = $state('');
+  let showNewGroupInput = $state(false);
+  let groupSearch = $state('');
+  let showGroupDropdown = $state(false);
+
+  const filteredGroups = $derived(
+    Object.keys($photoGroups).sort().filter(g =>
+      !groupSearch || g.toLowerCase().includes(groupSearch.toLowerCase())
+    )
+  );
+
+  async function createGroupFromSelected() {
+    if (!newGroupName.trim()) return;
+    await addSelectedToGroup(newGroupName.trim());
+    newGroupName = '';
+    showNewGroupInput = false;
+  }
 
   // Match mode — pendingMatch != null means mode is active (source selected)
   let pendingMatch = $state(/** @type {string|null} */ (null));  // asset_id of source
@@ -101,15 +149,24 @@
     loading = false;
   }
 
-  function loadMore() {
+  async function loadMore() {
     if (loading || items.length >= totalCount) return;
     page++;
-    load();
+    await load();
+    // When ungroupedOnly is active, filtered items may be fewer than perPage —
+    // keep loading until we have enough visible items or exhaust the server data.
+    if (ungroupedOnly) {
+      const visible = items.filter(it =>
+        Object.entries($photoGroups).every(([,ids]) => !ids.includes(it.asset_id))
+      ).length;
+      if (visible < 15 && items.length < totalCount) loadMore();
+    }
   }
 
-  /** @param {Event} e @param {any} item */
+  /** @param {MouseEvent} e @param {any} item */
   function handleCardClick(e, item) {
     e.stopPropagation();
+    if (toggleSelect(e, item)) return;
     if (pendingMatch) { doMatch(item); return; }
     popup = item;
   }
@@ -136,15 +193,23 @@
   /** @param {MouseEvent} e @param {any} item */
   function openCtx(e, item) {
     e.preventDefault();
-    ctxMenu = { item, x: e.clientX, y: e.clientY };
+    // If this item is part of a multi-selection, pass all selected items
+    if (selected.size > 1 && selected.has(item.asset_id)) {
+      const selItems = items.filter(it => selected.has(it.asset_id));
+      ctxMenu = { item, items: selItems, x: e.clientX, y: e.clientY };
+    } else {
+      ctxMenu = { item, x: e.clientX, y: e.clientY };
+    }
   }
 
   $effect(() => {
     if (!sentinel) return;
     const observer = new IntersectionObserver((entries) => {
       if (entries[0].isIntersecting) loadMore();
-    }, { rootMargin: '400px' });
+    }, { rootMargin: '800px' });
     observer.observe(sentinel);
+    // If content doesn't fill viewport on mount, trigger load immediately
+    setTimeout(() => { if (!loading && items.length < totalCount) loadMore(); }, 100);
     return () => observer.disconnect();
   });
 
@@ -195,8 +260,50 @@
         onSelect={pickSort} />
       <FilterPills label="Stock:" options={$stockList}
         value={stock} onSelect={(s) => { stock=s; load(true); onStockChange?.(s); }} />
+      <button class="pill {ungroupedOnly ? 'pill-active' : ''}"
+        onclick={() => { ungroupedOnly = !ungroupedOnly; clearSelection(); }}
+        title="Show only photos not in any group">
+        <Users size={11} strokeWidth={2} /> Ungrouped
+      </button>
     </div>
   </div>
+
+  <!-- Multi-select action bar -->
+  {#if selected.size > 0}
+    <div class="select-bar">
+      <span class="select-count">{selected.size} selected</span>
+      <div style="flex:1"></div>
+      {#if showNewGroupInput}
+        <input class="new-group-input" placeholder="Group name…" bind:value={newGroupName}
+          onkeydown={(e) => { if (e.key==='Enter') createGroupFromSelected(); if (e.key==='Escape') showNewGroupInput=false; }}
+          autofocus />
+        <button class="sel-btn sel-btn-ok" onclick={createGroupFromSelected}>Create</button>
+        <button class="sel-btn" onclick={() => showNewGroupInput=false}>✕</button>
+      {:else}
+        <div class="sel-group-wrap">
+          <span class="sel-label">Add to group:</span>
+          <div class="sel-search-wrap">
+            <input class="sel-search" placeholder="Search group…"
+              bind:value={groupSearch}
+              onfocus={() => showGroupDropdown = true}
+              onblur={() => setTimeout(() => showGroupDropdown = false, 150)}
+              oninput={() => showGroupDropdown = true} />
+            {#if showGroupDropdown && filteredGroups.length > 0}
+              <div class="sel-dropdown">
+                {#each filteredGroups.slice(0,12) as g}
+                  <button class="sel-drop-item" onmousedown={() => { addSelectedToGroup(g); groupSearch = ''; showGroupDropdown = false; }}>
+                    {g}
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        </div>
+        <button class="sel-btn sel-btn-new" onclick={() => showNewGroupInput = true}>+ New group</button>
+        <button class="sel-btn" onclick={clearSelection}>✕ Clear</button>
+      {/if}
+    </div>
+  {/if}
 
   <!-- Grid: fixed 160px cards -->
   <div class="grid scroll-y">
@@ -204,7 +311,9 @@
       {@const isSrc      = pendingMatch === item.asset_id}
       {@const stockKeys  = Object.keys(item.by_stock || {}).length ? Object.keys(item.by_stock) : [item.stock]}
       {@const inGroups   = Object.entries($photoGroups).filter(([,ids]) => ids.includes(item.asset_id)).map(([n]) => n)}
-      <div class="card {isSrc ? 'match-src' : ''} {pendingMatch && !isSrc ? 'match-pick' : ''}"
+      {@const isSelected = selected.has(item.asset_id)}
+      {#if !ungroupedOnly || inGroups.length === 0}
+      <div class="card {isSrc ? 'match-src' : ''} {pendingMatch && !isSrc ? 'match-pick' : ''} {isSelected ? 'card-selected' : ''}"
         in:fly={i < 15 ? { y: 14, duration: 180, delay: i * 16 } : { y: 0, duration: 0 }}
         onclick={(e) => handleCardClick(e, item)}
         oncontextmenu={(e) => openCtx(e, item)}
@@ -248,6 +357,7 @@
           </button>
         </div>
       </div>
+      {/if}
     {/each}
     {#if loading}
       <div class="loader">Loading…</div>
@@ -302,6 +412,68 @@
   .automatch-msg { font-size:11px; color: var(--green); flex-shrink:0; }
 
   .filter-row { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+
+  .pill {
+    display:inline-flex; align-items:center; gap:4px;
+    padding:3px 10px; border-radius: var(--radius-pill); border:1px solid var(--glass-border);
+    background: var(--bg2); color: var(--label2); font-size:11px; cursor:pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .pill:hover { background: var(--bg3); color: var(--label); }
+  .pill-active { background: rgba(10,132,255,0.15); border-color: rgba(10,132,255,0.4); color: var(--accent); }
+
+  .select-bar {
+    display:flex; align-items:center; gap:8px; flex-shrink:0;
+    background: rgba(10,132,255,0.10); border:1px solid rgba(10,132,255,0.30);
+    backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);
+    border-radius: var(--radius); padding:7px 12px;
+  }
+  .select-count { font-size:12px; font-weight:700; color: var(--accent); }
+  .sel-label { font-size:11px; color: var(--label2); }
+  .sel-group-wrap { display:flex; align-items:center; gap:6px; }
+  .sel-select {
+    font-size:11px; padding:3px 6px; border-radius:6px;
+    border:1px solid var(--glass-border); background: var(--bg2); color: var(--label);
+    max-width:200px;
+  }
+  .sel-btn {
+    font-size:11px; padding:3px 10px; border-radius: var(--radius-pill);
+    border:1px solid var(--glass-border); background: var(--bg2); color: var(--label2);
+    cursor:pointer; white-space:nowrap;
+  }
+  .sel-btn:hover { background: var(--bg3); color: var(--label); }
+  .sel-btn-new { color: var(--accent); border-color: rgba(10,132,255,0.4); }
+  .sel-btn-ok  { background: var(--accent); color:#fff; border-color: var(--accent); }
+  .new-group-input {
+    font-size:12px; padding:3px 8px; border-radius:6px;
+    border:1px solid rgba(10,132,255,0.4); background: var(--bg2); color: var(--label);
+    width:160px; outline:none;
+  }
+
+  .sel-search-wrap { position:relative; }
+  .sel-search {
+    font-size:12px; padding:3px 8px; border-radius:6px; width:160px;
+    border:1px solid var(--glass-border); background: var(--bg2); color: var(--label);
+    outline:none;
+  }
+  .sel-dropdown {
+    position:absolute; top:calc(100% + 4px); left:0; z-index:500;
+    background: var(--glass2); border:1px solid var(--glass-border);
+    border-radius: var(--radius); backdrop-filter: var(--blur);
+    width:220px; max-height:200px; overflow-y:auto;
+    box-shadow: var(--shadow);
+  }
+  .sel-drop-item {
+    display:block; width:100%; text-align:left; padding:6px 12px;
+    background:none; border:none; color: var(--label2); font-size:12px; cursor:pointer;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  .sel-drop-item:hover { background: rgba(255,255,255,0.06); color: var(--label); }
+
+  .card-selected {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
 
   .grid {
     flex:1; overflow-y:auto;

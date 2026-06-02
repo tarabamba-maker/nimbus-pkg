@@ -13,19 +13,26 @@
   let { ctx, onClose, onOpenDetails } = $props();
   let search = $state('');
 
-  let aid = $derived(ctx.item.asset_id);
+  // Support batch: ctx.items is set when multiple cards are selected
+  let aids = $derived(
+    ctx.items ? ctx.items.map(it => it.asset_id) : [ctx.item.asset_id]
+  );
+  let isBatch = $derived(aids.length > 1);
+
   let filtered = $derived(
     Object.keys($photoGroups).filter(g => !search || g.toLowerCase().includes(search.toLowerCase()))
   );
 
   /** @param {string} gname */
   function toggle(gname) {
-    toggleGroupMember(gname, aid);
+    for (const aid of aids) toggleGroupMember(gname, aid);
     onClose();
   }
   function create() {
     const name = search.trim() || prompt('Group name:')?.trim();
-    if (name) createGroup(name, aid);
+    if (name) {
+      for (const aid of aids) createGroup(name, aid);
+    }
     onClose();
   }
   function openDetails() {
@@ -42,14 +49,19 @@
     onkeydown={(e) => e.stopPropagation()}
     role="menu" tabindex="-1">
 
+    {#if isBatch}
+      <div class="batch-label">{aids.length} photos selected</div>
+    {/if}
     <div class="search-wrap">
       <input class="search" placeholder="Search group…" bind:value={search}
-        onclick={(e) => e.stopPropagation()} />
+        onclick={(e) => e.stopPropagation()} autofocus />
     </div>
 
     <div class="list">
       {#each filtered as gname}
-        {@const inGrp = $photoGroups[gname]?.includes(aid)}
+        {@const inGrp = isBatch
+          ? aids.some(a => $photoGroups[gname]?.includes(a))
+          : $photoGroups[gname]?.includes(aids[0])}
         <button class="btn {inGrp?'in':''}" role="menuitem" onclick={() => toggle(gname)}>
           <span class="check">{inGrp ? '✓' : ''}</span>
           {gname}
@@ -107,4 +119,5 @@
   .check { width:12px; font-size:11px; color: var(--accent); flex-shrink:0; }
   .sep { height:1px; background: var(--sep); margin:3px 0; flex-shrink:0; }
   .empty { font-size:11px; color: var(--label3); padding:6px 14px; }
+  .batch-label { font-size:10px; color: var(--accent); padding:5px 14px 0; font-weight:600; }
 </style>
