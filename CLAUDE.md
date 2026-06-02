@@ -715,7 +715,15 @@ For each new stock, follow "How to add a new stock" above.
 **Крок 1 — Inspector ПЕРЕД написанням коду**
 Відкрити Inspector → вибрати Envato → зайти на `https://author.envato.com/earnings`
 Знайти XHR запити до `api.envato.com` або `author.envato.com/api/`
-Записати: endpoint URL, headers (особливо Authorization), формат відповіді
+
+**Що шукати в Inspector (чеклист):**
+1. **Endpoint** — URL (напр. `api.envato.com/v2/market/...`)
+2. **Auth** — Bearer header? cookie? CSRF token?
+3. **Структура** — поля: item_id, total_earnings, downloads
+4. **Річна розбивка ⭐** — чи є `earnings_by_year` або окремий `/yearly` endpoint?
+   - Якщо є → перший синк = записи по роках (2021→$450 @ 2021-12-31, 2022→$780 @ 2022-12-31...)
+   - Якщо тільки total → перший синк = один запис @ MIN(sales.date)-1день
+5. **Пагінація** — offset/page параметр якщо фото 1000+
 
 **Крок 2 — написати колектор в ізоляції**
 Створити `collectors/envato.py` за патерном adobe.py/shutterstock.py:
