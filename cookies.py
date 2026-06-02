@@ -335,6 +335,8 @@ _STOCK_COOKIE_DOMAINS = {
     "Getty Images":  ["gettyimages.com", "esp.gettyimages.com",
                       "accountmanagement.gettyimages.com"],
     "Depositphotos": ["depositphotos.com"],
+    "Envato":        ["envato.com", "account.envato.com", "author.envato.com",
+                      "elements.envato.com"],
     "Microstock+":   ["microstock.plus"],
 }
 
@@ -438,6 +440,7 @@ _STOCK_LOGIN_URLS = {
     "Depositphotos": "https://depositphotos.com/account/sales-history.html",
     "Getty Images":  "https://accountmanagement.gettyimages.com/Reports/Export",
     "Microstock+":   "https://microstock.plus/myfiles",
+    "Envato":        "https://author.envato.com/reports/performance",
 }
 
 

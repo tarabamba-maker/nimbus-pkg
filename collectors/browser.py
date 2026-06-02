@@ -82,7 +82,7 @@ def _apply_stealth(ctx):
 
 # ── Login detection ───────────────────────────────────────────────────────────
 
-_LOGIN_SIGNALS = ["auth", "sign-in", "login", "signin", "ims-na1"]
+_LOGIN_SIGNALS = ["auth", "sign-in", "login", "signin", "ims-na1", "sign_in"]
 
 def _is_login_url(url_str):
     return any(x in url_str.lower() for x in _LOGIN_SIGNALS)
