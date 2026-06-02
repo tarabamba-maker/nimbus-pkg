@@ -307,24 +307,36 @@
 
   /** @param {string} name */
   async function deleteGroup(name) {
-    await fetch(API_BASE + `/api/photo-groups/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    // Optimistic: remove from local state immediately
+    groups = groups.filter(g => g.name !== name);
+    groupsList.set([...groups]);
     confirmDel = null;
     modalGroup = null;
-    await load({ force: true });
     onGroupsChange?.();
+    // Fire server in background; reload only on error
+    try {
+      const r = await fetch(API_BASE + `/api/photo-groups/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      if (!r.ok) { await load({ force: true }); onGroupsChange?.(); }
+    } catch { await load({ force: true }); onGroupsChange?.(); }
   }
 
   async function renameGroup() {
     const newName = renameVal.trim();
     if (!newName || newName === renaming) { renaming = null; return; }
-    const r = await fetch(API_BASE + '/api/photo-groups/rename', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ old_name: renaming, new_name: newName }),
-    }).then(r => r.json());
-    if (r.status === 'ok') {
-      renaming = null; renameVal = '';
-      await load({ force: true }); onGroupsChange?.();
-    }
+    const oldName = renaming;
+    // Optimistic: update name in local state immediately
+    groups = groups.map(g => g.name === oldName ? { ...g, name: newName } : g);
+    groupsList.set([...groups]);
+    renaming = null; renameVal = '';
+    onGroupsChange?.();
+    // Fire server in background; reload only on error
+    try {
+      const r = await fetch(API_BASE + '/api/photo-groups/rename', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ old_name: oldName, new_name: newName }),
+      }).then(r => r.json());
+      if (r.status !== 'ok') { await load({ force: true }); onGroupsChange?.(); }
+    } catch { await load({ force: true }); onGroupsChange?.(); }
   }
 
   /** Optimistic local merge: mutate groups array immediately, fire server in

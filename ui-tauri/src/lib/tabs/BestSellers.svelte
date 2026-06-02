@@ -72,6 +72,13 @@
   let showNewGroupInput = $state(false);
   let groupSearch = $state('');
   let showGroupDropdown = $state(false);
+  let groupDropdownPos = $state({ top: 0, left: 0 });
+  /** @param {FocusEvent|InputEvent} e */
+  function openGroupDropdown(e) {
+    const rect = /** @type {HTMLElement} */ (e.target).getBoundingClientRect();
+    groupDropdownPos = { top: rect.bottom + 4, left: rect.left };
+    showGroupDropdown = true;
+  }
 
   const filteredGroups = $derived(
     Object.keys($photoGroups).sort().filter(g =>
@@ -153,13 +160,11 @@
     if (loading || items.length >= totalCount) return;
     page++;
     await load();
-    // When ungroupedOnly is active, filtered items may be fewer than perPage —
-    // keep loading until we have enough visible items or exhaust the server data.
-    if (ungroupedOnly) {
-      const visible = items.filter(it =>
-        Object.entries($photoGroups).every(([,ids]) => !ids.includes(it.asset_id))
-      ).length;
-      if (visible < 15 && items.length < totalCount) loadMore();
+    // After load, if sentinel is still in viewport (content doesn't fill screen),
+    // keep loading — same behavior with or without ungroupedOnly filter.
+    if (items.length < totalCount && sentinel) {
+      const rect = sentinel.getBoundingClientRect();
+      if (rect.top < window.innerHeight + 800) loadMore();
     }
   }
 
@@ -285,18 +290,9 @@
           <div class="sel-search-wrap">
             <input class="sel-search" placeholder="Search group…"
               bind:value={groupSearch}
-              onfocus={() => showGroupDropdown = true}
+              onfocus={openGroupDropdown}
               onblur={() => setTimeout(() => showGroupDropdown = false, 150)}
-              oninput={() => showGroupDropdown = true} />
-            {#if showGroupDropdown && filteredGroups.length > 0}
-              <div class="sel-dropdown">
-                {#each filteredGroups.slice(0,12) as g}
-                  <button class="sel-drop-item" onmousedown={() => { addSelectedToGroup(g); groupSearch = ''; showGroupDropdown = false; }}>
-                    {g}
-                  </button>
-                {/each}
-              </div>
-            {/if}
+              oninput={openGroupDropdown} />
           </div>
         </div>
         <button class="sel-btn sel-btn-new" onclick={() => showNewGroupInput = true}>+ New group</button>
@@ -365,6 +361,19 @@
     <div class="sentinel" bind:this={sentinel}></div>
   </div>
 </div>
+
+<!-- Group search dropdown portal (outside stacking context of select-bar) -->
+{#if showGroupDropdown && filteredGroups.length > 0}
+  <div class="sel-dropdown-portal"
+    style="top:{groupDropdownPos.top}px;left:{groupDropdownPos.left}px">
+    {#each filteredGroups.slice(0, 12) as g}
+      <button class="sel-drop-item"
+        onmousedown={() => { addSelectedToGroup(g); groupSearch = ''; showGroupDropdown = false; }}>
+        {g}
+      </button>
+    {/each}
+  </div>
+{/if}
 
 <!-- Context menu (right-click → group management) -->
 {#if ctxMenu}
@@ -456,17 +465,17 @@
     border:1px solid var(--glass-border); background: var(--bg2); color: var(--label);
     outline:none;
   }
-  .sel-dropdown {
-    position:absolute; top:calc(100% + 4px); left:0; z-index:500;
+  .sel-dropdown-portal {
+    position:fixed; z-index:9000;
     background: var(--glass2); border:1px solid var(--glass-border);
-    border-radius: var(--radius); backdrop-filter: var(--blur);
+    border-radius: var(--radius); backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);
     width:220px; max-height:200px; overflow-y:auto;
     box-shadow: var(--shadow);
   }
   .sel-drop-item {
     display:block; width:100%; text-align:left; padding:6px 12px;
     background:none; border:none; color: var(--label2); font-size:12px; cursor:pointer;
-    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-family:inherit;
   }
   .sel-drop-item:hover { background: rgba(255,255,255,0.06); color: var(--label); }
 
