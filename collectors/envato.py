@@ -45,21 +45,9 @@ def _save_snapshot(snap: dict):
 def _envato_collect(pw_page) -> bool:
     """Collect Envato Elements earnings via item_performance API + snapshot-diff."""
 
-    # ── Step 1: try Safari cookie import, then navigate ──────────────────
-    # Try importing Envato cookies from Safari first (like other stocks).
-    # Silently skip on error — user may not have Envato in Safari.
-    try:
-        from cookies import _load_browser_cookies, _inject_cookies_via_playwright, _STOCK_COOKIE_DOMAINS
-        all_cookies = _load_browser_cookies()
-        if all_cookies:
-            patterns = _STOCK_COOKIE_DOMAINS.get("Envato", [])
-            filt = [c for c in all_cookies if any(p in c.get("domain", "") for p in patterns)]
-            if filt:
-                _inject_cookies_via_playwright("Envato", filt)
-                _sync_log(f"🍪 Envato: імпортовано {len(filt)} cookies з браузера")
-    except Exception:
-        pass
-
+    # ── Step 1: navigate to author dashboard ─────────────────────────────
+    # Cookie import is done separately via UI (Import Cookies button).
+    # Here we just use whatever is already in chrome_profile_Envato/.
     _sync_log("📊 Envato: loading author dashboard…")
     try:
         pw_page.goto(f"{_AUTHOR_BASE}/reports/performance",
@@ -69,8 +57,8 @@ def _envato_collect(pw_page) -> bool:
         return False
 
     if _is_login_url(pw_page.url) or "sign_in" in pw_page.url or "login" in pw_page.url:
-        _sync_log("⚠️ Envato: not logged in — відкрий Browser tab → Envato → Login")
-        return False
+        _sync_log("⚠️ Envato: не залогінений — використай Import Cookies або кнопку Login в Browser tab")
+        return "needs_login"
 
     # Extract CSRF token from page meta tag
     try:

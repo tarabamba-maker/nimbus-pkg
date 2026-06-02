@@ -85,7 +85,19 @@ def _run_collector_global(p, profile_dir, stock_name, start_url, headless, allow
     elif stock_name == "Depositphotos":
         _depositphotos_collect(pw_page)
     elif stock_name == "Envato":
-        _envato_collect(pw_page)
+        result = _envato_collect(pw_page)
+        if result == "needs_login":
+            if not allow_login:
+                _sync_log(f"[Envato] 🔒 потрібен логін — натисни кнопку «Envato» щоб увійти")
+                return browser, pw_page
+            browser.close()
+            _do_login_flow_global(p, profile_dir, start_url, stock_name, wait_cond)
+            browser = _open_browser_context(p, profile_dir, headless)
+            _apply_stealth(browser)
+            pw_page = browser.pages[0] if browser.pages else browser.new_page()
+            pw_page.goto(start_url, wait_until=wait_cond, timeout=60000)
+            time.sleep(2)
+            _envato_collect(pw_page)
     elif stock_name == "Getty Images":
         # Auto-force on empty DB: pulls every available TSV statement instead of
         # waiting for the monthly-21st gate.
