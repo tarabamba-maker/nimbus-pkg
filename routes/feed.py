@@ -24,6 +24,7 @@ _DEFAULT_STOCK_COLORS = {
     'iStock':         '#6366f1',
     'iStockphoto':    '#6366f1',
     'Depositphotos':  '#0061ff',
+    'Envato':         '#81b441',
 }
 _STOCK_COLORS_FILE = os.path.join(RECIPES_DIR, 'stock_colors.json')
 

@@ -25,6 +25,7 @@ from collectors.adobe import _adobe_collect_direct, _adobe_api_collect_global
 from collectors.shutterstock import _shutterstock_api_collect_direct, _shutterstock_api_collect_global
 from collectors.getty import _getty_collect_direct, _getty_api_collect_global
 from collectors.depositphotos import _depositphotos_collect
+from collectors.envato import _envato_collect
 from collectors.ms_plus import _ms_plus_collect_direct, _ms_plus_collect_global
 
 _BASE_DIR = os.environ.get("STOCK_DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
@@ -83,6 +84,8 @@ def _run_collector_global(p, profile_dir, stock_name, start_url, headless, allow
         _shutterstock_api_collect_global(pw_page)
     elif stock_name == "Depositphotos":
         _depositphotos_collect(pw_page)
+    elif stock_name == "Envato":
+        _envato_collect(pw_page)
     elif stock_name == "Getty Images":
         # Auto-force on empty DB: pulls every available TSV statement instead of
         # waiting for the monthly-21st gate.
@@ -297,7 +300,7 @@ def _sync_all_global():
     else:
         _sync_log(f"🚀 Sequential sync (DB has {_sales_count} rows — cold start safeguard)")
 
-    SALES_STOCKS = ["Depositphotos", "Getty Images", "Shutterstock", "Adobe Stock"]
+    SALES_STOCKS = ["Depositphotos", "Envato", "Getty Images", "Shutterstock", "Adobe Stock"]
 
     def _run_one(name):
         if _sync_stop_flag[0]:

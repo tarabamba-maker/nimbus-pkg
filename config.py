@@ -8,4 +8,5 @@ STOCK_URLS = {
     "Getty Images":  "https://esp.gettyimages.com/contribute/stats",
     "Depositphotos": "https://depositphotos.com/account/sales-history.html",
     "Microstock+":   "https://microstock.plus/myfiles",
+    "Envato":        "https://author.envato.com/reports/performance",
 }
