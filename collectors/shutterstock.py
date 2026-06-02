@@ -115,8 +115,22 @@ def _shutterstock_api_collect_direct():
         scan_days = list(reversed(scan_days))
         _sync_log(f"🔄 Shutterstock direct: повна історія 2018→сьогодні ({len(scan_days)} днів)")
     else:
-        scan_days = [(today - timedelta(days=i)) for i in range(30)]
-        _sync_log(f"⏩ Shutterstock direct: інкрементальний 30 днів")
+        # Incremental: scan from MAX(date) in DB - 1 day to today.
+        # Using DB as source of truth — works correctly after any gap (1 day or 100 days).
+        try:
+            with sqlite3.connect(DB_NAME, timeout=15) as _c:
+                _r = _c.execute(
+                    "SELECT substr(MAX(date),1,10) FROM sales WHERE stock='Shutterstock'"
+                ).fetchone()
+                _ss_max = _r[0] if _r and _r[0] else None
+            _ss_from = _date.fromisoformat(_ss_max) - timedelta(days=1) if _ss_max else today - timedelta(days=30)
+        except Exception:
+            _ss_from = today - timedelta(days=30)
+        scan_days = []
+        d = today
+        while d >= _ss_from:
+            scan_days.append(d); d -= timedelta(days=1)
+        _sync_log(f"⏩ Shutterstock direct: від {_ss_from} ({len(scan_days)} днів)")
 
     agg_cache = {}
     def _day_cats(day):

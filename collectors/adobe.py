@@ -78,9 +78,31 @@ def _adobe_collect_direct():
         except Exception as e:
             return {"error": str(e)}
 
-    # Pass 1: recent sales (pages 1..N, no date filter)
+    # Pass 1: recent sales — incremental from MAX(date) in DB - 1 day.
+    # Using DB as source of truth — works correctly after any gap.
+    # First run (empty DB): no date filter → collects all recent.
     total_saved = 0
-    page1 = _get_page(f"/en/insights/sales-earnings?limit=1000&page=1&pv={int(time.time()*1000)}")
+    try:
+        with sqlite3.connect(DB_NAME, timeout=15) as _c:
+            _r = _c.execute(
+                "SELECT substr(MAX(date),1,10) FROM sales WHERE stock='Adobe Stock'"
+            ).fetchone()
+            _adobe_max = _r[0] if _r and _r[0] else None
+    except Exception:
+        _adobe_max = None
+
+    if _adobe_max:
+        _start_d = (datetime.strptime(_adobe_max, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        _today   = datetime.now().strftime("%Y-%m-%d")
+        _p1_url  = (f"/en/insights/sales-earnings?limit=1000&page=1"
+                    f"&start_date={_start_d}&end_date={_today}"
+                    f"&time_range=day&pv={int(time.time()*1000)}")
+        _sync_log(f"📅 Adobe direct: incremental від {_start_d}")
+    else:
+        _p1_url = f"/en/insights/sales-earnings?limit=1000&page=1&pv={int(time.time()*1000)}"
+        _sync_log("📅 Adobe direct: повний recent (перший синк)")
+
+    page1 = _get_page(_p1_url)
     if "error" in page1:
         if page1.get('needs_login'):
             _sync_log("⚠️ Adobe direct: сесія expired в Safari — fallback to Playwright")
