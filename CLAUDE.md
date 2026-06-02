@@ -6,7 +6,7 @@ Desktop sales aggregator for photo stocks. Playwright logs into stock sites, col
 
 **Flet has been fully removed.** `main.py` is Flask-only (~5500 lines, modularization in progress). UI is `ui-tauri/` (SvelteKit + Tauri).
 
-**Current version: v0.9.50** (Mac + Windows, GitHub Actions CI builds both).
+**Current version: v0.9.51** (Mac + Windows, GitHub Actions CI builds both).
 **Windows port: COMPLETE** (v0.9.50 merged). Key Windows fixes:
 - UTF-8 stdout/stderr (emoji crash fix)
 - Chrome ABE v20: uses app-profile cookies via system Chrome (`channel='chrome'`)
@@ -451,6 +451,10 @@ updates → all other tabs (and PhotoPopup) immediately see the change.
 - [x] IntersectionObserver fix via $effect (was broken inside reactive blocks)
 - [x] All UI text translated to English
 - [x] Dead code removed (main.py: 9240 → 2218 lines after multiple rounds of cleanup)
+- [x] **Full modularization complete (v0.9.51):** main.py 6444 → 158 lines (−98%). All routes in `routes/` blueprints. Module map: utils.py, db.py, sync_state.py, cookies.py, image_utils.py, matching_engine.py, orchestrator.py, config.py, app_globals.py, collectors/, routes/
+- [x] **Smoke test script** `test_api.py` — 16/16 endpoints, runs against live app
+- [x] **UI:** removed redundant Refresh Stats button from topbar
+- [x] **UI:** removed stock-match dots from Downloads cards (belong in BestSellers only)
 - [x] Stale project files cleaned up
 - [x] **Removed 123RF + Dreamstime collectors entirely** (code + DB rows + UI refs)
 - [x] **Export / Import DB** with native Tauri save dialog (`@tauri-apps/plugin-dialog`+`plugin-fs`)
