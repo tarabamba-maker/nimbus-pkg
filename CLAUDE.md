@@ -746,3 +746,44 @@ python3 -c "from collectors.envato import _envato_collect; print('import OK')"
 - Якщо ламає — `git stash` або `git checkout collectors/envato.py` для відкату
 
 **Rollback**: якщо щось зламалось — `git revert HEAD` або `git checkout main -- collectors/`
+
+### Snapshot-diff алгоритм (фінальна версія, після аналізу Gemini)
+
+```python
+is_first_global_sync = not bool(prev_snapshot)  # _envato_snapshot.json порожній/відсутній
+
+# Дата для першого глобального синку: MIN(date) з sales - 1 день
+# (щоб не псувати Analytics графіки — Envato впишеться в початок кар'єри)
+if is_first_global_sync:
+    with sqlite3.connect(DB_NAME) as c:
+        r = c.execute("SELECT substr(MIN(date),1,10) FROM sales").fetchone()
+        first_date = r[0] if r and r[0] else '2020-01-01'
+    from datetime import datetime, timedelta
+    hist_date = (datetime.strptime(first_date, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
+
+for item in api_response:
+    aid = str(item['id'])
+    new_total = float(item['total_earnings'])
+    prev_total = prev_snapshot.get(aid)  # None якщо нове фото
+
+    if prev_total is None:
+        delta = new_total
+        date = hist_date if is_first_global_sync else today  # нове фото не в перший синк → today
+    else:
+        delta = new_total - prev_total
+        date = today
+
+    # ЗАВЖДИ оновлюємо snapshot (навіть refund!) — інакше наступні дельти будуть неправильні
+    new_snapshot[aid] = new_total
+
+    # В DB пишемо тільки додатну дельту
+    if delta > 0:
+        _save_record({'asset_id': aid, 'price': delta, 'date': date, 'stock': 'Envato',
+                      'thumb_url': item.get('thumbnail', '')})
+```
+
+**Ключові правила (не порушувати):**
+- `is_first_global_sync` = тільки коли snapshot порожній (не "нове фото в звичайному синку")
+- Snapshot оновлюється завжди, навіть при від'ємній дельті
+- В DB пишемо тільки `delta > 0`
+- Дата першого синку = `MIN(sales.date) - 1 день` (не 2010-01-01 — ламає Analytics)
