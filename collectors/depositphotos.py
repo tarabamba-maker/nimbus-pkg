@@ -74,15 +74,19 @@ def _depositphotos_collect(pw_page):
     try:
         with sqlite3.connect(DB_NAME, timeout=15) as _c:
             _dp_count = _c.execute("SELECT COUNT(*) FROM sales WHERE stock='Depositphotos'").fetchone()[0]
+            _last_r = _c.execute("SELECT substr(MAX(date),1,10) FROM sales WHERE stock='Depositphotos'").fetchone()
+            last_known = (_last_r[0] or '') if _last_r else ''
     except Exception:
         _dp_count = 0
+        last_known = ''
     PAGE_CAP = 500 if _dp_count == 0 else 30
     if _dp_count == 0:
         _sync_log(f"🔄 Depositphotos: БД пуста — повний історичний збір (до {PAGE_CAP} сторінок)")
 
     while not _sync_stop_flag[0]:
-        url = ("/sales.html" if page_num == 1
-               else f"/sales/page{page_num}.html?ajax=true")
+        # limit=160 returns 160 rows/page instead of default ~40 → 4x fewer requests
+        url = (f"/sales.html?limit=160&ajax=true" if page_num == 1
+               else f"/sales/page{page_num}.html?limit=160&ajax=true")
         _sync_log(f"Depositphotos: page {page_num}…")
         try:
             # 60s timeout per fetch — DataDome can hang requests indefinitely
@@ -112,15 +116,18 @@ def _depositphotos_collect(pw_page):
             break
 
         new_in_page = 0
-        # Track if the whole page is older than the newest known sale → we've
-        # already synced past this point. More robust than exact price match
-        # which can fail on Deposit's float rounding.
         page_max_date = ''
+        stop_after_page = False
         for row in rows:
             if not row["date"]:
                 continue
             if row["date"] > page_max_date:
                 page_max_date = row["date"]
+            # Row-level early stop: if this row's date is older than last known,
+            # every subsequent row is also older → no need to process further.
+            if last_known and row["date"][:10] < last_known:
+                stop_after_page = True
+                break
             if is_already_saved("Depositphotos", row["asset_id"], row["price"], row["date"]):
                 continue
             save_to_db({"stock": "Depositphotos", "asset_id": row["asset_id"],
@@ -130,24 +137,13 @@ def _depositphotos_collect(pw_page):
             new_in_page  += 1
             total_saved  += 1
 
-        # Date-based early stop: if the newest row on this page is older than
-        # the most recent Deposit sale we already have in DB, every page beyond
-        # is guaranteed already-synced. Cheap one-shot SQL lookup per page.
-        try:
-            with sqlite3.connect(DB_NAME, timeout=15) as _c:
-                _last = _c.execute(
-                    "SELECT MAX(date) FROM sales WHERE stock='Depositphotos'"
-                ).fetchone()[0]
-            last_known = (_last or '')[:10]
-        except Exception:
-            last_known = ''
-
         _sync_log(f"Depositphotos: page {page_num} → {new_in_page} new (max date {page_max_date})")
 
-        # Stop conditions (any one is enough):
-        #   1) two consecutive zero-new pages (original heuristic)
-        #   2) this page's newest date is ≤ last sync date we already have AND nothing new
-        #   3) we've scanned 30 pages — sane hard cap to never run away
+        if stop_after_page:
+            _sync_log("Depositphotos: reached older dates, stopping")
+            break
+
+        # Fallback stop conditions:
         if new_in_page == 0:
             all_known_streak += 1
             if (all_known_streak >= 2
