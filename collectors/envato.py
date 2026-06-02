@@ -45,20 +45,21 @@ def _save_snapshot(snap: dict):
 def _envato_collect(pw_page) -> bool:
     """Collect Envato Elements earnings via item_performance API + snapshot-diff."""
 
-    # ── Step 1: navigate to author dashboard ─────────────────────────────
-    # Cookie import is done separately via UI (Import Cookies button).
-    # Here we just use whatever is already in chrome_profile_Envato/.
-    _sync_log("📊 Envato: loading author dashboard…")
-    try:
-        pw_page.goto(f"{_AUTHOR_BASE}/reports/performance",
-                     wait_until="domcontentloaded", timeout=30000)
-    except Exception as ex:
-        _sync_log(f"⚠️ Envato: navigation failed: {ex}")
-        return False
-
-    if _is_login_url(pw_page.url) or "sign_in" in pw_page.url or "login" in pw_page.url:
+    # ── Step 1: wait for author dashboard to settle ───────────────────────
+    # orchestrator already navigated here; we just wait for URL to stabilize.
+    # Envato may redirect through sign_in momentarily even when logged in —
+    # wait up to 5s for the final URL to land on a non-login page.
+    _sync_log("📊 Envato: перевіряємо сесію…")
+    for _ in range(10):
+        url = pw_page.url
+        if not (_is_login_url(url) or "sign_in" in url):
+            break
+        time.sleep(0.5)
+    else:
         _sync_log("⚠️ Envato: не залогінений — використай Import Cookies або кнопку Login в Browser tab")
         return "needs_login"
+
+    _sync_log(f"✅ Envato: сесія активна ({pw_page.url[:60]}…)")
 
     # Extract CSRF token from page meta tag
     try:
