@@ -72,6 +72,48 @@ def _month_iter(start_ym: str, end_ym: str):
             m = 1; y += 1
 
 
+_YEAR_ACCENT = {2021: (38, 166, 154), 2022: (66, 133, 244), 2023: (149, 117, 205),
+                2024: (255, 167, 38), 2025: (102, 187, 106), 2026: (236, 89, 89)}
+
+
+def _card_font(sz):
+    from PIL import ImageFont
+    for p in ("/System/Library/Fonts/Helvetica.ttc",
+              "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+              "C:/Windows/Fonts/arialbd.ttf"):
+        if os.path.exists(p):
+            try:
+                return ImageFont.truetype(p, sz, index=1 if p.endswith(".ttc") else 0)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
+def _make_month_card(ym: str):
+    """Render a clean month placard for an aggregate `envato-YYYY-MM` record
+    (these have no real photo). Per-year accent colour. Saved to img_cache."""
+    from PIL import Image, ImageDraw
+    from app_globals import CACHE_DIR
+    try:
+        y, m = int(ym[:4]), int(ym[5:7])
+        acc = _YEAR_ACCENT.get(y, (120, 144, 156))
+        img = Image.new("RGB", (400, 400), (24, 28, 36))
+        d = ImageDraw.Draw(img)
+        for i in range(400):
+            t = i / 400
+            d.line([(0, i), (400, i)], fill=(int(24 + 10 * t), int(28 + 12 * t), int(36 + 16 * t)))
+        d.rectangle([0, 0, 8, 400], fill=acc)
+        d.text((28, 30), "ENVATO ELEMENTS", font=_card_font(18), fill=(150, 160, 175))
+        d.text((28, 150), calendar.month_name[m].upper(), font=_card_font(54), fill=(238, 242, 248))
+        d.text((28, 220), str(y), font=_card_font(72), fill=acc)
+        d.text((28, 340), "monthly earnings", font=_card_font(20), fill=(120, 132, 148))
+        d.rounded_rectangle([300, 34, 360, 94], radius=8, outline=acc, width=3)
+        d.line([(300, 52), (360, 52)], fill=acc, width=3)
+        img.save(os.path.join(CACHE_DIR, f"envato-{ym}.jpg"), "JPEG", quality=90)
+    except Exception as ex:
+        _app_log(f"[Envato] month card {ym} failed: {ex}")
+
+
 def _month_date(ym: str) -> str:
     """Date string for a month's records: last day of month, capped at today."""
     y, m = int(ym[:4]), int(ym[5:7])
@@ -206,6 +248,7 @@ def _envato_collect(pw_page):
                 "date":       rec_date,
                 "thumb_url":  "",
             })
+            _make_month_card(ym)   # placard instead of a grey card
             agg_saved += 1
             new_months[ym] = total
         else:

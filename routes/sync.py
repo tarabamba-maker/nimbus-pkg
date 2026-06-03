@@ -49,8 +49,10 @@ _INSPECTOR_URLS = {
 def _inspector_log_push(msg: str):
     with _inspector_lock:
         _inspector_log.append(msg)
-        if len(_inspector_log) > 200:
-            del _inspector_log[:-200]
+        # keep a long in-memory tail (disk log is unbounded). Universal inspector
+        # tracks whole login+browse sessions → don't truncate aggressively.
+        if len(_inspector_log) > 5000:
+            del _inspector_log[:-5000]
     fh = _inspector_log_file[0]
     if fh:
         try:
@@ -60,59 +62,126 @@ def _inspector_log_push(msg: str):
             pass
 
 
+_NOISE_HOSTS = ("datadoghq", "google-analytics", "googletagmanager", "doubleclick",
+                "sentry.io", "/segment", "hotjar", "newrelic", "bam.nr-data",
+                "amplitude", "mixpanel", "facebook.com/tr", "/rum", "clarity.ms",
+                "browser-intake", "/collect?", "cdn.cookielaw")
+_DATA_HINTS = ("earning", "sale", "download", "amount", "commission", "revenue",
+               "payout", "statement", "thumbnail", "thumb", "item_id", "asset",
+               "media", "price", "balance", "total_count")
+
+
+def _looks_like_data(body: str) -> bool:
+    s = body.lstrip()
+    if not s or s[0] not in ("{", "["):
+        return False
+    return any(h in s[:3000].lower() for h in _DATA_HINTS)
+
+
+def _build_curl(req) -> str:
+    parts = [f"curl '{req.url}'", f"-X {req.method}"]
+    for k, v in req.headers.items():
+        if k.lower() in ("content-length", "host"):
+            continue
+        parts.append("-H '%s: %s'" % (k, v.replace("'", "'\\''")))
+    try:
+        pd = req.post_data
+    except Exception:
+        pd = None
+    if pd:
+        parts.append("--data-raw '%s'" % pd.replace("'", "'\\''"))
+    return " ".join(parts)
+
+
+def _enable_password_manager(profile_dir):
+    """Ensure Chromium's password manager is on so logins can be saved + autofilled
+    next time (easy re-login for the universal inspector)."""
+    prefs_path = os.path.join(profile_dir, "Default", "Preferences")
+    try:
+        os.makedirs(os.path.dirname(prefs_path), exist_ok=True)
+        prefs = {}
+        if os.path.exists(prefs_path):
+            with open(prefs_path, encoding="utf-8") as f:
+                prefs = json.load(f)
+        prefs["credentials_enable_service"] = True
+        prefs.setdefault("profile", {})["password_manager_enabled"] = True
+        with open(prefs_path, "w", encoding="utf-8") as f:
+            json.dump(prefs, f)
+    except Exception:
+        pass
+
+
 def _inspector_thread(stock_name: str, start_url: str):
-    """Відкриває браузер, перехоплює мережу, пише в _inspector_log і на диск."""
-    import time as _time
+    """Headed browser + network capture for reverse-engineering a stock API.
+
+    Universal mode (stock_name == 'Universal'): a persistent `inspector_profile`
+    (cookies + saved passwords persist) opens a blank page — the user types ANY
+    URL in Chrome's address bar, logs in, and browses. Everything is captured:
+      • XHR/fetch request body + response body
+      • ⭐ highlight for responses that look like sales/earnings JSON
+      • a copy-paste cURL line per request (replay the endpoint outside the browser)
+      • a full HAR archive on disk
+      • a cookie dump on close
+    Tracking/analytics noise (datadog, GA, sentry…) is filtered out.
+    """
+    import datetime as _dt
     from playwright.sync_api import sync_playwright as _spw
     _inspector_state["running"] = True
     _inspector_state["stock"]   = stock_name
     _inspector_log.clear()
 
-    safe_name   = stock_name.replace(" ", "_")
-    profile_dir = os.path.abspath(f"chrome_profile_{safe_name}")
-    log_path    = os.path.join(INSPECTOR_LOG_DIR, f"{safe_name}.log")
+    safe_name = stock_name.replace(" ", "_")
+    if stock_name == "Universal":
+        profile_dir = os.path.join(_BASE_DIR, "inspector_profile")
+        _enable_password_manager(profile_dir)
+    else:
+        profile_dir = os.path.join(_BASE_DIR, f"chrome_profile_{safe_name}")
+    ts       = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(INSPECTOR_LOG_DIR, f"{safe_name}.log")
+    har_path = os.path.join(INSPECTOR_LOG_DIR, f"{safe_name}_{ts}.har")
 
     fh = open(log_path, "a", encoding="utf-8")
     _inspector_log_file[0] = fh
-    import datetime as _dt
     fh.write(f"\n{'='*60}\n{_dt.datetime.now().isoformat()} — {stock_name}\n{'='*60}\n\n")
     fh.flush()
-
-    _inspector_log_push(f"🔍 Opening {stock_name} — log: inspector_logs/{safe_name}.log")
+    _inspector_log_push(f"🔍 {stock_name} — log: inspector_logs/{safe_name}.log | HAR: {os.path.basename(har_path)}")
 
     def _on_response(resp):
         try:
-            if resp.request.resource_type not in ("xhr", "fetch"):
+            req = resp.request
+            if req.resource_type not in ("xhr", "fetch"):
                 return
-            url    = resp.url
-            status = resp.status
-            req    = resp.request
+            url = resp.url
+            if any(n in url for n in _NOISE_HOSTS):
+                return
             try:
-                body = resp.text().strip()
+                body = resp.text()
             except Exception:
                 body = "<binary or unreadable>"
+            star    = "⭐ " if _looks_like_data(body) else ""
             preview = body[:30000] + ("…[truncated]" if len(body) > 30000 else "")
-            hdrs = dict(req.headers)
-            keep = ["authorization", "cookie", "x-api-key", "x-auth-token",
-                    "x-requested-with", "x-end-app-name", "content-type", "accept"]
-            hdrs_filtered = {k: v for k, v in hdrs.items() if k.lower() in keep}
-            lines = [
-                f"━━━ {req.method} {status} ━━━",
-                f"URL: {url}",
-            ]
-            if hdrs_filtered:
-                lines.append("HEADERS: " + json.dumps(hdrs_filtered, ensure_ascii=False))
-            lines.append("BODY: " + preview)
+            try:
+                post = req.post_data
+            except Exception:
+                post = None
+            lines = [f"━━━ {star}{req.method} {resp.status} ━━━", f"URL: {url}"]
+            if post:
+                lines.append("REQUEST BODY: " + post[:5000])
+            lines.append("RESPONSE: " + preview)
+            lines.append("cURL: " + _build_curl(req))
             _inspector_log_push("\n".join(lines))
         except Exception as e:
             _inspector_log_push(f"[response hook error] {e}")
 
+    browser = None
     try:
         with _spw() as _p:
             browser = _p.chromium.launch_persistent_context(
                 user_data_dir=profile_dir,
                 headless=False,
                 no_viewport=True,
+                record_har_path=har_path,
+                record_har_content="embed",
                 user_agent=(
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -130,36 +199,45 @@ def _inspector_thread(stock_name: str, start_url: str):
 
             def _attach_page(page):
                 page.on("response", _on_response)
-
             for p in browser.pages:
                 _attach_page(p)
+            browser.on("page", _attach_page)
             if not browser.pages:
                 pg = browser.new_page()
                 try: pg.goto(start_url, wait_until="domcontentloaded", timeout=20000)
                 except Exception: pass
+            elif start_url and start_url != "about:blank":
+                try: browser.pages[0].goto(start_url, wait_until="domcontentloaded", timeout=20000)
+                except Exception: pass
 
-            browser.on("page", _attach_page)
-
-            _inspector_log_push("✅ Browser open — log in and navigate to the earnings/sales page")
+            _inspector_log_push("✅ Browser open — type any URL in the address bar, log in, browse. ⭐ = likely sales/earnings JSON.")
             while _inspector_state["running"]:
                 try:
                     pages = browser.pages
                     if not pages:
-                        pg = browser.new_page()
-                        try: pg.goto(start_url, wait_until="domcontentloaded", timeout=20000)
-                        except Exception: pass
+                        browser.new_page()
                     else:
                         pages[0].wait_for_timeout(500)
                 except Exception:
                     break
-            try: browser.close()
+
+            # dump cookies (for collector dev) before closing
+            try:
+                cookies = browser.cookies()
+                cpath = os.path.join(INSPECTOR_LOG_DIR, f"{safe_name}_cookies.json")
+                with open(cpath, "w", encoding="utf-8") as cf:
+                    json.dump(cookies, cf, ensure_ascii=False, indent=1)
+                _inspector_log_push(f"🍪 {len(cookies)} cookies → inspector_logs/{safe_name}_cookies.json")
+            except Exception:
+                pass
+            try: browser.close()   # flushes the HAR
             except Exception: pass
     except Exception as ex:
         _inspector_log_push(f"🛑 Inspector error: {ex}")
     finally:
         _inspector_state["running"] = False
         _inspector_browser_ref[0]   = None
-        _inspector_log_push("🔴 Inspector closed")
+        _inspector_log_push(f"🔴 Inspector closed — HAR: inspector_logs/{os.path.basename(har_path)}")
         fh = _inspector_log_file[0]
         _inspector_log_file[0] = None
         if fh:
@@ -322,10 +400,13 @@ def api_inspector_start():
     if _inspector_state["running"]:
         return jsonify({"ok": False, "msg": "already running"})
     data  = request.get_json(force=True, silent=True) or {}
-    stock = data.get("stock", "Depositphotos")
-    url   = (_INSPECTOR_URLS.get(stock)
+    stock = data.get("stock") or "Universal"
+    # Universal: blank page, user types the URL in Chrome. Per-stock deep-links
+    # (legacy) still work if a known stock name is passed.
+    url   = (data.get("url")
+             or _INSPECTOR_URLS.get(stock)
              or STOCK_URLS.get(stock)
-             or "https://depositphotos.com/account/sales-history.html")
+             or "about:blank")
     threading.Thread(target=_inspector_thread, args=(stock, url), daemon=True).start()
     return jsonify({"ok": True})
 

@@ -7,8 +7,8 @@ Moved here from main.py (logic unchanged — only location changed):
 
 import sqlite3
 
-from db import is_already_saved, save_to_db, DB_NAME
-from sync_state import _sync_log, _sync_stop_flag
+from db import is_already_saved, DB_NAME
+from sync_state import _sync_log, _sync_stop_flag, _save_record
 from collectors.browser import _is_login_url
 
 
@@ -130,9 +130,11 @@ def _depositphotos_collect(pw_page):
                 break
             if is_already_saved("Depositphotos", row["asset_id"], row["price"], row["date"]):
                 continue
-            save_to_db({"stock": "Depositphotos", "asset_id": row["asset_id"],
-                        "price": row["price"], "date": row["date"],
-                        "title": row["title"], "thumb_url": row["thumb"]})
+            # _save_record (not save_to_db) so the new sale is appended to
+            # _session_new_keys → client paints the blue "new" highlight.
+            _save_record({"stock": "Depositphotos", "asset_id": row["asset_id"],
+                          "price": row["price"], "date": row["date"],
+                          "photo_name": row["title"], "thumb_url": row["thumb"]})
             load_img_async(row["asset_id"], row["thumb"], None, False, stock="Depositphotos")
             new_in_page  += 1
             total_saved  += 1

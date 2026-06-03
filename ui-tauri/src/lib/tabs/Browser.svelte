@@ -14,13 +14,11 @@
   let progress   = $derived($syncProgress);
   let headless   = $state(true);
 
-  // Inspector state
+  // Inspector state — universal: one blank inspector, user types any URL
   let inspectorRunning = $state(false);
-  let inspectorStock   = $state('Depositphotos');
+  let inspectorUrl     = $state('');
   let inspectorLogs    = $state(/** @type {string[]} */ ([]));
   let inspectorEs      = $state(/** @type {EventSource|null} */ (null));
-
-  const INSPECTOR_STOCKS = ['Adobe Stock', 'Shutterstock', 'Getty Images', 'Depositphotos', 'Envato', 'iStock', 'Pond5'];
 
   const STOCKS = ['Adobe Stock', 'Shutterstock', 'Getty Images', 'Depositphotos', 'Envato'];
   const STOCK_COLORS = $derived($stockColors);
@@ -72,7 +70,7 @@
     inspectorRunning = true;
     const r = await fetch(API_BASE + '/api/inspector/start', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ stock: inspectorStock }),
+      body: JSON.stringify({ stock: 'Universal', url: inspectorUrl.trim() }),
     }).then(r => r.json()).catch(() => ({ ok: false }));
     if (r.ok === false) { inspectorLogs = [r.msg || 'Failed to start']; inspectorRunning = false; return; }
     const source = new EventSource(API_BASE + '/api/inspector/stream');
@@ -80,7 +78,7 @@
     source.onmessage = (e) => {
       const d = JSON.parse(e.data);
       if (d.done) { source.close(); inspectorEs = null; inspectorRunning = false; }
-      else { inspectorLogs = [...inspectorLogs.slice(-299), d.msg]; }
+      else { inspectorLogs = [...inspectorLogs.slice(-2999), d.msg]; }
     };
     source.onerror = () => { source.close(); inspectorEs = null; inspectorRunning = false; };
   }
@@ -163,13 +161,11 @@
     <div class="inspector-header">
       <Search size={13} strokeWidth={1.8} />
       <span class="inspector-title">Network Inspector</span>
-      <span class="inspector-sub dim">для підключення нових стоків</span>
+      <span class="inspector-sub dim">універсальний — введи будь-який URL</span>
       <div class="inspector-controls">
-        <select class="inspector-select" bind:value={inspectorStock} disabled={inspectorRunning}>
-          {#each INSPECTOR_STOCKS as s}
-            <option value={s}>{s}</option>
-          {/each}
-        </select>
+        <input class="inspector-url" type="text" bind:value={inspectorUrl}
+               disabled={inspectorRunning}
+               placeholder="URL (необов'язково — або введи в адресному рядку браузера)" />
         {#if inspectorRunning}
           <button class="action-pill" onclick={stopInspector}>
             <X size={12} strokeWidth={2} /> Stop
@@ -186,7 +182,7 @@
         <pre class="inspector-entry {i === inspectorLogs.length-1 ? 'last' : ''}">{entry}</pre>
       {/each}
       {#if inspectorLogs.length === 0}
-        <div class="dim" style="font-size:11px">Відкрий браузер → перейди на сторінку з продажами → всі API-запити з'являться тут</div>
+        <div class="dim" style="font-size:11px">Відкрий браузер → введи адресу й залогінься → ⭐ позначає схожі на sales/earnings JSON. Cookies + HAR зберігаються в inspector_logs/</div>
       {/if}
     </div>
   </div>
@@ -291,6 +287,13 @@
     padding: 4px 10px; font-size: 12px; font-weight: 600; font-family: inherit;
     cursor: pointer; outline: none;
   }
+  .inspector-url {
+    background: var(--glass2); border: 1px solid rgba(10,132,255,0.35);
+    color: var(--label); border-radius: var(--radius-pill);
+    padding: 4px 12px; font-size: 12px; font-family: inherit;
+    outline: none; min-width: 320px;
+  }
+  .inspector-url::placeholder { color: var(--dim); }
   .inspector-log {
     flex: 1; overflow-y: auto; font-family: monospace; font-size: 10px;
     max-height: 260px;
