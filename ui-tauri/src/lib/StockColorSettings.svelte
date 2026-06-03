@@ -265,10 +265,10 @@
     {#if dedupStatus}
       <div class="import-status" class:ok={dedupStatus.startsWith('✓')}>{dedupStatus}</div>
     {/if}
-    <!-- Cookie import from native Chrome (bypasses DataDome) -->
+    <!-- Cookie import from native browser (Safari on macOS, Chrome on Windows) — bypasses DataDome -->
     <div class="db-row">
       <button class="db-btn" onclick={doImportChromeCookies} disabled={importingCookies}>
-        <Download size={13} strokeWidth={2} /> {importingCookies ? 'Importing…' : 'Import cookies from Chrome'}
+        <Download size={13} strokeWidth={2} /> {importingCookies ? 'Importing…' : 'Import Cookies'}
       </button>
     </div>
     {#if cookieStatus}

@@ -85,7 +85,13 @@ def _apply_stealth(ctx):
 _LOGIN_SIGNALS = ["auth", "sign-in", "login", "signin", "ims-na1", "sign_in"]
 
 def _is_login_url(url_str):
-    return any(x in url_str.lower() for x in _LOGIN_SIGNALS)
+    u = url_str.lower()
+    # "author.envato.com" CONTAINS "auth" but is NOT a login page. Without this
+    # strip, _is_login_url() returns True for every Envato author URL → the
+    # collector thinks the (already valid) session expired, pops a login window,
+    # then bails with "not logged in". Drop the "author." subdomain before matching.
+    u = u.replace("author.", "")
+    return any(x in u for x in _LOGIN_SIGNALS)
 
 
 # ── Browser context ───────────────────────────────────────────────────────────

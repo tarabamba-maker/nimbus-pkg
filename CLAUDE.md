@@ -198,8 +198,12 @@ Tauri auto-starts `main.py` on launch and kills it on exit:
   - Date: "05-Mar-2026" → "2026-03-05"
 - Session dedup: `_processed_dates.json` → key `"Getty/iStock"` → list of `"YYYY-MM"`
 
-### ⏳ Depositphotos / 123RF / Pond5 / Envato
+### ✅ Envato Elements
+- **DONE.** Earnings (monthly aggregate + per-item), clean portfolio thumbnails, pHash grouping. See "✅ Envato — DONE" section below.
+
+### ⏳ Pond5 / 123RF
 - Chrome profiles already created, need: inspect real page + write dedicated collector
+- (Depositphotos ✅ done, Envato ✅ done)
 
 ## General API collector pattern (Adobe / Shutterstock / Getty)
 
@@ -696,14 +700,32 @@ For a permanent URL: register on dash.cloudflare.com (free), bind a domain.
 
 #### New stocks (priority order)
 - [x] **Depositphotos** — HTML scraping (no JSON API found). Optimized: limit=160/page, row-level date stop.
-- [ ] **Envato** — NEXT SESSION PRIORITY. Details below.
+- [x] **Envato** — DONE. Earnings (monthly aggregate + per-item), CLEAN portfolio thumbnails, pHash grouping. See "✅ Envato — DONE" below.
 - [ ] **Pond5** — after Envato
 
 For each new stock, follow "How to add a new stock" above.
 
 ---
 
-## ⚠️ Envato — наступна сесія (складно, раніше ламало)
+## ✅ Envato — DONE (final architecture, 2026-06-03)
+
+**Earnings** (`collectors/envato.py`) — two report APIs on `author.envato.com`, split at the daily boundary:
+- `earnings/detail?view=monthly&start_date=…&end_date=…` → MONTHLY AGGREGATE totals, from `monthly_first_record_date` (2021-06). No per-item. → synthetic `envato-YYYY-MM` records (one/month, 2021-06 … boundary).
+- `performance/item_performance?shopfront=Elements&start_date=…&end_date=…&page=N` → PER-ITEM, only from `daily_first_record_date` (~2025-05). Boundary read live from the detail response. → per-item records dated to their month.
+- Both scope `total_earnings` by date range. State: `recipes/_envato_months.json` `{YYYY-MM: total}`; a month re-collects only when its total changed (settling-delay aware). Grand total ≈ $20,334. Auth: cookie session in `chrome_profile_Envato/`, CSRF from `<meta name="csrf-token">`.
+- **Login bug (fixed):** `_is_login_url` matched substring `"auth"` inside `"author.envato.com"` → false "needs_login" + popped a window every sync. Fix: strip `"author."` before matching (collectors/browser.py).
+
+**Clean thumbnails** — `portfolio.envato.com/items/search?status=distributable&page=N&per_page=100` → `{uuid, thumbnail_url, created_at}`. **`uuid == per-item asset_id`** (100% coverage of sold photos), `thumbnail_url` is WATERMARK-FREE → map by ID directly. `load_img()` → `ImageOps.fit→400×400` center-square (same as MS+) so `asset_meta` dHash matches MS+. Collector pages portfolio (newest-first, early-stop), caches map in `recipes/_envato_portfolio.json`. One-time backfill of 8443 thumbs: `envato_clean_thumbs.py`.
+
+**Grouping** — clean thumbs → clean `asset_meta` dHash → existing `_ms_visual_matches` (rebuild Pass F) auto-groups into MS+ groups by pHash. ~88% (7421/8443), hamming ~0, verified. Hash-named filenames irrelevant (match by image). No Gemini/overrides.
+
+**Historical per-photo attribution — intentionally NOT done.** Distributing the $17k aggregate by per-item weight = `weight × 6.15` for every photo → Best Sellers order unchanged, no new signal, +130-256k synthetic rows. Aggregates kept.
+
+**Abandoned (don't revive):** (1) `elements.envato.com/item-uuid-redirect` og:image — watermarked+cropped, broke pHash. (2) GDrive "Family stock" filename matching + Gemini disambiguation — 41% of filenames are hash-names (`<24hex>_withmeta.jpg`), watermark+crop broke pHash (median 32). Superseded by the portfolio clean-thumb API. `_gemini_key.json` kept only for optional cleanup of the ~12% ungrouped.
+
+---
+
+## ⚠️ Envato — historical research notes (pre-portfolio; kept for reference)
 
 ### Що відомо
 - Профіль: `chrome_profile_Envato/` (вже створений)
