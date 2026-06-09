@@ -75,6 +75,53 @@ def _mp_scan(row_indices):
     return out
 
 
+# ── Multiprocessing MS+ visual matching (Pass F) ──────────────────────────────
+# Each unmatched sale independently finds its best MS+ group — no interaction
+# between sales — so it's embarrassingly parallel. Workers scan a slice of sales
+# against the shared ms_resolved table and return (idx, aid, gname) for matches;
+# the parent applies them in idx (original-sales) order with an aid-dedup guard,
+# giving a result identical to the single-core loop.
+_MSVW: dict = {}
+
+
+def _msv_init(ms_resolved, strict_hamming, loose_hamming, loose_rgb_max):
+    _MSVW.update(ms=ms_resolved, sh=strict_hamming, lh=loose_hamming, lrgb=loose_rgb_max)
+
+
+def _msv_scan(chunk):
+    ms = _MSVW['ms']; sh = _MSVW['sh']; lh = _MSVW['lh']; lrgb = _MSVW['lrgb']
+    out = []
+    for idx, aid, ha_int, ara, ra, ga, ba, is_new_sale in chunk:
+        best = None
+        for gn, hb, hb_int, arb, rb, gb, bb, is_new_ms in ms:
+            # Incremental: skip pairs where BOTH sides are old (already evaluated).
+            if not is_new_sale and not is_new_ms:
+                continue
+            if ara and arb and abs(ara - arb) > 0.15:
+                continue
+            d = bin(ha_int ^ hb_int).count('1')
+            if d > lh:
+                continue
+            if (isinstance(ra, int) and isinstance(rb, int) and isinstance(ga, int)
+                    and isinstance(gb, int) and isinstance(ba, int) and isinstance(bb, int)):
+                rgb_dist = abs(ra - rb) + abs(ga - gb) + abs(ba - bb)
+            else:
+                rgb_dist = None
+            if d <= sh:
+                if rgb_dist is not None and rgb_dist > 30:
+                    continue
+            else:
+                if rgb_dist is None or rgb_dist > lrgb:
+                    continue
+            if best is None or d < best[0]:
+                best = (d, gn)
+                if d == 0:
+                    break
+        if best:
+            out.append((idx, aid, best[1]))
+    return out
+
+
 
 def _hash_based_matches(existing_matches, threshold=4, incremental_from_rowid=None):
     """
@@ -353,6 +400,46 @@ def _ms_visual_matches(aid_to_group, strict_hamming=4, loose_hamming=8, loose_rg
         ms_resolved.append((gn, h, int(h, 16), ar, r, g, b, is_new_ms))
 
     additions = {}
+
+    # ── Multi-core path: each unmatched sale is independent → fan across cores. ──
+    # Workers return (idx, aid, gname); the parent applies them in idx (original
+    # sales) order with the same aid-dedup guard → bit-identical to single-core.
+    ncpu = os.cpu_count() or 1
+    if ncpu > 1 and len(sales_rows) * max(1, len(ms_resolved)) >= 5_000_000:
+        try:
+            import multiprocessing as _mp
+            work = []
+            for stock, aid, ha, ara, ra, ga, ba in sales_rows:
+                aid = str(aid)
+                if aid in aid_to_group:
+                    continue
+                try:
+                    ha_int = int(ha, 16)
+                except Exception:
+                    continue
+                is_new_sale = (new_sale_aids is None) or (aid in new_sale_aids)
+                work.append((len(work), aid, ha_int, ara, ra, ga, ba, is_new_sale))
+            if work:
+                nproc = min(ncpu, 8)
+                nch = max(nproc, min(len(work), nproc * 4))
+                chunks = [work[k::nch] for k in range(nch)]
+                chunks = [c for c in chunks if c]
+                _sync_log(f"⚙️ MS+ visual matching: {nproc} ядер, {len(work)}×{len(ms_resolved)}…")
+                with _mp.get_context('spawn').Pool(
+                        nproc, initializer=_msv_init,
+                        initargs=(ms_resolved, strict_hamming, loose_hamming, loose_rgb_max)) as pool:
+                    results = pool.map(_msv_scan, chunks)
+                merged = [t for r in results for t in r]
+                merged.sort()                          # by idx → original sales order
+                for _idx, aid, gn in merged:
+                    if aid in aid_to_group:             # first (lowest idx) wins, like single-core
+                        continue
+                    additions.setdefault(gn, []).append(aid)
+                    aid_to_group[aid] = gn
+            return additions
+        except Exception as ex:
+            _sync_log(f"⚠️ MS+ visual multi-core failed ({ex}) — single-core fallback")
+
     for stock, aid, ha, ara, ra, ga, ba in sales_rows:
         aid = str(aid)
         if aid in aid_to_group:
