@@ -95,18 +95,32 @@ def _capture_pw_cookies(context):
 def _wait_close_capturing(context, timeout_ms=600000):
     """Wait for the login window to close, snapshotting cookies to the cache every
     few seconds so the post-login session is captured even though we never know
-    exactly when the user finishes. Replaces a bare wait_for_event('close')."""
+    exactly when the user finishes.
+
+    ⚠️ The window must stay open until the USER closes it (they said so). The ONLY
+    exit conditions are: (1) the context/window is actually gone — `context.cookies()`
+    raises — or (2) the 10-min safety timeout. DO NOT exit just because no cookies
+    were captured yet: on a fresh login the profile has zero cookies until the user
+    logs in, and the old `if n == 0: break` slammed the window shut immediately."""
     deadline = time.time() + timeout_ms / 1000.0
     while time.time() < deadline:
-        n = _capture_pw_cookies(context)
-        if n == 0:        # context closed (cookies() threw) → done
-            break
+        try:
+            cks = context.cookies()        # raises once the window is closed
+        except Exception:
+            break                           # genuinely closed by the user → done
+        if cks:
+            _save_pw_cookie_cache(cks)
         try:
             context.wait_for_event("close", timeout=2500)
-            break          # closed within the slice
+            break                           # close event fired within the slice
         except Exception:
-            continue        # timeout slice elapsed → loop & re-snapshot
-    _capture_pw_cookies(context)   # best-effort final snapshot
+            continue                        # 2.5s slice elapsed, still open → loop
+    try:
+        cks = context.cookies()
+        if cks:
+            _save_pw_cookie_cache(cks)      # best-effort final snapshot
+    except Exception:
+        pass
 
 from utils import _dpapi_unprotect
 from collectors.browser import _open_browser_context, _apply_stealth
