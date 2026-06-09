@@ -358,8 +358,12 @@ def _adobe_collect_missions(_get_page):
             for t in txns:
                 amount = float(t.get("amount", 0) or 0)
                 if amount <= 0: continue
-                creation = str(t.get("creation", ""))[:19]   # "YYYY-MM-DD HH:MM:SS"
-                if not creation: continue
+                # creation = "2026-04-20 13:10:19.328824" → ISO with 'T' so _save_record
+                # parses it (%Y-%m-%dT%H:%M:%S). The space form matches NONE of
+                # _save_record's formats → it silently defaulted to datetime.now()
+                # and every payout landed on TODAY (the bug). Keep the real date.
+                creation = str(t.get("creation", ""))[:19].replace(" ", "T")
+                if len(creation) < 10: continue
                 if is_already_saved("Adobe Stock", MISSIONS_ASSET_ID, amount, creation):
                     continue
                 _save_record({
