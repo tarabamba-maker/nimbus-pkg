@@ -33,6 +33,48 @@ from sync_state import _sync_log, _sync_stop_flag, _sync_state
 from image_utils import load_ms_library
 
 
+# ── Multiprocessing pHash candidate search ────────────────────────────────────
+# The candidate SEARCH (XOR+popcount + stock/aspect/RGB masks per row) is the only
+# CPU-heavy part of rebuild-matches and is single-core under the GIL. We fan it out
+# across all cores with multiprocessing: each worker scans a slice of rows and
+# returns the (i, j) candidate pairs. The order-dependent union-find _merge stays
+# SEQUENTIAL in the parent over the pairs sorted by (i, j) — exactly the order the
+# single-process loop produced — so the verdict + new_pairs count are IDENTICAL.
+# Read-only arrays are shared via a per-worker initializer (tiny: ~0.3 MB each).
+_MPW: dict = {}
+
+
+def _mp_init(H, AR, R, G, B, has_rgb, S, POP, threshold, full):
+    _MPW.update(H=H, AR=AR, R=R, G=G, B=B, has_rgb=has_rgb, S=S, POP=POP,
+                threshold=threshold, full=full)
+
+
+def _mp_scan(row_indices):
+    """Worker: return [(i, j), …] candidate pairs for the given rows. Same mask
+    logic as the in-process vectorised loop."""
+    import numpy as np
+    H = _MPW['H']; AR = _MPW['AR']; R = _MPW['R']; G = _MPW['G']; B = _MPW['B']
+    has_rgb = _MPW['has_rgb']; S = _MPW['S']; POP = _MPW['POP']
+    threshold = _MPW['threshold']; full = _MPW['full']
+    def popcount(u):
+        return POP[u.view(np.uint8).reshape(-1, 8)].sum(axis=1)
+    out = []
+    for i in row_indices:
+        cand = popcount(H ^ H[i]) <= threshold
+        cand[i] = False
+        cand &= (S != S[i])
+        if AR[i] >= 0:
+            cand &= ((AR < 0) | (np.abs(AR - AR[i]) <= 0.05))
+        if has_rgb[i]:
+            l1 = np.abs(R - R[i]) + np.abs(G - G[i]) + np.abs(B - B[i])
+            cand &= (~has_rgb | (l1 <= 45))
+        if full:
+            cand[:i + 1] = False
+        for j in np.nonzero(cand)[0]:
+            out.append((i, int(j)))
+    return out
+
+
 
 def _hash_based_matches(existing_matches, threshold=4, incremental_from_rowid=None):
     """
@@ -133,7 +175,34 @@ def _hash_based_matches(existing_matches, threshold=4, incremental_from_rowid=No
             return _POP[u64arr.view(np.uint8).reshape(-1, 8)].sum(axis=1)
 
         full = new_aids is None
-        rows_to_scan = range(n) if full else [idxmap[a] for a in aids if a in new_aids]
+        rows_to_scan = list(range(n)) if full else [idxmap[a] for a in aids if a in new_aids]
+
+        # ── Multi-core path: fan the candidate search across all CPU cores. ──
+        # Only when the work is big enough to beat process-spawn overhead. The
+        # union-find merge below stays sequential over (i, j)-sorted pairs → the
+        # result is bit-identical to the single-process loop, just faster.
+        ncpu = os.cpu_count() or 1
+        if ncpu > 1 and len(rows_to_scan) * n >= 5_000_000:
+            try:
+                import multiprocessing as _mp
+                nproc = min(ncpu, 8)
+                # Strided chunks balance load (rows with many candidates get spread
+                # across workers). Final sort makes chunk order irrelevant.
+                nch = max(nproc, min(len(rows_to_scan), nproc * 4))
+                chunks = [rows_to_scan[k::nch] for k in range(nch)]
+                chunks = [c for c in chunks if c]
+                _sync_log(f"⚙️ pHash matching: {nproc} ядер, {len(rows_to_scan)} рядків…")
+                ctx = _mp.get_context('spawn')
+                with ctx.Pool(nproc, initializer=_mp_init,
+                              initargs=(H, AR, R, G, B, has_rgb, S, _POP, threshold, full)) as pool:
+                    results = pool.map(_mp_scan, chunks)
+                all_pairs = [p for r in results for p in r]
+                all_pairs.sort()                      # (i, j) asc = single-proc order
+                for i, j in all_pairs:
+                    _merge(aids[i], aids[j])
+                return existing_matches, new_pairs, max_rowid
+            except Exception as ex:
+                _sync_log(f"⚠️ pHash multi-core failed ({ex}) — single-core fallback")
 
         for i in rows_to_scan:
             cand = _popcount(H ^ H[i]) <= threshold       # hamming ≤ threshold
