@@ -1,38 +1,11 @@
 import SwiftUI
 
-/// Pills where the selected highlight slides between options (matchedGeometry),
-/// matching the tab-bar feel. Used for Downloads/BestSellers stock filters.
-struct SlidingPills: View {
-    let options: [String]
-    let selected: String
-    let onSelect: (String) -> Void
-    @Namespace private var ns
-
-    var body: some View {
-        HStack(spacing: 4) {
-            ForEach(options, id: \.self) { opt in
-                Text(opt)
-                    .font(.system(size: 12, weight: .semibold))
-                    .padding(.horizontal, 12).padding(.vertical, 5)
-                    .foregroundStyle(selected == opt ? .white : .secondary)
-                    .background {
-                        if selected == opt {
-                            Capsule().fill(Theme.accent.gradient)
-                                .matchedGeometryEffect(id: "pillsel", in: ns)
-                        }
-                    }
-                    .contentShape(Capsule())
-                    .onTapGesture { withAnimation(.easeOut(duration: 0.16)) { onSelect(opt) } }
-            }
-        }
-    }
-}
-
 /// One continuous segmented bar across the bottom edge of a card image:
 /// every stock is a segment whose width is proportional to its share of the
 /// card's total earnings (red Adobe, orange SS, green iStock, …).
 struct WeightBars: View {
     let byStock: [String: SaleStockStat]?
+    @Environment(AppModel.self) private var model
 
     private var segs: [(stock: String, frac: Double)] {
         guard let bs = byStock else { return [] }
@@ -48,7 +21,7 @@ struct WeightBars: View {
             HStack(spacing: 0) {
                 ForEach(segs, id: \.stock) { s in
                     Rectangle()
-                        .fill(Theme.color(for: s.stock))
+                        .fill(model.color(for: s.stock))
                         .frame(width: geo.size.width * s.frac)
                 }
             }
@@ -60,31 +33,41 @@ struct WeightBars: View {
     }
 }
 
-/// Close button (no blue focus ring on present).
-struct CloseButton: View {
-    let action: () -> Void
-    var body: some View {
-        Button(action: action) { Image(systemName: "xmark").font(.system(size: 12, weight: .bold)) }
-            .buttonStyle(.plain)
-            .padding(8)
-            .glassPill()
-            .focusEffectDisabled()
-    }
-}
-
 /// Real Liquid Glass container for popups/modals (same material as panels).
 struct PopupChrome: ViewModifier {
     var width: CGFloat
     var height: CGFloat
+    @Environment(AppModel.self) private var model
     func body(content: Content) -> some View {
+        let s = model.surfaces
         content
             .frame(width: width, height: height)
-            .glassCard(22)
+            .surfaceMat(s.mat(.popup, isDark: model.isDark),
+                        interactive: s.interactive(.popup),
+                        radius: s.popupRadius)
     }
 }
 extension View {
     func popupChrome(width: CGFloat, height: CGFloat) -> some View {
         modifier(PopupChrome(width: width, height: height))
+    }
+    func settingsChrome(width: CGFloat, height: CGFloat) -> some View {
+        modifier(SettingsChrome(width: width, height: height))
+    }
+}
+
+/// Liquid Glass container for the Settings window (own material + radius slot).
+struct SettingsChrome: ViewModifier {
+    var width: CGFloat
+    var height: CGFloat
+    @Environment(AppModel.self) private var model
+    func body(content: Content) -> some View {
+        let s = model.surfaces
+        content
+            .frame(width: width, height: height)
+            .surfaceMat(s.mat(.settingsPopup, isDark: model.isDark),
+                        interactive: s.interactive(.settingsPopup),
+                        radius: s.settingsRadius)
     }
 }
 
@@ -92,12 +75,16 @@ extension View {
 struct PopupHost<Item: Identifiable, C: View>: ViewModifier {
     @Binding var item: Item?
     @ViewBuilder var content: (Item) -> C
+    @Environment(AppModel.self) private var model
 
     func body(content base: Content) -> some View {
+        let s = model.surfaces
         ZStack {
             base
+                .blur(radius: item != nil ? s.popupBlurRadius : 0)
+                .animation(.snappy(duration: 0.22), value: item?.id)
             if let it = item {
-                BokehDim()
+                BokehDim(dimAlpha: s.popupDimAlpha)
                     .ignoresSafeArea()
                     .onTapGesture { item = nil }
                     .transition(.opacity)
@@ -111,9 +98,10 @@ struct PopupHost<Item: Identifiable, C: View>: ViewModifier {
 
 /// Light page dim for popups: ~18% darken + soft bokeh blobs (no heavy frost).
 struct BokehDim: View {
+    var dimAlpha: Double = 0.18
     var body: some View {
         ZStack {
-            Color.black.opacity(0.18)
+            Color.black.opacity(dimAlpha)
             Circle().fill(Theme.accent.opacity(0.10)).frame(width: 260).blur(radius: 60).offset(x: -180, y: -120)
             Circle().fill(Color.purple.opacity(0.10)).frame(width: 300).blur(radius: 70).offset(x: 200, y: 140)
             Circle().fill(Color.cyan.opacity(0.08)).frame(width: 220).blur(radius: 60).offset(x: 120, y: -180)
@@ -136,6 +124,11 @@ struct FieldWell: ViewModifier {
     }
 }
 
+extension View {
+    func fieldWell() -> some View { modifier(FieldWell()) }
+    func topFade(_ height: CGFloat = 14) -> some View { modifier(TopFade(height: height)) }
+}
+
 /// Top fade so scrolling content dissolves as it slides under a header —
 /// the same "scroll under material" feel used by the main tabs, reused inside
 /// cards/popups.
@@ -150,11 +143,6 @@ struct TopFade: ViewModifier {
             }
         )
     }
-}
-
-extension View {
-    func fieldWell() -> some View { modifier(FieldWell()) }
-    func topFade(_ height: CGFloat = 14) -> some View { modifier(TopFade(height: height)) }
 }
 
 /// Identifiable wrapper so a single asset id can drive a popup host.
@@ -192,7 +180,7 @@ struct GroupAssignPopup: View {
                         Button { Task { await model.toggleMember(group: g, assetID: assetID) } } label: {
                             HStack {
                                 Image(systemName: memberOf.contains(g) ? "checkmark.circle.fill" : "circle")
-                                    .foregroundStyle(memberOf.contains(g) ? Theme.accent : Theme.t2)
+                                    .foregroundStyle(memberOf.contains(g) ? model.accent : model.t2)
                                 Text(g).font(.system(size: 12)).lineLimit(1)
                                 Spacer()
                             }
@@ -231,22 +219,60 @@ struct PanelScroll<Panel: View, Content: View>: View {
     var panelHeight: CGFloat
     @ViewBuilder var panel: () -> Panel
     @ViewBuilder var content: () -> Content
+    @Environment(AppModel.self) private var model
 
     var body: some View {
+        let s = model.surfaces
+        let fade = s.fade(underlay: model.isDark)
+        let bottom = s.fade(canvasBottom: model.isDark)
         ZStack(alignment: .top) {
             ScrollView {
                 content()
                     .padding(.top, panelHeight + 12)
             }
-            .mask(
-                VStack(spacing: 0) {
-                    LinearGradient(colors: [.clear, .black],
-                                   startPoint: .top, endPoint: .bottom)
-                        .frame(height: panelHeight + 8)
-                    Color.black
-                }
-            )
+            .scrollIndicators(s.showScrollBar ? .visible : .never)
+            .scrollBounceBehavior(s.scrollBounce ? .automatic : .basedOnSize)
+            .mask(fadeMask(panelH: panelHeight, fade: fade, bottom: bottom))
             panel()
+        }
+    }
+
+    /// Top band: content dissolves under the floating panel (FadeConfig top).
+    /// Bottom band: content dissolves into the bottom window edge so the last row
+    /// of cards isn't a hard square cut (FadeConfig canvasBottom). Both are driven
+    /// from Materials Lab.
+    @ViewBuilder
+    private func fadeMask(panelH: CGFloat, fade: FadeConfig, bottom: FadeConfig) -> some View {
+        let band = panelH + 8
+        VStack(spacing: 0) {
+            // ── top ──
+            if fade.enabled {
+                let sEnd = max(0, min(fade.solidEnd, 1))
+                let fEnd = max(sEnd, min(fade.fadeEnd, 1))
+                LinearGradient(stops: [
+                    .init(color: .clear, location: 0),
+                    .init(color: .clear, location: sEnd),
+                    .init(color: .black, location: fEnd),
+                    .init(color: .black, location: 1),
+                ], startPoint: .top, endPoint: .bottom)
+                .frame(height: band)
+            } else {
+                Color.black.frame(height: band)
+            }
+            // ── middle (fully visible) ──
+            Color.black
+            // ── bottom ──
+            if bottom.enabled {
+                let bs = max(0, min(bottom.solidEnd, 1))
+                let be = max(bs, min(bottom.fadeEnd, 1))
+                LinearGradient(stops: [
+                    .init(color: .black, location: 0),
+                    .init(color: .black, location: bs),
+                    .init(color: .clear, location: be),
+                    .init(color: .clear, location: 1),
+                ], startPoint: .top, endPoint: .bottom)
+                .frame(height: 96)
+            }
         }
     }
 }

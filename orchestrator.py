@@ -26,6 +26,7 @@ from collectors.shutterstock import _shutterstock_api_collect_direct, _shutterst
 from collectors.getty import _getty_collect_direct, _getty_api_collect_global
 from collectors.depositphotos import _depositphotos_collect
 from collectors.envato import _envato_collect
+from collectors.freepik import _freepik_collect
 from collectors.ms_plus import _ms_plus_collect_direct, _ms_plus_collect_global
 
 _BASE_DIR = os.environ.get("STOCK_DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
@@ -46,8 +47,9 @@ def _run_collector_global(p, profile_dir, stock_name, start_url, headless, allow
     # DataDome blocks the Playwright Chromium build by fingerprint; system Chrome
     # passes through normally.
     channel = "chrome" if stock_name == "Shutterstock" else None
+    _real = channel == "chrome"
     browser = _open_browser_context(p, profile_dir, headless, channel=channel)
-    _apply_stealth(browser)
+    _apply_stealth(browser, real_chrome=_real)
     pw_page = browser.pages[0] if browser.pages else browser.new_page()
     pw_page.goto(start_url, wait_until=wait_cond, timeout=60000)
     time.sleep(3 if stock_name != "Shutterstock" else 5)
@@ -60,8 +62,10 @@ def _run_collector_global(p, profile_dir, stock_name, start_url, headless, allow
             return browser, pw_page
         browser.close()
         _do_login_flow_global(p, profile_dir, start_url, stock_name, wait_cond)
-        browser = _open_browser_context(p, profile_dir, headless)
-        _apply_stealth(browser)
+        # Keep the SAME channel after login — Shutterstock must stay on real Chrome,
+        # otherwise the re-open falls back to bundled Chromium and re-trips DataDome.
+        browser = _open_browser_context(p, profile_dir, headless, channel=channel)
+        _apply_stealth(browser, real_chrome=_real)
         pw_page = browser.pages[0] if browser.pages else browser.new_page()
         pw_page.goto(start_url, wait_until=wait_cond, timeout=60000)
         time.sleep(3 if stock_name != "Shutterstock" else 5)
@@ -98,6 +102,20 @@ def _run_collector_global(p, profile_dir, stock_name, start_url, headless, allow
             pw_page.goto(start_url, wait_until=wait_cond, timeout=60000)
             time.sleep(2)
             _envato_collect(pw_page)
+    elif stock_name == "Freepik":
+        result = _freepik_collect(pw_page)
+        if result == "needs_login":
+            if not allow_login:
+                _sync_log(f"[Freepik] 🔒 потрібен логін — натисни кнопку «Freepik» щоб увійти")
+                return browser, pw_page
+            browser.close()
+            _do_login_flow_global(p, profile_dir, start_url, stock_name, wait_cond)
+            browser = _open_browser_context(p, profile_dir, headless)
+            _apply_stealth(browser)
+            pw_page = browser.pages[0] if browser.pages else browser.new_page()
+            pw_page.goto(start_url, wait_until=wait_cond, timeout=60000)
+            time.sleep(2)
+            _freepik_collect(pw_page)
     elif stock_name == "Getty Images":
         # Auto-force on empty DB: pulls every available TSV statement instead of
         # waiting for the monthly-21st gate.
@@ -111,6 +129,13 @@ def _run_collector_global(p, profile_dir, stock_name, start_url, headless, allow
         _getty_api_collect_global(pw_page, force=(_g_count == 0))
     elif stock_name == "Microstock+":
         _ms_plus_collect_global(pw_page)
+    # Refresh the macOS cookie cache from this live context so the NEXT sync can use
+    # the fast direct-API path instead of opening a browser again.
+    try:
+        from cookies import _capture_pw_cookies
+        _capture_pw_cookies(browser)
+    except Exception:
+        pass
     return browser, pw_page
 
 
@@ -240,6 +265,7 @@ def _collect_one_stock_global(name, url, allow_login=False):
                     else "https://depositphotos.com/account/sales-history.html" if name == "Depositphotos"
                     else "https://accountmanagement.gettyimages.com/Reports/Export" if is_getty
                     else "https://microstock.plus/myfiles" if name == "Microstock+"
+                    else "https://contributor.magnific.com/statistics" if name == "Freepik"
                     else url,
                     name,
                     "networkidle" if name == "Shutterstock" else "domcontentloaded")
@@ -312,7 +338,7 @@ def _sync_all_global():
     else:
         _sync_log(f"🚀 Sequential sync (DB has {_sales_count} rows — cold start safeguard)")
 
-    SALES_STOCKS = ["Depositphotos", "Envato", "Getty Images", "Shutterstock", "Adobe Stock"]
+    SALES_STOCKS = ["Depositphotos", "Envato", "Freepik", "Getty Images", "Shutterstock", "Adobe Stock"]
 
     def _run_one(name):
         if _sync_stop_flag[0]:

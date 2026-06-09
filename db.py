@@ -113,21 +113,24 @@ def is_already_saved(stock, asset_id, price, date_str):
             except ValueError:
                 pass
         p = float(price) if price else 0.0
+        has_time = 'T' in raw or (' ' in raw and len(raw) > 10)
         with sqlite3.connect(DB_NAME, timeout=15) as c:
-            # Pass 1: exact datetime (new records stored with HH:MM:SS)
-            if 'T' in raw or (' ' in raw and len(raw) > 10):
+            # Pass 1: exact datetime. Timestamped sales (Adobe) carry a unique
+            # HH:MM:SS, so DIFFERENT sales of the same photo on the same day at the
+            # same price are correctly DISTINCT here.
+            if has_time:
                 dt_norm = raw.replace('T', ' ').split('+')[0].split('Z')[0][:19]
                 row = c.execute(
                     'SELECT 1 FROM sales WHERE stock=? AND asset_id=? AND date=?',
                     (stock, str(asset_id), dt_norm)
                 ).fetchone()
-                if row:
-                    return True
-            # Pass 2: price + day fallback — matches records stored in ANY
-            # date format ("2026-04-29" or "2026-04-29 00:00:00") since SS/
-            # Deposit collectors pass date-only strings while existing rows
-            # are mixed-format. Old LENGTH(date)=10 restriction caused all
-            # SS daily aggregates to be re-inserted as duplicates every sync.
+                # For a TIMESTAMPED incoming sale, Pass 1 is authoritative. DO NOT
+                # fall through to the day+price match — that wrongly treated every
+                # extra same-day same-price sale as a dup and dropped real Adobe
+                # subscription sales (a 6564-download photo collapsed to ~1108).
+                return row is not None
+            # Pass 2 (date-only incoming only — SS/Depositphotos daily aggregates):
+            # price + day fallback so re-syncing the same aggregate doesn't dup.
             row = c.execute(
                 'SELECT 1 FROM sales WHERE stock=? AND asset_id=? '
                 'AND substr(date,1,10)=? AND ABS(price - ?) < 0.005',

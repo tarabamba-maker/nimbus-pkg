@@ -72,6 +72,85 @@ def _hash_based_matches(existing_matches, threshold=4, incremental_from_rowid=No
     new_pairs = 0
     aids = list(by_aid.keys())
 
+    def _merge(aid_a, aid_b):
+        """Union-find merge of a matched pair into existing_matches. Identical
+        verdict + merge as the original per-pair logic; only the candidate SEARCH
+        is vectorised below. Returns True if it counted a new pair."""
+        nonlocal new_pairs
+        ka = aid_to_group_key.get(aid_a)
+        kb = aid_to_group_key.get(aid_b)
+        if ka and kb:
+            if ka == kb:
+                return
+            existing_matches[ka] = sorted(set(existing_matches.get(ka, []) + existing_matches.get(kb, [])))
+            for m in existing_matches.get(kb, []):
+                aid_to_group_key[m] = ka
+            existing_matches.pop(kb, None)
+        elif ka:
+            existing_matches[ka] = sorted(set(existing_matches[ka] + [aid_b]))
+            aid_to_group_key[aid_b] = ka
+        elif kb:
+            existing_matches[kb] = sorted(set(existing_matches[kb] + [aid_a]))
+            aid_to_group_key[aid_a] = kb
+        else:
+            existing_matches[aid_a] = sorted([aid_a, aid_b])
+            aid_to_group_key[aid_a] = aid_a
+            aid_to_group_key[aid_b] = aid_a
+        new_pairs += 1
+
+    # ── VECTORISED candidate search (numpy): hamming via XOR+popcount on uint64
+    # arrays + masked stock/aspect/RGB filters. Turns the O(n²) pure-Python pair
+    # scan (minutes on 35k rows) into ~seconds. SAME match verdict as before. ──
+    try:
+        import numpy as np
+        _have_np = True
+    except Exception:
+        _have_np = False
+
+    if _have_np and len(aids) > 1:
+        n = len(aids)
+        idxmap = {a: i for i, a in enumerate(aids)}
+        H  = np.zeros(n, dtype=np.uint64)
+        AR = np.full(n, -1.0, dtype=np.float64)
+        R  = np.zeros(n, dtype=np.int64); G = np.zeros(n, dtype=np.int64); B = np.zeros(n, dtype=np.int64)
+        has_rgb = np.zeros(n, dtype=bool)
+        S  = np.zeros(n, dtype=np.int64)
+        _scode: dict = {}
+        for i, a in enumerate(aids):
+            stock, h, ar, r, g, b = by_aid[a]
+            try:
+                H[i] = np.uint64(int(h, 16) & 0xFFFFFFFFFFFFFFFF)
+            except Exception:
+                H[i] = np.uint64(0)
+            if ar:
+                AR[i] = float(ar)
+            if isinstance(r, int) and isinstance(g, int) and isinstance(b, int):
+                R[i] = r; G[i] = g; B[i] = b; has_rgb[i] = True
+            S[i] = _scode.setdefault(stock, len(_scode))
+
+        _POP = np.array([bin(x).count('1') for x in range(256)], dtype=np.uint8)
+        def _popcount(u64arr):
+            return _POP[u64arr.view(np.uint8).reshape(-1, 8)].sum(axis=1)
+
+        full = new_aids is None
+        rows_to_scan = range(n) if full else [idxmap[a] for a in aids if a in new_aids]
+
+        for i in rows_to_scan:
+            cand = _popcount(H ^ H[i]) <= threshold       # hamming ≤ threshold
+            cand[i] = False
+            cand &= (S != S[i])                            # different stock
+            if AR[i] >= 0:                                 # aspect within 0.05 (if both have it)
+                cand &= ((AR < 0) | (np.abs(AR - AR[i]) <= 0.05))
+            if has_rgb[i]:                                 # RGB L1 ≤ 45 (if both have it)
+                l1 = np.abs(R - R[i]) + np.abs(G - G[i]) + np.abs(B - B[i])
+                cand &= (~has_rgb | (l1 <= 45))
+            if full:
+                cand[:i + 1] = False                       # only j>i: process each pair once
+            for j in np.nonzero(cand)[0]:
+                _merge(aids[i], aids[int(j)])
+        return existing_matches, new_pairs, max_rowid
+
+    # ── fallback: original pure-Python pair scan (numpy unavailable) ──
     def _pair_iter():
         if new_aids is None:
             for i, a in enumerate(aids):
@@ -103,25 +182,7 @@ def _hash_based_matches(existing_matches, threshold=4, incremental_from_rowid=No
                 continue
         except Exception:
             pass
-        ga = aid_to_group_key.get(aid_a)
-        gb = aid_to_group_key.get(aid_b)
-        if ga and gb:
-            if ga == gb: continue
-            existing_matches[ga] = sorted(set(existing_matches.get(ga, []) + existing_matches.get(gb, [])))
-            for m in existing_matches.get(gb, []):
-                aid_to_group_key[m] = ga
-            existing_matches.pop(gb, None)
-        elif ga:
-            existing_matches[ga] = sorted(set(existing_matches[ga] + [aid_b]))
-            aid_to_group_key[aid_b] = ga
-        elif gb:
-            existing_matches[gb] = sorted(set(existing_matches[gb] + [aid_a]))
-            aid_to_group_key[aid_a] = gb
-        else:
-            existing_matches[aid_a] = sorted([aid_a, aid_b])
-            aid_to_group_key[aid_a] = aid_a
-            aid_to_group_key[aid_b] = aid_a
-        new_pairs += 1
+        _merge(aid_a, aid_b)
     return existing_matches, new_pairs, max_rowid
 
 

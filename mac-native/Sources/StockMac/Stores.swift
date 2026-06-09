@@ -46,16 +46,15 @@ final class BestStore {
     var sort = "earnings"
     var stock = "All"
     var query = ""
+    var period: Period = .all
 
-    private var key: String { "\(sort)|\(stock)|\(query)" }
+    private var key: String { "\(period.rawValue)|\(sort)|\(stock)|\(query)" }
     var items: [TopPhoto] { caches[key]?.items ?? [] }
 
-    /// Fetch current filter if not cached.
     func ensure() async {
         if caches[key] == nil { await loadPage() }
     }
 
-    /// Force a fresh fetch for the current filter (used after editing query).
     func reloadCurrent() async {
         caches[key] = nil
         await loadPage()
@@ -66,7 +65,7 @@ final class BestStore {
         var c = caches[k] ?? PageCache<TopPhoto>()
         guard !loading, !c.end else { return }
         loading = true; defer { loading = false }
-        if let r = try? await API.sales(period: .all, stock: stock, sort: sort, page: c.page, query: query) {
+        if let r = try? await API.sales(period: period, stock: stock, sort: sort, page: c.page, query: query) {
             if r.items.isEmpty { c.end = true }
             else { c.items.append(contentsOf: r.items); c.page += 1 }
             caches[k] = c
@@ -79,12 +78,20 @@ final class GroupsStore {
     var groups: [PhotoGroup] = []
     var loading = false
     var loaded = false
+    var period: Period = .all
 
     func ensure() async { if !loaded { await load() } }
 
+    /// Reload for a (possibly new) period — used by the Today/Week/Month/Year blocks.
+    func reload(period: Period) async {
+        if period != self.period { self.period = period; loaded = false }
+        await ensure()
+    }
+
     func load() async {
         loading = true; defer { loading = false }
-        if let url = URL(string: API.base + "/api/groups"),
+        let q = period.rawValue.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? period.rawValue
+        if let url = URL(string: API.base + "/api/groups?period=\(q)"),
            let (data, _) = try? await URLSession.shared.data(from: url),
            let gs = try? JSONDecoder().decode([PhotoGroup].self, from: data) {
             groups = gs; loaded = true

@@ -8,12 +8,15 @@ struct StatsRow: View {
     var body: some View {
         HStack(spacing: 10) {
             ForEach(Period.allCases) { p in
-                StatCard(period: p,
-                         block: model.statBlock(p),
-                         active: model.period == p)
-                    .onTapGesture {
-                        withAnimation(.snappy) { model.period = p }
-                    }
+                Button {
+                    withAnimation(.snappy) { model.period = p }
+                } label: {
+                    StatCard(period: p,
+                             block: model.statBlock(p),
+                             active: model.period == p)
+                }
+                .buttonStyle(.plain)
+                .contentShape(RoundedRectangle(cornerRadius: Theme.radius))
             }
         }
     }
@@ -23,35 +26,46 @@ struct StatCard: View {
     let period: Period
     let block: StatBlock
     let active: Bool
+    @Environment(AppModel.self) private var model
 
     var body: some View {
+        let s = model.surfaces
         VStack(alignment: .leading, spacing: 4) {
             Text(period.short)
                 .font(.system(size: 9, weight: .bold))
                 .tracking(0.8)
-                .foregroundStyle(Theme.t3)
+                .foregroundStyle(s.t3(isDark: model.isDark))
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(block.total.money)
                     .font(.system(size: 18, weight: .bold))
                     .foregroundStyle(.primary)
+                    .contentTransition(.numericText())        // rolling digits on change
+                    .animation(.snappy, value: block.total)
                 if let d = block.delta, d > 0.005 {
                     Text("+\(d.money)")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(Theme.green)
+                        .contentTransition(.numericText())
+                        .animation(.snappy, value: d)
                 }
             }
             Text("↓\(block.count.formatted())")
                 .font(.system(size: 10))
-                .foregroundStyle(Theme.t2)
+                .foregroundStyle(s.t2(isDark: model.isDark))
+                .contentTransition(.numericText())
+                .animation(.snappy, value: block.count)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 14).padding(.vertical, 11)
-        .glassCard(16)
+        .surfaceMat(s.mat(.statsBlock, isDark: model.isDark),
+                    interactive: s.glassInteractive,
+                    radius: s.statsRadius)
         .overlay {
             if active {
-                RoundedRectangle(cornerRadius: 16)
-                    .strokeBorder(Theme.accent, lineWidth: 1.5)
+                RoundedRectangle(cornerRadius: s.statsRadius)
+                    .strokeBorder(model.accent, lineWidth: 1.5)
             }
         }
+        .contentShape(RoundedRectangle(cornerRadius: s.statsRadius))
     }
 }

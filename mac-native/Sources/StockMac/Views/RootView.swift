@@ -5,6 +5,8 @@ struct RootView: View {
 
     private let tabs = ["Downloads", "Best Sellers", "Groups", "Browser"]
     @State private var showSettings = false
+    @State private var showLab = false
+    @AppStorage("showLabButton") private var showLabButton = false
 
     var body: some View {
         ZStack {
@@ -13,28 +15,49 @@ struct RootView: View {
             if !model.ready {
                 BootView()
             } else {
+                let s = model.surfaces
                 VStack(spacing: 14) {
                     topRegion
                     content
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .surfaceMat(s.mat(.scrollPanelBg, isDark: model.isDark),
+                                    interactive: s.interactive(.scrollPanelBg),
+                                    radius: s.scrollPanelRadius)
+                        .offset(s.off(.content))
                 }
-                .padding(20)
+                .padding(.horizontal, s.contentPaddingH)
+                .padding(.vertical, s.contentPaddingV)
                 .transition(.opacity)
             }
         }
+        // Blur everything behind the Settings window (the overlay below is added
+        // AFTER this modifier, so the settings panel itself stays sharp).
+        .blur(radius: showSettings ? model.surfaces.settingsBlurRadius : 0)
+        .animation(.snappy(duration: 0.22), value: showSettings)
         .animation(.smooth(duration: 0.25), value: model.ready)
         .preferredColorScheme(model.isDark ? .dark : .light)
         .overlay {
             if showSettings {
                 ZStack {
-                    Rectangle().fill(.ultraThinMaterial).ignoresSafeArea()
+                    BokehDim(dimAlpha: model.surfaces.popupDimAlpha).ignoresSafeArea()
                         .onTapGesture { showSettings = false }
-                    SettingsView(onClose: { showSettings = false }).environment(model)
+                    SettingsView(showLabButton: $showLabButton,
+                                 onShowLab: { showSettings = false; showLab = true },
+                                 onClose: { showSettings = false }).environment(model)
                         .transition(.scale(scale: 0.96).combined(with: .opacity))
                 }
                 .animation(.snappy(duration: 0.22), value: showSettings)
             }
         }
+        .overlay(alignment: .trailing) {
+            if showLab {
+                MaterialsLab(onClose: { showLab = false })
+                    .environment(model)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                    .animation(.snappy(duration: 0.28), value: showLab)
+            }
+        }
+        .animation(.snappy(duration: 0.28), value: showLab)
     }
 
     private var bindingTab: Binding<Int> {
@@ -44,10 +67,14 @@ struct RootView: View {
     /// Title + stats + tab bar share one GlassEffectContainer so the Liquid Glass
     /// shapes reflect/bleed into each other (e.g. the blue tab tints its neighbours).
     @ViewBuilder private var topRegion: some View {
+        let s = model.surfaces
         VStack(spacing: 12) {
-            TopBar(showSettings: $showSettings)
+            TopBar(showSettings: $showSettings, showLab: $showLab, showLabButton: showLabButton)
+                .offset(s.off(.topBar))
             StatsRow()
+                .offset(s.off(.statsRow))
             GlassTabBar(tabs: tabs, selection: bindingTab)
+                .offset(s.off(.tabBarRow))
         }
     }
 
@@ -77,6 +104,11 @@ struct AppBackground: View {
                 } else {
                     gradient
                 }
+                // Optional material layer over the gradient/photo (Materials Lab).
+                Color.clear
+                    .surfaceMat(model.surfaces.mat(.appBackground, isDark: model.isDark),
+                                interactive: false, radius: 0)
+                    .frame(width: geo.size.width, height: geo.size.height)
             }
             .frame(width: geo.size.width, height: geo.size.height)
             .clipped()
@@ -118,58 +150,46 @@ private struct BootView: View {
 
 struct TopBar: View {
     @Binding var showSettings: Bool
+    @Binding var showLab: Bool
+    var showLabButton: Bool
     @Environment(AppModel.self) private var model
 
     var body: some View {
+        let s = model.surfaces
         HStack {
+            // Title — independently positionable / resizable (Materials Lab).
             Text("Stock Aggregator")
-                .font(.system(size: 16, weight: .bold))
+                .font(.system(size: s.size("titleSize", 16), weight: .bold))
                 .foregroundStyle(
-                    LinearGradient(colors: [Theme.accent, Color(red: 0.37, green: 0.77, blue: 1)],
+                    LinearGradient(colors: [model.accent, Color(red: 0.37, green: 0.77, blue: 1)],
                                    startPoint: .leading, endPoint: .trailing))
+                .offset(s.off(.topBarTitle))
             Spacer()
-            Button { model.isDark.toggle() } label: {
-                Image(systemName: model.isDark ? "sun.max" : "moon")
-                    .font(.system(size: 14)).padding(8)
-            }
-            .buttonStyle(.plain).glassPill()
-            Button { showSettings = true } label: {
-                Image(systemName: "gearshape").font(.system(size: 14)).padding(8)
-            }
-            .buttonStyle(.plain).glassPill()
-        }
-    }
-}
-
-/// Segmented control rendered as a single Liquid Glass capsule.
-struct GlassTabBar: View {
-    let tabs: [String]
-    @Binding var selection: Int
-
-    var body: some View {
-        HStack(spacing: 4) {
-            ForEach(Array(tabs.enumerated()), id: \.offset) { i, name in
-                Button {
-                    withAnimation(.easeOut(duration: 0.16)) { selection = i }
-                } label: {
-                    Text(name)
-                        .font(.system(size: 12.5, weight: .semibold))
-                        .padding(.horizontal, 16).padding(.vertical, 7)
-                        .foregroundStyle(selection == i ? .white : .secondary)
-                }
-                .buttonStyle(.plain)
-                .background {
-                    if selection == i {
-                        Capsule().fill(Theme.accent.gradient)
-                            .matchedGeometryEffect(id: "tabsel", in: ns)
+            // Right-side buttons — independently positionable as a group.
+            HStack(spacing: 8) {
+                if showLabButton {
+                    Button { showLab.toggle() } label: {
+                        Image(systemName: "paintbrush.pointed")
+                            .font(.system(size: 14)).padding(8)
+                            .foregroundStyle(showLab ? model.accent : .white)
                     }
+                    .buttonStyle(.plain).glassPill(active: showLab)
                 }
+                Button { model.isDark.toggle() } label: {
+                    Image(systemName: model.isDark ? "sun.max" : "moon")
+                        .font(.system(size: 14)).padding(8)
+                }
+                .buttonStyle(.plain).glassPill()
+                Button { showSettings = true } label: {
+                    Image(systemName: "gearshape").font(.system(size: 14)).padding(8)
+                }
+                .buttonStyle(.plain).glassPill()
             }
+            .offset(s.off(.topBarButtons))
         }
-        .padding(4)
-        .glassPill()
-        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 12).padding(.vertical, 6)
+        .surfaceMat(s.mat(.topBar, isDark: model.isDark),
+                    interactive: false, radius: s.topBarRadius)
     }
-
-    @Namespace private var ns
 }
+

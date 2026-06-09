@@ -6,6 +6,7 @@ struct StatBlock: Codable, Equatable {
     var total: Double = 0
     var count: Int = 0
     var delta: Double? = 0
+    var by_stock: [String: SaleStockStat]? = nil
 }
 
 struct StockTotal: Codable, Identifiable, Equatable {
@@ -41,6 +42,12 @@ struct Sale: Codable, Identifiable, Equatable {
     var isFirstSale: Bool {
         guard let bs = by_stock else { return false }
         return bs.values.reduce(0) { $0 + $1.count } == 1
+    }
+
+    /// Key that matches backend `_session_new_keys` format.
+    var saleKey: String {
+        let day = date.count >= 10 ? String(date.prefix(10)) : date
+        return "\(asset_id)|\(day)|\(stock)|\(String(format: "%.2f", price))"
     }
 }
 

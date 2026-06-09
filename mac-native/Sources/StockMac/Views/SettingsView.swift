@@ -3,12 +3,16 @@ import AppKit
 import UniformTypeIdentifiers
 
 struct SettingsView: View {
+    @Binding var showLabButton: Bool
+    var onShowLab: () -> Void = {}
     var onClose: () -> Void = {}
     @Environment(AppModel.self) private var model
     @State private var busy = ""
     @State private var msg = ""
 
     private let stockColorOrder = ["Adobe Stock", "Shutterstock", "iStock", "Depositphotos", "Envato"]
+
+    @State private var cookiesBusy = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -22,6 +26,7 @@ struct SettingsView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     appearance
+                    cookies
                     database
                     colors
                 }
@@ -31,7 +36,7 @@ struct SettingsView: View {
             }
         }
         .padding(20)
-        .popupChrome(width: 460, height: 620)
+        .settingsChrome(width: 460, height: 620)
     }
 
     // MARK: appearance + background
@@ -47,8 +52,49 @@ struct SettingsView: View {
                 btn("Import dark background", icon: "photo") { importBackground(dark: true) }
                 btn("Import light background", icon: "photo") { importBackground(dark: false) }
             }
-            Text("Картинку зберігається окремо для світлої / темної теми")
+            Text("Background saved separately for light / dark theme")
                 .font(.system(size: 10)).foregroundStyle(Theme.t3)
+
+            Divider().opacity(0.3)
+
+            Toggle(isOn: $showLabButton) {
+                Label("Show Materials Lab button", systemImage: "paintbrush.pointed")
+            }
+            .toggleStyle(.switch).font(.system(size: 12))
+
+            btn("Open Materials Lab", icon: "paintbrush.pointed", wide: true) { onShowLab() }
+        }
+    }
+
+    // MARK: cookies
+
+    private var cookies: some View {
+        section("BROWSER AUTH") {
+            Text("Імпортує cookies з Chrome/Safari для всіх стоків. Спершу закрий браузер (Cmd+Q).")
+                .font(.system(size: 10)).foregroundStyle(Theme.t3)
+            btn(cookiesBusy ? "Importing…" : "Import Cookies", icon: "key.fill", wide: true) {
+                Task { await importCookies() }
+            }
+        }
+    }
+
+    private func importCookies() async {
+        cookiesBusy = true
+        defer { cookiesBusy = false }
+        var req = URLRequest(url: URL(string: API.base + "/api/import-chrome-cookies")!)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = Data("{}".utf8)
+        guard let (data, _) = try? await URLSession.shared.data(for: req),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            msg = "Не вдалося звʼязатися з бекендом"; return
+        }
+        if (obj["status"] as? String) == "ok" {
+            let n = obj["total_imported"] as? Int ?? 0
+            let src = obj["source"] as? String ?? ""
+            msg = n > 0 ? "Імпортовано \(n) cookies (\(src))" : "0 cookies — увійди у браузері й повтори"
+        } else {
+            msg = (obj["msg"] as? String) ?? "Помилка імпорту"
         }
     }
 
@@ -61,9 +107,9 @@ struct SettingsView: View {
                 btn("Import backup", icon: "square.and.arrow.up") { importBackup() }
             }
             btn("Deduplicate", icon: "eraser", wide: true) { Task { await postConfirm("/api/deduplicate", "Deduplicate?") } }
-            btn("Rebuild from DB", icon: "arrow.clockwise", wide: true) { Task { await postConfirm("/api/rebuild-from-db", "Rebuild groups from DB?") } }
+            btn("Rebuild from DB", icon: "arrow.clockwise", wide: true) { Task { await postConfirm("/api/rebuild-from-db", "Rebuild groups from DB?", confirm: "REBUILD") } }
             btn("Full Reset (як свіже встановлення)", icon: "trash", wide: true, danger: true) {
-                Task { await postConfirm("/api/full-reset", "FULL RESET — зітре всі дані. Точно?") }
+                Task { await postConfirm("/api/full-reset", "FULL RESET — зітре всі дані. Точно?", confirm: "RESET") }
             }
         }
     }
@@ -72,11 +118,14 @@ struct SettingsView: View {
         section("STOCK COLORS") {
             ForEach(stockColorOrder, id: \.self) { s in
                 HStack {
-                    Circle().fill(Theme.color(for: s)).frame(width: 12, height: 12)
+                    Circle().fill(model.color(for: s)).frame(width: 10, height: 10)
                     Text(s).font(.system(size: 12))
                     Spacer()
-                    RoundedRectangle(cornerRadius: 5).fill(Theme.color(for: s))
-                        .frame(width: 44, height: 22)
+                    ColorPicker("", selection: Binding(
+                        get: { model.color(for: s) },
+                        set: { c in Task { await model.saveStockColor(s, c) } }
+                    ))
+                    .labelsHidden().frame(width: 44)
                 }
             }
         }
@@ -146,7 +195,7 @@ struct SettingsView: View {
         }
     }
 
-    private func postConfirm(_ path: String, _ prompt: String) async {
+    private func postConfirm(_ path: String, _ prompt: String, confirm: String = "") async {
         let alert = NSAlert()
         alert.messageText = prompt
         alert.addButton(withTitle: "OK"); alert.addButton(withTitle: "Cancel")
@@ -154,7 +203,9 @@ struct SettingsView: View {
         var req = URLRequest(url: URL(string: API.base + path)!)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = Data("{}".utf8)
+        // Destructive endpoints require a confirm token in the body.
+        let body = confirm.isEmpty ? [:] : ["confirm": confirm]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         _ = try? await URLSession.shared.data(for: req)
         await model.refresh()
         msg = "Готово"

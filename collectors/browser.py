@@ -69,13 +69,20 @@ _STEALTH_JS = """
 """
 
 
-def _apply_stealth(ctx):
+def _apply_stealth(ctx, real_chrome=False):
     # _STEALTH_JS spoofs navigator.platform=MacIntel + Apple WebGL to match the
     # macOS UA on bundled Chromium. On Windows/Linux we drive REAL system Chrome,
     # which is already consistent and trusted — injecting Mac signals there makes
     # the fingerprint mismatch the real platform (Win32 UA vs MacIntel) and trips
     # DataDome instantly. So apply stealth on macOS only.
-    if not IS_MAC:
+    #
+    # real_chrome=True means we're driving the user's REAL system Chrome via
+    # channel='chrome' (e.g. Shutterstock) — even on macOS. That browser already
+    # has a clean, trusted fingerprint; injecting stealth ON TOP of it creates the
+    # same mismatch Windows would get and gets DataDome to flag/poison the session.
+    # This is why Windows (always real Chrome) never applies stealth. Skip it here
+    # too so the Mac real-Chrome path behaves exactly like the Windows one.
+    if not IS_MAC or real_chrome:
         return
     ctx.add_init_script(_STEALTH_JS)
 
@@ -121,10 +128,17 @@ def _open_browser_context(p, profile_dir, headless, off_screen=False, channel=No
         # Strip Playwright's automation flags that DataDome fingerprints on
         ignore_default_args=["--enable-automation", "--enable-blink-features=IdleDetection"],
     )
-    # The hardcoded UA above is a macOS string. On Windows it would mismatch the
-    # real platform signals of system Chrome (a DataDome red flag) — drop it so
-    # Chrome presents its own consistent Windows UA.
-    if not IS_MAC:
+    # Will we drive the user's REAL system Chrome (clean, trusted fingerprint)?
+    # — always on Windows, and on macOS whenever channel='chrome' resolves to the
+    # installed Chrome.app below.
+    _mac_chrome = (channel and IS_MAC and os.path.exists(
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"))
+    use_real_chrome = IS_WIN or bool(_mac_chrome)
+    # The hardcoded UA above is a macOS string for BUNDLED Chromium. Real Chrome
+    # already sends its own correct, consistent UA — spoofing it on top mismatches
+    # the platform signals (a DataDome red flag), so drop the override whenever we
+    # drive real Chrome (Windows always, macOS for channel='chrome' stocks).
+    if use_real_chrome or not IS_MAC:
         kwargs.pop('user_agent', None)
     if IS_WIN:
         # On Windows ALWAYS drive the user's real system Chrome. This (a) gets
@@ -149,7 +163,7 @@ def _do_login_flow_global(p, profile_dir, target_url, stock_label, wait_cond):
     # Shutterstock: use real Chrome for login too (matches collector engine)
     channel = "chrome" if stock_label == "Shutterstock" else None
     vis = _open_browser_context(p, profile_dir, headless=False, channel=channel)
-    _apply_stealth(vis)
+    _apply_stealth(vis, real_chrome=(channel == "chrome"))
     vp = vis.pages[0] if vis.pages else vis.new_page()
     try:
         vp.goto(target_url, wait_until=wait_cond, timeout=90000)
@@ -157,8 +171,10 @@ def _do_login_flow_global(p, profile_dir, target_url, stock_label, wait_cond):
         pass
     _sync_log(f"👤 {stock_label}: залогуйся і ЗАКРИЙ ВІКНО БРАУЗЕРА — збір продовжиться автоматично (макс 10 хв)")
     try:
-        # 10-min cap — if user walks away, sync still recovers instead of hanging forever
-        vis.wait_for_event("close", timeout=600000)
+        # Capture cookies to the cache while open (decrypted by Playwright) — the only
+        # reliable cookie source on macOS. 10-min cap so a walk-away still recovers.
+        from cookies import _wait_close_capturing
+        _wait_close_capturing(vis, timeout_ms=600000)
     except Exception:
         _sync_log(f"⏱ {stock_label}: 10-хв timeout — закриваю браузер примусово")
     finally:

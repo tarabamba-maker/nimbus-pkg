@@ -89,26 +89,39 @@ def _card_font(sz):
     return ImageFont.load_default()
 
 
+_MONTH_CARDS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "assets", "month_cards")
+
+
 def _make_month_card(ym: str):
-    """Render a clean month placard for an aggregate `envato-YYYY-MM` record
-    (these have no real photo). Per-year accent colour. Saved to img_cache."""
+    """Build a month-card thumbnail for an aggregate `envato-YYYY-MM` record
+    (these have no real photo). Uses a seasonal photo for that calendar month
+    (assets/month_cards/MM_N.jpg — 4 variants/month, picked by year) with a
+    subtle bottom gradient + "MONTH YEAR" label. Saved to img_cache."""
     from PIL import Image, ImageDraw
     from app_globals import CACHE_DIR
     try:
         y, m = int(ym[:4]), int(ym[5:7])
-        acc = _YEAR_ACCENT.get(y, (120, 144, 156))
-        img = Image.new("RGB", (400, 400), (24, 28, 36))
-        d = ImageDraw.Draw(img)
+        variant = (y - 2021) % 4            # rotate the 4 photos across years
+        src = os.path.join(_MONTH_CARDS_DIR, f"{m:02d}_{variant}.jpg")
+        if os.path.exists(src):
+            img = Image.open(src).convert("RGB").resize((400, 400), Image.LANCZOS)
+        else:                               # fallback: plain dark tile
+            img = Image.new("RGB", (400, 400), (24, 28, 36))
+        # darken the bottom strip for legible text
+        grad = Image.new("L", (1, 400), 0)
         for i in range(400):
-            t = i / 400
-            d.line([(0, i), (400, i)], fill=(int(24 + 10 * t), int(28 + 12 * t), int(36 + 16 * t)))
-        d.rectangle([0, 0, 8, 400], fill=acc)
-        d.text((28, 30), "ENVATO ELEMENTS", font=_card_font(18), fill=(150, 160, 175))
-        d.text((28, 150), calendar.month_name[m].upper(), font=_card_font(54), fill=(238, 242, 248))
-        d.text((28, 220), str(y), font=_card_font(72), fill=acc)
-        d.text((28, 340), "monthly earnings", font=_card_font(20), fill=(120, 132, 148))
-        d.rounded_rectangle([300, 34, 360, 94], radius=8, outline=acc, width=3)
-        d.line([(300, 52), (360, 52)], fill=acc, width=3)
+            grad.putpixel((0, i), int(200 * max(0, (i - 250) / 150)))
+        grad = grad.resize((400, 400))
+        shade = Image.new("RGB", (400, 400), (0, 0, 0))
+        img = Image.composite(shade, img, grad)
+        d = ImageDraw.Draw(img)
+        acc = _YEAR_ACCENT.get(y, (120, 144, 156))
+        d.text((20, 318), calendar.month_name[m].upper(), font=_card_font(40), fill=(255, 255, 255))
+        d.text((22, 364), str(y), font=_card_font(22), fill=acc)
+        tag = "ENVATO · monthly"
+        tw = d.textlength(tag, font=_card_font(16))
+        d.text((380 - tw, 370), tag, font=_card_font(16), fill=(200, 208, 220))
         img.save(os.path.join(CACHE_DIR, f"envato-{ym}.jpg"), "JPEG", quality=90)
     except Exception as ex:
         _app_log(f"[Envato] month card {ym} failed: {ex}")

@@ -13,7 +13,7 @@ from flask import Blueprint, jsonify, request
 
 from app_globals import (
     DB_NAME, RECIPES_DIR,
-    _RELEVANT_STOCKS, _query_earnings_batch,
+    _RELEVANT_STOCKS, _query_earnings_batch, _load_matches,
 )
 from image_utils import load_groups, save_groups, load_ms_library, save_ms_library
 from sync_state import _app_log
@@ -30,6 +30,16 @@ def api_groups_get():
                     returns all photos). Use preview=3 for fast list rendering;
                     full photos fetched per-group via /api/group-photos?name=…
     """
+    # Period cutoff so the Today/Week/Month/Year blocks filter Groups like Downloads.
+    from datetime import datetime as _dt, timedelta as _td
+    _now = _dt.now()
+    _period = request.args.get('period', 'All-time')
+    _cutoff = {
+        'Today': _now.strftime('%Y-%m-%d'),
+        'Week':  (_now - _td(days=7)).strftime('%Y-%m-%d'),
+        'Month': (_now - _td(days=30)).strftime('%Y-%m-%d'),
+        'Year':  (_now - _td(days=365)).strftime('%Y-%m-%d'),
+    }.get(_period)
     try:
         preview_n = int(request.args.get('preview', 0))
     except ValueError:
@@ -63,14 +73,26 @@ def api_groups_get():
                                  if k in _RELEVANT_STOCKS and v},
                 })
 
+    # Cross-stock sibling map: id → set of all cluster members. Lets us fold every
+    # matched stock version (incl. stocks NOT in ms_library, e.g. Freepik) into ONE
+    # card instead of a separate card per stock.
+    _matches = _load_matches()
+    sib_of: dict = {}
+    for _prim, _members in _matches.items():
+        _cluster = {str(_prim)} | {str(m) for m in _members}
+        for _x in _cluster:
+            sib_of[_x] = _cluster
+
     all_ids: set = set()
     for photos_raw in ms_groups.values():
         for ph in photos_raw:
-            all_ids.update(ph['stockids'].values())
+            for sid in ph['stockids'].values():
+                all_ids.add(str(sid))
+                all_ids |= sib_of.get(str(sid), set())
     for aids in user_groups.values():
         all_ids.update(str(a) for a in aids)
 
-    earnings, thumb_map = _query_earnings_batch(all_ids)
+    earnings, thumb_map = _query_earnings_batch(all_ids, cutoff=_cutoff)
 
     result = []
 
@@ -84,9 +106,14 @@ def api_groups_get():
             ph_total = 0.0; ph_count = 0; ph_by_stock: dict = {}
             ph_thumb = ''; canonical_id = ''
 
-            for sid in stockids.values():
-                if not canonical_id:
-                    canonical_id = sid
+            # canonical id stays a stable ms_library stockid; earnings fold in the
+            # whole cross-stock cluster (so Freepik & co. count on the same card).
+            base_sids = [str(s) for s in stockids.values()]
+            canonical_id = base_sids[0] if base_sids else ''
+            sids = set(base_sids)
+            for s in base_sids:
+                sids |= sib_of.get(s, set())
+            for sid in sids:
                 e = earnings.get(sid)
                 if not e:
                     continue
@@ -122,7 +149,9 @@ def api_groups_get():
 
         represented: set = set()
         for ph_raw in photos_raw:
-            represented.update(ph_raw['stockids'].values())
+            for sid in ph_raw['stockids'].values():
+                represented.add(str(sid))
+                represented |= sib_of.get(str(sid), set())   # collapse sibling stocks
         for p in photos:
             represented.add(p['asset_id'])
 

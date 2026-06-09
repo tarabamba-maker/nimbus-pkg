@@ -361,6 +361,11 @@ def api_sync_start():
         _sync_stop_flag[0]     = False
         _sync_state["running"] = True
         _sync_state["log"]     = []
+        # Reset the blue-highlight baseline like _sync_all_global does — otherwise a
+        # single-stock sync's inserts pile into _session_new_keys forever and that
+        # stock's photos stay blue across every refresh (the Freepik "permanent blue").
+        with _session_new_keys_lock:
+            _session_new_keys.clear()
         try:
             _sync_log(f"🚀 Single-stock sync: {name}")
             _collect_one_stock_global(name, u, allow_login=True)

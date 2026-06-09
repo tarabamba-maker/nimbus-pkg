@@ -25,7 +25,7 @@ struct PhotoPopup: View {
                 HStack {
                     VStack(alignment: .leading) {
                         Text(total.money).font(.system(size: 20, weight: .bold))
-                        Text("↓\(count) sales · ID \(assetID)").font(.system(size: 11)).foregroundStyle(Theme.t2)
+                        Text("↓\(count) sales · ID \(assetID)").font(.system(size: 11)).foregroundStyle(model.t2)
                     }
                     Spacer()
                     CloseButton { onClose() }
@@ -35,18 +35,18 @@ struct PhotoPopup: View {
                 VStack(spacing: 6) {
                     ForEach(byStock.sorted { $0.value.total > $1.value.total }, id: \.key) { stock, stat in
                         HStack {
-                            Circle().fill(Theme.color(for: stock)).frame(width: 9, height: 9)
+                            Circle().fill(model.color(for: stock)).frame(width: 9, height: 9)
                             Text(stock).font(.system(size: 12))
                             Spacer()
-                            Text(stat.total.money).font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.accent)
-                            Text("· \(stat.count)").font(.system(size: 11)).foregroundStyle(Theme.t2)
+                            Text(stat.total.money).font(.system(size: 13, weight: .semibold)).foregroundStyle(model.accent)
+                            Text("· \(stat.count)").font(.system(size: 11)).foregroundStyle(model.t2)
                         }
                     }
                 }
 
                 Divider()
 
-                Text("GROUPS").font(.system(size: 10, weight: .bold)).foregroundStyle(Theme.t3)
+                Text("GROUPS").font(.system(size: 10, weight: .bold)).foregroundStyle(model.t3)
                 if !memberOf.isEmpty {
                     FlowChips(items: memberOf) { g in
                         Task { await model.toggleMember(group: g, assetID: assetID) }
@@ -54,7 +54,7 @@ struct PhotoPopup: View {
                 }
 
                 TextField("Search groups…", text: $groupSearch)
-                    .textFieldStyle(.plain).fieldWell()
+                    .textFieldStyle(.plain).searchWell()
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 2) {
@@ -64,7 +64,7 @@ struct PhotoPopup: View {
                             } label: {
                                 HStack {
                                     Image(systemName: memberOf.contains(g) ? "checkmark.circle.fill" : "circle")
-                                        .foregroundStyle(memberOf.contains(g) ? Theme.accent : .secondary)
+                                        .foregroundStyle(memberOf.contains(g) ? model.accent : .secondary)
                                     Text(g).font(.system(size: 12)).lineLimit(1)
                                     Spacer()
                                 }
@@ -79,15 +79,15 @@ struct PhotoPopup: View {
                 HStack {
                     TextField("Create new group…", text: $newGroup)
                         .textFieldStyle(.plain)
-                        .padding(.horizontal, 10).padding(.vertical, 6).glassPill()
+                        .fieldWell()
                         .onSubmit { create() }
-                    Button { create() } label: { Image(systemName: "plus") }
-                        .buttonStyle(.plain).padding(8).glassPill(active: true)
+                    Button { create() } label: { Image(systemName: "plus").foregroundStyle(.white) }
+                        .buttonStyle(.pill(.icon, active: true))
                 }
             }
             .padding(18)
         }
-        .clipShape(RoundedRectangle(cornerRadius: 22))
+        .clipShape(RoundedRectangle(cornerRadius: Theme.radius))
         .popupChrome(width: 380, height: 640)
     }
 
@@ -104,26 +104,9 @@ struct PhotoPopup: View {
     }
 }
 
-/// Simple wrapping chips row.
-struct FlowChips: View {
-    let items: [String]
-    let onTap: (String) -> Void
-
+/// (FlowChips now lives in Pills.swift.)
+private struct _RemovedFlowChips: View {
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                ForEach(items, id: \.self) { it in
-                    Button { onTap(it) } label: {
-                        HStack(spacing: 4) {
-                            Text(it).font(.system(size: 11)).lineLimit(1)
-                            Image(systemName: "xmark").font(.system(size: 8))
-                        }
-                        .padding(.horizontal, 9).padding(.vertical, 4)
-                        .foregroundStyle(.white)
-                    }
-                    .buttonStyle(.plain).glassPill(active: true)
-                }
-            }
-        }
+        EmptyView()
     }
 }

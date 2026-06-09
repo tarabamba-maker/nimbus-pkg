@@ -29,6 +29,7 @@ from cookies import (
     _import_cookies_for_stock, _inject_cookies_via_playwright,
     _is_chrome_running, _is_safari_running,
     _parse_safari_binarycookies, _windows_browser_login,
+    _stock_has_valid_session,
 )
 from db import init_db
 from image_utils import load_groups, save_groups
@@ -140,11 +141,23 @@ def api_import_chrome_cookies():
     requested = (data.get('source') or '').lower()
     stocks = data.get('stocks') or list(_STOCK_COOKIE_DOMAINS.keys())
 
-    if IS_WIN:
-        results = _windows_browser_login(stocks)
+    if IS_WIN or IS_MAC:
+        # Open a real Chrome window with the app's seed profile — user logs in once,
+        # sessions persist and are picked up by _load_browser_cookies() → collectors.
+        # Only open tabs for stocks WITHOUT a live session — already-logged-in stocks
+        # don't need re-login (and re-opening them risks re-challenging DataDome).
+        pending = [s for s in stocks if not _stock_has_valid_session(s)]
+        already = [s for s in stocks if s not in pending]
+        if not pending:
+            return jsonify({'status': 'ok', 'source': 'app-browser-login',
+                            'total_imported': 0, 'per_stock': [],
+                            'already_logged_in': already,
+                            'msg': 'All stocks already logged in'})
+        results = _windows_browser_login(pending)
         total = sum(r.get('imported', 0) for r in results)
         return jsonify({'status': 'ok', 'source': 'app-browser-login',
-                        'total_imported': total, 'per_stock': results})
+                        'total_imported': total, 'per_stock': results,
+                        'already_logged_in': already})
 
     safari_cookies_path = (
         os.path.expanduser("~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
@@ -482,10 +495,16 @@ def api_deduplicate():
     try:
         with sqlite3.connect(DB_NAME, timeout=15) as c:
             before = c.execute('SELECT COUNT(*) FROM sales').fetchone()[0]
+            # ⚠️ DEDUP ONLY EXACT DUPLICATES — full datetime + price. The old
+            # `GROUP BY stock, asset_id, DATE(date)` collapsed EVERY same-day sale of
+            # a photo into one (a 6564-download Adobe top-seller → 1108), destroying
+            # real subscription sales. A photo legitimately sells many times per day
+            # at the same/different price — only an identical (stock, asset_id, exact
+            # timestamp, price) row is a true duplicate.
             c.execute('''
                 DELETE FROM sales WHERE rowid NOT IN (
-                    SELECT MAX(rowid) FROM sales
-                    GROUP BY stock, asset_id, DATE(date)
+                    SELECT MIN(rowid) FROM sales
+                    GROUP BY stock, asset_id, date, price
                 )
             ''')
             c.commit()

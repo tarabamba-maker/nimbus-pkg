@@ -6,7 +6,8 @@ Desktop sales aggregator for photo stocks. Playwright logs into stock sites, col
 
 **Flet has been fully removed.** `main.py` is Flask-only (~5500 lines, modularization in progress). UI is `ui-tauri/` (SvelteKit + Tauri).
 
-**Current version: v0.9.53** (Mac + Windows, GitHub Actions CI builds both).
+**Current version: v0.9.54** (Mac + Windows, GitHub Actions CI builds both).
+**Native macOS SwiftUI app: `mac-native/` (see section below) — shares the Python backend.**
 **Windows port: COMPLETE** (v0.9.50 merged). Key Windows fixes:
 - UTF-8 stdout/stderr (emoji crash fix)
 - Chrome ABE v20: uses app-profile cookies via system Chrome (`channel='chrome'`)
@@ -150,6 +151,67 @@ Tauri auto-starts `main.py` on launch and kills it on exit:
 - `stop_backend()`: kill child + `pkill -f main.py`
 - `RunEvent::Exit` → `stop_backend()`
 
+## macOS native app (`mac-native/`) — SwiftUI, shares the Python backend
+
+Native SwiftUI app (macOS 26 Liquid Glass) alongside the Tauri/Windows UI. Same
+Flask backend (`Backend.swift` spawns `main.py` with `STOCK_DATA_DIR` =
+`~/Library/Application Support/StockAutomation`, cwd = that dir).
+
+### ⚠️ BUILD + INSTALL PROTOCOL — the #1 time-waster (2026-06-08)
+- Build: `cd mac-native && ./build.sh` (plain `swiftc`, NOT SwiftPM — `Package.swift`
+  uses `.v26` which the CLI SwiftPM toolchain can't parse). Produces `Stock Mac.app`.
+- **The app holds its binary open while running**, so `cp` over a *running*
+  `/Applications/Stock Mac.app` SILENTLY FAILS and you keep testing a stale build.
+  This cost an entire session: every "it's still broken" was a 13:36 binary while the
+  fix was at 14:15. ALWAYS:
+  1. `osascript -e 'tell application "Stock Mac" to quit'`; then kill by PID:
+     `pgrep -x StockMac | while read p; do kill -9 "$p"; done` (NEVER
+     `pkill -f StockMac` / `-f MacOS/StockMac` — the pattern matches your own shell
+     command and kills the shell with exit 144, aborting the install mid-way).
+  2. `rm -rf "/Applications/Stock Mac.app"; cp -R "Stock Mac.app" /Applications/`
+  3. **VERIFY**: `stat -f %Sm` on the installed binary is newer than your edits, and
+     `strings … | grep -c SortSegmented` (a known new symbol) > 0. Only then `open`.
+- Run each install step as a SEPARATE Bash call; compound `&&` chains abort on the
+  exit-144 and leave a half-done install.
+
+### Theme persistence (`SurfaceTheme.swift`)
+- `load()` decodes EVERY `Persisted` field as optional and applies it only if present.
+  Do NOT make any field non-optional: one missing/older field would throw and reset
+  ALL settings (incl. saved positions) to defaults — the "positions reset after save"
+  bug. Materials Lab (`MaterialsLab.swift`) is the live editor → `recipes/surface_theme.json`.
+
+### Blue new-sale highlight (recurs every few sessions — READ THIS)
+- Backend is the source of truth: `_session_new_keys` (cleared at sync start, appended
+  by `_save_record`), read via `GET /api/sync/recent-keys`. `Sale.saleKey` =
+  `asset_id|date[:10]|stock|price.2f` matches it exactly.
+- The bug is ALWAYS the same: a sync path that reloads the feed but never fetches the
+  keys. EVERY sync completion MUST call `model.notifySyncDone()` (fetches keys, clears
+  the tab cache, refreshes) BEFORE the feed reload. Downloads `doSync()` and
+  BrowserView both do this now. Don't add a sync path that skips it.
+
+### Period blocks — same logic on every tab
+- The Today/Week/Month/Year cards set `model.period`. Every tab reacts with
+  `.task(id: model.period)`. Best Sellers passes period to `/api/sales`; Groups passes
+  it to `/api/groups` (backend: `_query_earnings_batch(ids, cutoff=)` + period→cutoff
+  in `api_groups_get`). Downloads uses `/api/feed`.
+
+### Pills (`Pills.swift`) — single source of truth
+- `SegmentedGroup` (filters/tabs) + `SortSegmented` (Earnings/Sales/Name sort, with ↑/↓
+  arrow, double-click flips direction). Standalone buttons use `PillButtonStyle`.
+- SurfaceTheme drives: `pillColor`, `pillRadius`, `pillOffsetX/Y`,
+  `pillTextColor(isDark:)` (per-theme: white in dark, BLACK in light by default).
+- Light theme: inactive pills/buttons use `glass .regular` tint 0.2 (not the dark fill).
+
+### Animations in use (2026-06-08)
+- `.contentTransition(.numericText())` on all `$`/count totals (stat blocks + cards).
+- `.scrollTransition` fade+scale on every card as it enters.
+- One-shot `.scaleEffect` pulse on new (blue) sale cards via `onAppear`.
+- Sort arrow `.contentTransition(.symbolEffect(.replace))`.
+- Segmented selection morph = `matchedGeometryEffect(id:"segsel")`.
+- NOT done (need a focused visual pass, don't attempt blind): card→`PhotoPopup` zoom
+  (popups are overlay-based `popupHost`, not NavigationStack so `.navigationTransition(.zoom)`
+  doesn't apply); deeper `glassEffectID` glass-morph refactor of the pills.
+
 ## Stocks — status
 
 ### ✅ Adobe Stock
@@ -223,6 +285,33 @@ DataDome and similar anti-bot systems block direct HTTP requests. Browser-intern
 
 ## Photo groups & cross-stock matching
 
+### ⚠️ LAYERED GROUPING MODEL — every new stock MUST obey this (2026-06-09)
+This is the load-bearing contract. A new stock is **purely additive**; it must NOT
+change any layer below. Freepik broke this once (see below) — don't repeat it.
+
+1. **DB layer — each stock separate.** Every stock's photos live independently in
+   `sales` + `asset_meta` (pHash `thumb_hash`, aspect, RGB). A new stock just adds
+   its own rows. Nothing else changes.
+2. **Group structure layer — MS+ only.** `photo_groups.json` holds the MS+/ms_library
+   **shoot membership ONLY** — one primary stockid per photo, grouped by ms_library
+   `group`. This is the authoritative group composition. **NEVER write another
+   stock's asset_ids (siblings, Freepik, visual matches) INTO photo_groups.**
+3. **Matching/fold layer — at DISPLAY.** `api_groups_get` folds every stock's version
+   of a photo into ONE card via `_cross_stock_matches` (it expands the `represented`
+   set + each card's earnings over the photo's cross-stock cluster). A new stock
+   appears in cards automatically once its `asset_meta` pHash-clusters into
+   `_cross_stock_matches` (Pass A). No per-stock code in the group structure.
+4. **Manual overrides layer — last.** `_match_overrides.json` (Pass H) wins on top.
+
+**THE REGRESSION (don't redo):** rebuild **Pass E** (append cross-stock siblings into
+photo_groups) and **Pass F** (append MS+ visual matches into photo_groups) violated
+layer 2 — they stored other stocks' ids in `photo_groups`. With ms_library stocks it
+was invisible (all siblings were ms_library ids → collapsed by `represented`), but
+Freepik (NOT in ms_library) surfaced it: thousands of wrong-shoot photos bloated
+groups (one group went 339 → 3495, mixing shoots; manual removal wouldn't stick).
+**Both Pass E and Pass F appends are now DISABLED** — folding happens only at display.
+If you add a stock and groups bloat/mix, you re-introduced a write into photo_groups.
+
 - `photo_groups.json` — user-managed groups. Stores **only ONE primary stockid per photo** (no siblings — that would cause duplicates in the UI).
 - `ms_library.json` — 14 000+ photos with `{filename, group, stockids: {adobestock, shutterstock, istock, esp, ...}}` — source of truth for cross-stock links.
 - `_cross_stock_matches.json` — maps `primary_id → [primary_id, sibling_id, ...]`, rebuilt from ms_library stockids. Used by `/api/best-sellers` and `/api/photo-groups` to aggregate earnings across sibling IDs.
@@ -267,6 +356,32 @@ See `### ✅ Adobe Stock` section above. Key invariants:
 - `stop_pages` early-exit in Pass 1 MUST `break`, not `return` (this killed Pass 2 silently for months).
 - Pass 2 chunks: **360 days** (Adobe max is 364, 4-day safety margin).
 - **Don't mark empty chunks as done.** This is what lost us $8,400 of history in 2024-2025. See Adobe section.
+
+### macOS cookies — Playwright cache, NOT profile decryption (2026-06-08, `cookies.py`)
+- macOS app Chrome/Chromium profiles are written with `--use-mock-keychain` /
+  `--password-store=basic`, so their **v10 cookies are NOT decryptable** by either the
+  `Chrome Safe Storage` or `Chromium Safe Storage` Keychain key. `_load_appprofile_cookies_mac`
+  returns ~0 → collectors logged "no browser cookies" → Playwright fallback → DataDome.
+- FIX: capture cookies straight from the Playwright **context** — `context.cookies()`
+  returns them ALREADY DECRYPTED (httpOnly included) — into `recipes/_pw_cookies.json`.
+  `_load_browser_cookies()` reads this cache FIRST on macOS. Capture happens in the login
+  window (`_wait_close_capturing`), the per-stock login flow, and after every Playwright
+  collector run (`_capture_pw_cookies(browser)` in orchestrator). Self-healing: first
+  Playwright sync/login populates the cache → subsequent syncs use the fast direct API.
+- Keychain lookup must query by SERVICE only (`-s 'Chrome Safe Storage'`), NOT
+  `-a 'Chrome Safe Storage'` (that's the wrong account → fails → only the useless
+  'peanuts' key remained). `_mac_chrome_candidate_keys` tries both Chrome + Chromium keys.
+- `_stock_has_valid_session()` (markers per stock; Envato uses `envatosession`/`envatoid`,
+  NOT the HttpOnly `_author_warehouse_session`) → Import-Cookies opens login tabs ONLY for
+  not-logged-in stocks.
+
+### Stealth must NOT touch real Chrome — even on macOS (`collectors/browser.py`)
+- `_apply_stealth(ctx, real_chrome=False)` and the spoofed Mac UA are ONLY for bundled
+  Chromium. When driving real system Chrome (`channel='chrome'`, e.g. Shutterstock),
+  injecting stealth JS + a fake UA on top of a genuine Chrome fingerprint is exactly what
+  DataDome flags and POISONS the datadome token — this kept blocking Shutterstock on Mac.
+  Real Chrome / `channel='chrome'` → pass `real_chrome=True` everywhere (login flow,
+  `_run_collector_global`, `_windows_browser_login`). Mirrors Windows (no stealth there).
 
 ### Shutterstock (main.py:_shutterstock_api_collect_global)
 - Browser fetch to `/api/next/v2/earnings/media_stats/day` (not direct HTTPS — DataDome blocks). Navigate to `/earnings` first to seed cookies.

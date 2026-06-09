@@ -259,13 +259,31 @@ def api_compute_ms_hashes():
 
 @matching_bp.route('/api/rebuild-matches', methods=['POST'])
 def api_rebuild_matches():
-    """Rebuild cross-stock matches + sync ms_library groups into photo_groups.json."""
+    """Rebuild cross-stock matches + sync ms_library groups into photo_groups.json.
+    POST {"force": true} wipes the incremental state + group snapshot so the whole
+    catalog is re-clustered from scratch (the normal call early-exits 'cached' when
+    nothing changed)."""
     lib      = load_ms_library()
     overrides = _load_overrides()
 
     # ── State + change detection ─────────────────────────────────────────
     _state_file    = os.path.join(RECIPES_DIR, '_matches_state.json')
     _snapshot_file = os.path.join(RECIPES_DIR, '_ms_group_snapshot.json')
+    # Auto-rebuild after sync calls this from a background thread (NO request
+    # context) — guard the request access or it raises "Working outside of request
+    # context" and the rebuild aborts (groups vanish).
+    from flask import has_request_context
+    _force = False
+    if has_request_context():
+        _force = bool((request.get_json(force=True, silent=True) or {}).get('force'))
+    if _force:
+        for _f in (_state_file, _snapshot_file,
+                   os.path.join(RECIPES_DIR, '_cross_stock_matches.json')):
+            try:
+                if os.path.exists(_f):
+                    os.remove(_f)
+            except Exception:
+                pass
     try:
         with open(_state_file) as _f: _state = json.load(_f)
     except Exception:
@@ -345,7 +363,10 @@ def api_rebuild_matches():
     _save_matches(matches)
 
     # ── Pass D: sync MS+ groups → photo_groups (DIFF-BASED) ──────────────
-    groups = load_groups()
+    # On force, start groups from SCRATCH so old bloat (wrong-shoot photos that
+    # aren't ms_authoritative primaries) is fully discarded — the incremental purge
+    # below only removes ms_library primaries+siblings, not unrelated garbage.
+    groups = {} if _force else load_groups()
     ms_authoritative = {}
     for photo in lib:
         gname = (photo.get('group') or '').strip()
@@ -415,32 +436,15 @@ def api_rebuild_matches():
         for m in members:
             aid_to_matchkey[m] = key
 
+    # Pass E DISABLED: it appended every cross-stock sibling INTO photo_groups,
+    # which bloated groups (and with Freepik started dragging unrelated shoots in).
+    # Cross-stock versions now fold into one card at DISPLAY time (api_groups_get
+    # uses _cross_stock_matches), so photo_groups must stay the authoritative
+    # ms_library shoot membership only. Same reason Pass F's append is gated.
     auto_added = 0
-    for gname in list(groups.keys()):
-        for aid in list(groups[gname]):
-            mkey = aid_to_matchkey.get(aid)
-            if not mkey: continue
-            for sib in matches.get(mkey, []):
-                if sib == aid or sib in aid_to_group: continue
-                groups[gname].append(sib)
-                aid_to_group[sib] = gname
-                auto_added += 1
 
-    # ── Pass F: MS+ visual matching (incremental) ────────────────────────
+    # ── Pass F: MS+ visual matching (DISABLED — folds at display, see above) ──
     ms_added = 0
-    if am_unchanged and mm_unchanged and _last_am_rowid is not None:
-        ms_additions = {}
-    else:
-        ms_additions = _ms_visual_matches(
-            aid_to_group,
-            last_asset_meta_rowid=_last_am_rowid,
-            last_ms_meta_rowid=_last_mm_rowid,
-        )
-    for gname, aids in ms_additions.items():
-        if gname not in groups:
-            groups[gname] = []
-        groups[gname].extend(aids)
-        ms_added += len(aids)
 
     # ── Pass G: dedup ────────────────────────────────────────────────────
     for gname in list(groups.keys()):

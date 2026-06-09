@@ -66,8 +66,10 @@ def _save_overrides(d: dict):
         json.dump({"linked": d.get("linked", {}), "unlinked": d.get("unlinked", {})}, f, indent=2)
 
 
-def _query_earnings_batch(ids_iterable):
-    """Query sales DB for a set of asset_ids; return earnings + thumb_map dicts."""
+def _query_earnings_batch(ids_iterable, cutoff=None):
+    """Query sales DB for a set of asset_ids; return earnings + thumb_map dicts.
+    cutoff: optional 'YYYY-MM-DD' lower bound on date so the period stat blocks
+    (Today/Week/Month/Year) filter Groups the same way they filter Downloads."""
     earnings: dict = {}
     thumb_map: dict = {}
     ids_list = list(set(str(i) for i in ids_iterable if i))
@@ -77,11 +79,12 @@ def _query_earnings_batch(ids_iterable):
         for off in range(0, len(ids_list), 800):
             chunk = ids_list[off:off + 800]
             phs = ','.join('?' * len(chunk))
+            extra = " AND date >= ?" if cutoff else ""
             rows = conn.execute(
                 f"SELECT asset_id, stock, SUM(price), COUNT(*), MAX(thumb_url) FROM sales"
-                f" WHERE asset_id IN ({phs})"
+                f" WHERE asset_id IN ({phs}){extra}"
                 f" GROUP BY asset_id, stock",
-                chunk,
+                chunk + ([cutoff] if cutoff else []),
             ).fetchall()
             for r in rows:
                 aid = str(r[0]); sk = r[1]; thumb = r[4]

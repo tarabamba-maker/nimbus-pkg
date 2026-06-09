@@ -30,6 +30,84 @@ _BASE_DIR = os.environ.get(
     os.path.dirname(os.path.abspath(__file__))
 )
 
+# ── Playwright cookie cache (macOS) ──────────────────────────────────────────
+# On macOS the app's Chrome/Chromium profiles encrypt cookies with a key we can't
+# recover (Playwright launches Chrome with --use-mock-keychain/--password-store=
+# basic, so neither the 'Chrome Safe Storage' nor 'Chromium Safe Storage' Keychain
+# key decrypts them). Instead we snapshot cookies straight from the Playwright
+# context during login — context.cookies() returns them ALREADY DECRYPTED (httpOnly
+# included) — and persist to this plain JSON. Collectors then read it via
+# _load_browser_cookies(). This is the macOS equivalent of the Windows
+# app-profile-cookie path and is why "no browser cookies" stops happening.
+_PW_COOKIE_CACHE = os.path.join(_BASE_DIR, "recipes", "_pw_cookies.json")
+
+
+def _save_pw_cookie_cache(pw_cookies):
+    """Write Playwright-decrypted cookies (list of dicts from context.cookies()) to
+    the plain JSON cache. Merges by (domain, name) so logging into one stock doesn't
+    wipe another stock's still-valid cookies."""
+    import json as _json
+    try:
+        os.makedirs(os.path.dirname(_PW_COOKIE_CACHE), exist_ok=True)
+        merged = {}
+        for c in _load_pw_cookie_cache():           # keep existing
+            merged[(c.get('domain', ''), c.get('name', ''))] = c
+        for c in pw_cookies:                          # overlay fresh
+            d = (c.get('domain') or '').lstrip('.')
+            if not c.get('name'):
+                continue
+            merged[(d, c.get('name'))] = {
+                'name': c.get('name', ''), 'value': c.get('value', ''),
+                'domain': d, 'path': c.get('path', '/') or '/',
+                'expires': c.get('expires', -1),
+                'secure': bool(c.get('secure', False)),
+                'httpOnly': bool(c.get('httpOnly', False)),
+            }
+        out = list(merged.values())
+        with open(_PW_COOKIE_CACHE, 'w') as f:
+            _json.dump(out, f)
+        return len(out)
+    except Exception as e:
+        _app_log(f"[cookies] pw cache write failed: {e}")
+        return 0
+
+
+def _load_pw_cookie_cache():
+    import json as _json
+    try:
+        with open(_PW_COOKIE_CACHE) as f:
+            data = _json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _capture_pw_cookies(context):
+    """Snapshot the live Playwright context's cookies into the cache. Safe to call
+    repeatedly; returns count written (0 if the context is already closed)."""
+    try:
+        cks = context.cookies()
+    except Exception:
+        return 0
+    return _save_pw_cookie_cache(cks) if cks else 0
+
+
+def _wait_close_capturing(context, timeout_ms=600000):
+    """Wait for the login window to close, snapshotting cookies to the cache every
+    few seconds so the post-login session is captured even though we never know
+    exactly when the user finishes. Replaces a bare wait_for_event('close')."""
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        n = _capture_pw_cookies(context)
+        if n == 0:        # context closed (cookies() threw) → done
+            break
+        try:
+            context.wait_for_event("close", timeout=2500)
+            break          # closed within the slice
+        except Exception:
+            continue        # timeout slice elapsed → loop & re-snapshot
+    _capture_pw_cookies(context)   # best-effort final snapshot
+
 from utils import _dpapi_unprotect
 from collectors.browser import _open_browser_context, _apply_stealth
 from sync_state import _sync_log, _app_log
@@ -211,23 +289,185 @@ def _load_appprofile_cookies_windows():
                 break
     return out
 
+def _mac_keychain_pw(service):
+    """Read a Keychain generic-password by SERVICE name. The account (-a) for these
+    items is the app name ('Chrome'/'Chromium'), NOT the service — passing the wrong
+    -a makes the lookup fail, which silently left us with only the 'peanuts' key and
+    decrypted 0 cookies. Query by service only."""
+    try:
+        import subprocess
+        r = subprocess.run(
+            ['security', 'find-generic-password', '-s', service, '-w'],
+            capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip().encode('utf-8')
+    except Exception:
+        pass
+    return None
+
+
+def _mac_chrome_key():
+    """AES-128 key for Chrome cookies on macOS (first candidate)."""
+    return _mac_chrome_candidate_keys()[0]
+
+
+def _mac_chrome_candidate_keys():
+    """All AES-128 keys to try on macOS. A profile's cookies may have been written
+    by real Chrome (channel='chrome' → 'Chrome Safe Storage' key) OR by Playwright's
+    bundled Chromium (→ 'Chromium Safe Storage' key), and the same seed profile can
+    hold a mix. So derive a key from BOTH Keychain services, then 'peanuts' (Chromium
+    with no Keychain entry). Trying the wrong key yields garbage that fails strict
+    utf-8 validation downstream, so order doesn't matter — only coverage does."""
+    from hashlib import pbkdf2_hmac
+    keys = []
+    for service in ('Chrome Safe Storage', 'Chromium Safe Storage'):
+        pw = _mac_keychain_pw(service)
+        if pw:
+            keys.append(pbkdf2_hmac('sha1', pw, b'saltysalt', 1003, dklen=16))
+    keys.append(pbkdf2_hmac('sha1', b'peanuts', b'saltysalt', 1003, dklen=16))
+    return keys
+
+
+def _decrypt_one_mac(ev, keys, AES):
+    """Try every candidate key with STRICT utf-8 validation. Returns the cleanly
+    decrypted value, or None if no key produces valid plaintext (= garbage)."""
+    body = ev[3:]
+    for k in keys:
+        try:
+            dec = AES.new(k, AES.MODE_CBC, IV=b' ' * 16).decrypt(body)
+            if not dec:
+                continue
+            pad = dec[-1]
+            if pad < 1 or pad > 16:          # invalid PKCS#7 padding → wrong key
+                continue
+            raw = dec[:-pad]
+            # Newer Chrome (v130+) prepends a 32-byte SHA256 domain hash to the
+            # plaintext. Strip it if the remainder decodes cleanly; otherwise use raw.
+            for cand in ((raw[32:], raw) if len(raw) > 32 else (raw,)):
+                try:
+                    return cand.decode('utf-8')   # strict — raises on garbage
+                except UnicodeDecodeError:
+                    continue
+        except Exception:
+            continue
+    return None
+
+
+def _decrypt_chrome_cookie_db_mac(cookie_db):
+    """Decrypt Chrome/Chromium cookie DB on macOS (v10/v11 = AES-128-CBC)."""
+    import shutil, tempfile
+    try:
+        from Cryptodome.Cipher import AES
+    except ImportError:
+        return []
+    if not cookie_db or not os.path.exists(cookie_db):
+        return []
+    keys = _mac_chrome_candidate_keys()
+    tmp = tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False).name
+    try:
+        shutil.copyfile(cookie_db, tmp)
+        con = sqlite3.connect(tmp)
+        rows = con.execute(
+            'SELECT host_key, name, encrypted_value, value FROM cookies').fetchall()
+        con.close()
+    except Exception as e:
+        _app_log(f"⚠️ Mac Chrome cookie DB read failed ({cookie_db}): {e}")
+        return []
+    finally:
+        try: os.remove(tmp)
+        except: pass
+    out, skipped = [], 0
+    for host, name, ev, plain in rows:
+        ev = bytes(ev) if ev else b''
+        val = None
+        if not ev:
+            val = plain or ''
+        elif ev[:3] in (b'v10', b'v11'):
+            val = _decrypt_one_mac(ev, keys, AES)
+        elif ev[:3] == b'v20':
+            continue  # App-Bound Encrypted — undecryptable outside Chrome
+        else:
+            val = plain or ''
+        if val is None:
+            skipped += 1
+            continue
+        out.append({'name': name, 'value': val, 'domain': host.lstrip('.')})
+    if skipped:
+        _app_log(f"ℹ️ Mac Chrome cookies: {len(out)} decrypted, {skipped} undecryptable (wrong key/ABE) skipped — {cookie_db}")
+    return out
+
+
+def _load_appprofile_cookies_mac():
+    """Read cookies from all app Chrome profiles on macOS."""
+    import glob
+    roots = {_BASE_DIR, os.getcwd()}
+    profiles = set()
+    for r in roots:
+        profiles.update(glob.glob(os.path.join(r, 'chrome_profile*')))
+        profiles.update(glob.glob(os.path.join(r, '*_profile')))
+    seen, out = set(), []
+    for prof in sorted(profiles):
+        for sub in (os.path.join(prof, 'Default', 'Network', 'Cookies'),
+                    os.path.join(prof, 'Default', 'Cookies')):
+            if os.path.exists(sub):
+                for c in _decrypt_chrome_cookie_db_mac(sub):
+                    k = (c['domain'], c['name'])
+                    if k not in seen:
+                        seen.add(k)
+                        out.append(c)
+                break
+    return out
+
+
+def _latin1_safe_cookies(cookies):
+    """HTTP headers are encoded latin-1, so a cookie whose value (or name) carries
+    chars outside 0x00–0xFF cannot be sent and crashes requests with
+    'latin-1 codec can't encode'. Cookies are ASCII by spec, so any such value is
+    garbage (failed decryption / replacement chars) — drop it. This is the single
+    choke point every collector reads through, so one filter protects all stocks."""
+    clean, dropped = [], 0
+    for c in cookies:
+        name = c.get('name', '')
+        val = c.get('value', '')
+        try:
+            name.encode('latin-1'); val.encode('latin-1')
+        except (UnicodeEncodeError, AttributeError):
+            dropped += 1
+            continue
+        clean.append(c)
+    if dropped:
+        _app_log(f"ℹ️ Dropped {dropped} non-latin-1 (corrupt) cookies before use")
+    return clean
+
+
 def _load_browser_cookies():
     """OS-agnostic: returns all browser cookies as list of dicts.
-    On macOS: Safari binarycookies. On Windows: the app's own Chrome login
-    profiles (variant 3), since Chrome 127+ App-Bound Encryption makes the
-    user's native Chrome cookies unreadable from outside Chrome."""
+    On macOS: app Chrome profiles first (if browser-login was done), then Safari.
+    On Windows: the app's own Chrome login profiles (variant 3).
+    Always passes through _latin1_safe_cookies so corrupt values can't crash
+    collectors (the 'latin-1 codec' bug that took down every stock)."""
     if IS_MAC:
+        # 1) Playwright cookie cache — captured during the login window, decrypted by
+        #    Playwright itself. Primary source on macOS (profile DBs aren't decryptable).
+        cached = _load_pw_cookie_cache()
+        if cached:
+            return _latin1_safe_cookies(cached)
+        # 2) App Chrome profiles (works only if the keychain key happens to match)
+        chrome_cookies = _load_appprofile_cookies_mac()
+        if chrome_cookies:
+            return _latin1_safe_cookies(chrome_cookies)
+        # 3) Fall back to Safari
         path = os.path.expanduser(
             "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
         if not os.path.exists(path):
             return []
         try:
-            return _parse_safari_binarycookies(path)
+            return _latin1_safe_cookies(_parse_safari_binarycookies(path))
         except Exception as e:
             _app_log(f"⚠️ Safari cookies parse failed: {e}")
             return []
     if IS_WIN:
-        return _load_appprofile_cookies_windows()
+        return _latin1_safe_cookies(_load_appprofile_cookies_windows())
     return []
 
 
@@ -338,6 +578,7 @@ _STOCK_COOKIE_DOMAINS = {
     "Envato":        ["envato.com", "account.envato.com", "author.envato.com",
                       "elements.envato.com"],
     "Microstock+":   ["microstock.plus"],
+    "Freepik":       ["magnific.com", "contributor.magnific.com", "freepik.com"],
 }
 
 
@@ -441,7 +682,55 @@ _STOCK_LOGIN_URLS = {
     "Getty Images":  "https://accountmanagement.gettyimages.com/Reports/Export",
     "Microstock+":   "https://microstock.plus/myfiles",
     "Envato":        "https://author.envato.com/reports/performance",
+    "Freepik":       "https://contributor.magnific.com/statistics",
 }
+
+
+# Auth-marker cookies whose presence (non-expired) proves a live session. ANY of
+# the listed names counts. These are the names actually readable from the app's
+# Chrome profiles when logged in (verified against real profiles) — NOT the
+# HttpOnly server-only names. For stocks without a single obvious marker we fall
+# back to "has any live cookie on the stock's domains" (Adobe/Depositphotos).
+_STOCK_AUTH_COOKIE = {
+    "Shutterstock": ["accts_contributor"],          # same marker the direct collector checks
+    "Getty Images": ["ccw"],                         # ESP auth token
+    # author.envato.com's _author_warehouse_session is HttpOnly and not readable
+    # from the profile, so key off the account-session cookies that ARE present.
+    "Envato":       ["envatosession", "envatoid", "_author_warehouse_session"],
+    "Microstock+":  ["koa.sid"],
+}
+
+
+def _stock_has_valid_session(stock_name):
+    """True if a live (non-expired) session for this stock exists in the app's
+    Chrome login profiles. Used to open login windows ONLY for stocks that aren't
+    already logged in. Reads the same cookies the collectors use, so it agrees with
+    what a sync would actually see."""
+    import time as _t
+    domains = _STOCK_COOKIE_DOMAINS.get(stock_name, [])
+    if not domains:
+        return False
+    try:
+        cookies = _load_browser_cookies()
+    except Exception:
+        return False
+    markers = _STOCK_AUTH_COOKIE.get(stock_name) or []
+    now = _t.time()
+    domain_hits = 0
+    for c in cookies:
+        dom = (c.get('domain') or '').lstrip('.')
+        if not any(d in dom for d in domains):
+            continue
+        exp = c.get('expires', -1)
+        # expires -1/0 = session cookie (valid while present); >0 must be in future.
+        if isinstance(exp, (int, float)) and exp > 0 and exp < now:
+            continue
+        domain_hits += 1
+        if markers and c.get('name') in markers:
+            return True
+    # Marker stock but no marker found → not logged in. Otherwise any live cookie
+    # on the stock's domains counts as a session.
+    return False if markers else domain_hits > 0
 
 
 def _stock_profile_dir(stock_name):
@@ -483,7 +772,10 @@ def _windows_browser_login(stocks):
     try:
         with _spw() as p:
             vis = _open_browser_context(p, login_prof, headless=False, channel="chrome")
-            _apply_stealth(vis)
+            # Real system Chrome — do NOT inject stealth. On macOS that would poison
+            # the very datadome token this login is meant to mint cleanly (the bug
+            # that kept getting Shutterstock blocked). Mirrors Windows behaviour.
+            _apply_stealth(vis, real_chrome=True)
             # Shutterstock's DataDome rejects a stale/flagged token outright (it
             # serves a blank block page instead of the login form). Clear its
             # cookies first so it issues a fresh, clean token. Other stocks just
@@ -512,15 +804,14 @@ def _windows_browser_login(stocks):
                 time.sleep(3 if name == "Shutterstock" else 1.5)
             _sync_log("👤 Залогінься у КОЖНІЙ вкладці (" + ", ".join(opened) +
                       ") і ЗАКРИЙ ВІКНО — далі все підхопиться автоматично (макс 10 хв)")
+            # Snapshot cookies to the cache while the window is open (and once more at
+            # close) — Playwright returns them decrypted, the only reliable source on
+            # macOS. Without this the direct collectors see "no browser cookies".
+            _wait_close_capturing(vis, timeout_ms=600000)
             try:
-                vis.wait_for_event("close", timeout=600000)
+                vis.close()
             except Exception:
-                _sync_log("⏱ 10-хв timeout — закриваю вікно логіну")
-            finally:
-                try:
-                    vis.close()
-                except Exception:
-                    pass
+                pass
     except Exception as e:
         _app_log(f"[win-login] failed: {e}")
         return [{'stock': s, 'imported': 0, 'error': str(e)} for s in opened or stocks]

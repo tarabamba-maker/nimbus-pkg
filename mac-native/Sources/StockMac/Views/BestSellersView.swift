@@ -8,8 +8,9 @@ struct BestSellersView: View {
     @State private var sortAsc = false
     @State private var pendingMatch: String?     // asset_id awaiting a link target
     @State private var matchMsg = ""
-    private let cols = [GridItem(.adaptive(minimum: 168, maximum: 168), spacing: 10)]
-    private let panelH: CGFloat = 52
+    private var cardW: CGFloat { model.surfaces.size("cardW", 168) }
+    private var cols: [GridItem] { [GridItem(.adaptive(minimum: cardW, maximum: cardW), spacing: model.surfaces.cardSpacing)] }
+    private var panelH: CGFloat { model.surfaces.panelH }
 
     private var store: BestStore { model.best }
 
@@ -23,7 +24,7 @@ struct BestSellersView: View {
         PanelScroll(panelHeight: panelH) {
             controls
         } content: {
-            LazyVGrid(columns: cols, spacing: 10) {
+            LazyVGrid(columns: cols, spacing: model.surfaces.cardSpacing) {
                 ForEach(visible) { p in
                     TopPhotoCard(photo: p, byCount: store.sort == "count")
                         .onTapGesture { tap(p) }
@@ -34,16 +35,21 @@ struct BestSellersView: View {
                         }
                         .overlay {
                             if pendingMatch == p.asset_id {
-                                RoundedRectangle(cornerRadius: 14).strokeBorder(Theme.accent, lineWidth: 2)
+                                RoundedRectangle(cornerRadius: model.surfaces.cardRadius).strokeBorder(model.accent, lineWidth: 2)
                             }
+                        }
+                        // infinite scroll: load next page as the last card appears
+                        .onAppear {
+                            if p.id == visible.last?.id { Task { await store.loadPage() } }
                         }
                 }
             }
-            Color.clear.frame(height: 1)
-                .onAppear { Task { await store.loadPage() } }
             if store.loading { ProgressView().padding() }
         }
-        .task { await store.ensure() }
+        // Same period logic as Downloads: the Today/Week/Month/Year blocks set
+        // model.period → reload Best Sellers for that period (the store key includes
+        // period, so a new period = a fresh fetch).
+        .task(id: model.period) { store.period = model.period; await store.ensure() }
         .popupHost(item: $popup) { p in
             PhotoPopup(assetID: p.asset_id, thumb: p.thumb_url, byStock: p.by_stock ?? [:],
                        onClose: { popup = nil }).environment(model)
@@ -67,24 +73,16 @@ struct BestSellersView: View {
 
     private var controls: some View {
         HStack(spacing: 8) {
-            ForEach(["Earnings", "Sales"], id: \.self) { label in
-                let isOn = (label == "Sales") == (store.sort == "count")
-                Button {
-                    let newSort = (label == "Sales") ? "count" : "earnings"
-                    if store.sort == newSort { sortAsc.toggle() }          // repeat click → toggle dir
-                    else { store.sort = newSort; sortAsc = false }
+            SortSegmented(
+                options: ["Earnings", "Sales"],
+                selected: store.sort == "count" ? "Sales" : "Earnings",
+                asc: sortAsc,
+                onSelect: { sel in
+                    store.sort = (sel == "Sales") ? "count" : "earnings"; sortAsc = false
                     Task { await store.ensure() }
-                } label: {
-                    HStack(spacing: 3) {
-                        Text(label)
-                        if isOn { Image(systemName: sortAsc ? "arrow.up" : "arrow.down").font(.system(size: 9)) }
-                    }
-                    .font(.system(size: 12, weight: .semibold))
-                    .padding(.horizontal, 12).padding(.vertical, 5)
-                    .foregroundStyle(isOn ? .white : Theme.t2)
-                }
-                .buttonStyle(.plain).glassPill(active: isOn)
-            }
+                },
+                onToggleDir: { sortAsc.toggle(); Task { await store.ensure() } })
+                .offset(x: model.surfaces.pillOffsetX, y: model.surfaces.pillOffsetY)
             Divider().frame(height: 18)
             SlidingPills(options: model.stockList, selected: store.stock) { s in
                 store.stock = s; Task { await store.ensure() }
@@ -97,7 +95,7 @@ struct BestSellersView: View {
             }
             .buttonStyle(.plain).glassPill(active: ungrouped)
             if pendingMatch != nil || !matchMsg.isEmpty {
-                Text(matchMsg).font(.system(size: 11)).foregroundStyle(Theme.accent)
+                Text(matchMsg).font(.system(size: 11)).foregroundStyle(model.accent)
             }
             Spacer()
             TextField("Search ID…", text: Binding(
@@ -107,9 +105,10 @@ struct BestSellersView: View {
                 .onSubmit { Task { await store.reloadCurrent() } }
         }
         .padding(10)
-        .glassCard(16)
+        .glassCard()
         .frame(height: panelH)
     }
+
 }
 
 struct TopPhotoCard: View {
@@ -120,27 +119,38 @@ struct TopPhotoCard: View {
     private var groupLabel: String? { model.groups(for: photo.asset_id).first }
 
     var body: some View {
+        let s = model.surfaces
+        let w = s.size("cardW", 168)
+        let imgH = s.size("cardImgH", 112)
         VStack(alignment: .leading, spacing: 0) {
             ZStack(alignment: .topLeading) {
                 CachedThumb(assetID: photo.asset_id, fallback: photo.thumb_url)
-                    .frame(width: 168, height: 112).clipped()
+                    .frame(width: w, height: imgH).clipped()
                 WeightBars(byStock: photo.by_stock)
-                    .frame(width: 168, height: 112)
+                    .frame(width: w, height: imgH)
             }
             VStack(alignment: .leading, spacing: 1) {
                 Text(byCount ? "\(photo.count) sales" : photo.total.money)
                     .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(model.t1)
+                    .contentTransition(.numericText())
                 Text(byCount ? photo.total.money : "↓\(photo.count)")
-                    .font(.system(size: 10)).foregroundStyle(Theme.t2)
+                    .font(.system(size: 10)).foregroundStyle(model.t2)
+                    .contentTransition(.numericText())
                 if let g = groupLabel {
-                    Text("📁 \(g)").font(.system(size: 8)).foregroundStyle(Theme.t3).lineLimit(1)
+                    Text("📁 \(g)").font(.system(size: 8)).foregroundStyle(model.t3).lineLimit(1)
                 }
             }
             .padding(.horizontal, 9).padding(.top, 7).padding(.bottom, 9)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .surfaceMat(s.mat(.cardInfoBg, isDark: model.isDark),
+                        interactive: false, radius: s.cardInfoRadius)
         }
-        .frame(width: 168)
-        .clipShape(RoundedRectangle(cornerRadius: 14))
-        .cardSurface(14)
+        .frame(width: w)
+        .clipShape(RoundedRectangle(cornerRadius: s.cardRadius))
+        .cardSurface()
+        .scrollTransition { content, phase in
+            content.opacity(phase.isIdentity ? 1 : 0.0).scaleEffect(phase.isIdentity ? 1 : 0.94)
+        }
     }
 }

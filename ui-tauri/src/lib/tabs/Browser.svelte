@@ -20,7 +20,7 @@
   let inspectorLogs    = $state(/** @type {string[]} */ ([]));
   let inspectorEs      = $state(/** @type {EventSource|null} */ (null));
 
-  const STOCKS = ['Adobe Stock', 'Shutterstock', 'Getty Images', 'Depositphotos', 'Envato'];
+  const STOCKS = ['Adobe Stock', 'Shutterstock', 'Getty Images', 'Depositphotos', 'Envato', 'Freepik'];
   const STOCK_COLORS = $derived($stockColors);
 
   let debugCopyMsg = $state('');
