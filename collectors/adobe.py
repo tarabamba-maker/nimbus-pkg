@@ -175,16 +175,26 @@ def _adobe_collect_direct():
     # For empty chunks in the post-first-sale window we DON'T mark them done →
     # they get re-checked next sync (cheap 1-request probe; protects against
     # API breakage that would otherwise silently lose history).
-    try:
-        with sqlite3.connect(DB_NAME, timeout=15) as _c:
-            _r = _c.execute(
-                "SELECT substr(MIN(date),1,10) FROM sales WHERE stock='Adobe Stock'"
-            ).fetchone()
-            _first_sale_str = _r[0] if _r and _r[0] else None
-        first_sale_d = (datetime.strptime(_first_sale_str, '%Y-%m-%d').date()
-                        if _first_sale_str else None)
-    except Exception:
-        first_sale_d = None
+    #
+    # ⚠️ CRITICAL: MIN(date) is only the TRUE first sale AFTER Pass 2 has walked
+    # the full 10 years at least once. On a COLD START Pass 1 only pulls the recent
+    # window, so MIN(date) is just that window's floor (e.g. 2025-06). Trusting it
+    # then made Pass 2 treat ALL older chunks as "pre-first-sale" and mark them done
+    # FOREVER — silently locking out years of history (the 73k→14.9k bug). So the
+    # guard is DISABLED until a full walk completes (sentinel `_adobe_full_walk`).
+    _full_walk_done = bool(all_proc.get("_adobe_full_walk"))
+    first_sale_d = None
+    if _full_walk_done:
+        try:
+            with sqlite3.connect(DB_NAME, timeout=15) as _c:
+                _r = _c.execute(
+                    "SELECT substr(MIN(date),1,10) FROM sales WHERE stock='Adobe Stock'"
+                ).fetchone()
+                _first_sale_str = _r[0] if _r and _r[0] else None
+            first_sale_d = (datetime.strptime(_first_sale_str, '%Y-%m-%d').date()
+                            if _first_sale_str else None)
+        except Exception:
+            first_sale_d = None
 
     def _months_in_range(start, end):
         months = set()
@@ -268,10 +278,103 @@ def _adobe_collect_direct():
                 with open(proc_file, "w") as f: json.dump(all_proc, f, indent=2)
             except Exception: pass
         chunk_end = chunk_start - timedelta(days=1)
+
+    # Pass 2 reached the 10-year cutoff WITHOUT being interrupted → the full history
+    # has now been walked once, so MIN(date) is the genuine first sale. Arm the
+    # first-sale guard for subsequent syncs (cheap probes only on real history).
+    if not _sync_stop_flag[0]:
+        all_proc["_adobe_full_walk"] = True
+        try:
+            with open(proc_file, "w") as f: json.dump(all_proc, f, indent=2)
+        except Exception: pass
         time.sleep(0.2)
 
     _sync_log(f"✅ Adobe direct ВСЬОГО: {total_saved + hist_saved}")
+
+    # Pass 3: missions / "other payments" → single synthetic "Adobe Missions" card.
+    try:
+        _adobe_collect_missions(_get_page)
+    except Exception as ex:
+        _sync_log(f"  ⚠️ Adobe missions: {ex}")
+
     return True
+
+
+# Synthetic asset that aggregates ALL Adobe mission/bonus payouts into one card.
+MISSIONS_ASSET_ID = "adobe-missions"
+MISSIONS_THUMB    = "/img/cache/adobe-missions"   # served from img_cache/adobe-missions.jpg
+
+
+def _seed_missions_thumb():
+    """Copy the bundled assets/adobe-missions.jpg into the image cache so the card's
+    /img/cache/adobe-missions resolves. Source is in the REPO (assets/), dest is the
+    runtime data dir's img_cache/."""
+    import shutil
+    repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = os.path.join(repo_dir, "assets", "adobe-missions.jpg")
+    cache_dir = os.path.join(_BASE_DIR, "img_cache")
+    dst = os.path.join(cache_dir, "adobe-missions.jpg")
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        if os.path.exists(src) and not os.path.exists(dst):
+            shutil.copy2(src, dst)
+    except Exception:
+        pass
+
+
+def _adobe_collect_missions(_get_page):
+    """Collect Adobe mission/bonus credits from /en/insights/other-payments.
+
+    Same envelope + 364-day-window rule as activity, but the data lives in
+    `insights.creditTransactions[]` = {creditTransactionId, creditTransactionTypeId,
+    amount, currencyCode, creation}. ALL transaction types (77/78/79…) are summed.
+    Each payout → one synthetic record under asset_id='adobe-missions' so the
+    group/best-seller fold collapses them into ONE 'Adobe Missions' card while
+    Analytics keeps the per-payout dates. Walks 10 years back in 360-day chunks;
+    dedup is exact (creation carries HH:MM:SS), so re-syncs add nothing new."""
+    _sync_log("🎖️ Adobe missions: старт...")
+    _seed_missions_thumb()
+
+    now = datetime.now()
+    chunk_end = now
+    cutoff    = now - timedelta(days=365 * 10)
+    saved = 0
+    while chunk_end > cutoff:
+        if _sync_stop_flag[0]: break
+        chunk_start = max(chunk_end - timedelta(days=359), cutoff)
+        s_str = chunk_start.strftime("%Y-%m-%d")
+        e_str = chunk_end.strftime("%Y-%m-%d")
+        page = 1
+        while True:
+            if _sync_stop_flag[0]: break
+            ts = int(time.time() * 1000)
+            d = _get_page(f"/en/insights/other-payments"
+                          f"?end_date={e_str}&start_date={s_str}&time_range=day"
+                          f"&limit=50&page={page}&timestamp={ts}&pv={ts}")
+            if "error" in d:
+                _sync_log(f"  ⚠️ missions {s_str}→{e_str} p{page}: {d['error']}")
+                break
+            txns = d.get("insights", {}).get("creditTransactions", []) or []
+            for t in txns:
+                amount = float(t.get("amount", 0) or 0)
+                if amount <= 0: continue
+                creation = str(t.get("creation", ""))[:19]   # "YYYY-MM-DD HH:MM:SS"
+                if not creation: continue
+                if is_already_saved("Adobe Stock", MISSIONS_ASSET_ID, amount, creation):
+                    continue
+                _save_record({
+                    "asset_id": MISSIONS_ASSET_ID, "photo_name": "Adobe Missions",
+                    "stock": "Adobe Stock", "price": amount,
+                    "thumb_url": MISSIONS_THUMB, "date": creation,
+                    "filename": "Adobe Missions"})
+                saved += 1
+            pag = d.get("view", {}).get("pagination", {})
+            if page >= pag.get("pages", 1): break
+            page += 1
+            time.sleep(0.1)
+        chunk_end = chunk_start - timedelta(days=1)
+
+    _sync_log(f"✅ Adobe missions: +{saved} зарахувань")
 
 
 def _adobe_api_collect_global(pw_page):

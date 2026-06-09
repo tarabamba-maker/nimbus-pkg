@@ -175,9 +175,20 @@ def _collect_one_stock_global(name, url, allow_login=False):
         except Exception as ex:
             _sync_log(f"[Microstock+] direct API exception: {ex} — fallback")
     if name == "Getty Images":
-        # Getty has the 21st-of-month gate (no point running before then)
+        # Getty has the 21st-of-month gate (statements publish ~21st). BUT only gate
+        # once we ALREADY have Getty data — on a cold start (no iStock rows yet) we
+        # must let it run so it pulls whatever statements are already available,
+        # rather than leaving Getty completely empty until the 21st.
         from datetime import date as _date_g
-        if _date_g.today().day < 21:
+        _has_getty = False
+        try:
+            with sqlite3.connect(DB_NAME, timeout=15) as _gc:
+                _has_getty = _gc.execute(
+                    "SELECT 1 FROM sales WHERE stock IN ('iStock','iStockphoto') LIMIT 1"
+                ).fetchone() is not None
+        except Exception:
+            pass
+        if _has_getty and _date_g.today().day < 21:
             _sync_log(f"📅 [Getty Images] skipped — available from the 21st (today {_date_g.today().day})")
             return
         try:
@@ -196,7 +207,15 @@ def _collect_one_stock_global(name, url, allow_login=False):
     if is_getty:
         from datetime import date as _date
         today = _date.today()
-        if today.day < 21:
+        _has_getty2 = False
+        try:
+            with sqlite3.connect(DB_NAME, timeout=15) as _gc2:
+                _has_getty2 = _gc2.execute(
+                    "SELECT 1 FROM sales WHERE stock IN ('iStock','iStockphoto') LIMIT 1"
+                ).fetchone() is not None
+        except Exception:
+            pass
+        if _has_getty2 and today.day < 21:
             _sync_log(f"📅 [{name}] skipped — available from the 21st (today is the {today.day}th)")
             return
         # Check if already synced this month cycle
@@ -251,8 +270,19 @@ def _collect_one_stock_global(name, url, allow_login=False):
             # For empty DB: trigger login flow for ALL stocks including MS+.
             # ms_library.json absence is the empty-state indicator for MS+.
             _ms_empty = not os.path.exists(MS_LIBRARY_FILE)
-            _should_login = (_db_is_empty and name != "Microstock+") or \
-                            (name == "Microstock+" and _ms_empty)
+            # Cold-start (empty DB) WOULD force a login for every stock — but if the
+            # user already logged in inside the in-app Chrome profile, the cookies are
+            # there and we must NOT skip. Consult the actual session (generic for all
+            # current + future stocks). Only force login when truly not logged in.
+            _logged_in = False
+            try:
+                from cookies import _stock_has_valid_session
+                _logged_in = _stock_has_valid_session(name)
+            except Exception:
+                pass
+            _needs_login = (_db_is_empty and name != "Microstock+") or \
+                           (name == "Microstock+" and _ms_empty)
+            _should_login = _needs_login and not _logged_in
             if _should_login and not allow_login:
                 _sync_log(f"[{name}] 🔒 не залогінено — натисни кнопку «{name}» щоб увійти (пропускаю у Sync All)")
                 return

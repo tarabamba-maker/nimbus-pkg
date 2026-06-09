@@ -107,30 +107,24 @@ def _shutterstock_api_collect_direct():
     from datetime import date as _date
     today = _date.today()
 
-    if _ss_count == 0:
-        scan_days = []
-        d = _date(2018, 1, 1)
-        while d <= today:
-            scan_days.append(d); d += timedelta(days=1)
-        scan_days = list(reversed(scan_days))
-        _sync_log(f"🔄 Shutterstock direct: повна історія 2018→сьогодні ({len(scan_days)} днів)")
-    else:
-        # Incremental: scan from MAX(date) in DB - 1 day to today.
-        # Using DB as source of truth — works correctly after any gap (1 day or 100 days).
-        try:
-            with sqlite3.connect(DB_NAME, timeout=15) as _c:
-                _r = _c.execute(
-                    "SELECT substr(MAX(date),1,10) FROM sales WHERE stock='Shutterstock'"
-                ).fetchone()
-                _ss_max = _r[0] if _r and _r[0] else None
-            _ss_from = _date.fromisoformat(_ss_max) - timedelta(days=1) if _ss_max else today - timedelta(days=30)
-        except Exception:
-            _ss_from = today - timedelta(days=30)
-        scan_days = []
-        d = today
-        while d >= _ss_from:
-            scan_days.append(d); d -= timedelta(days=1)
-        _sync_log(f"⏩ Shutterstock direct: від {_ss_from} ({len(scan_days)} днів)")
+    # Recent/forward scan: always from MAX(date)-1 .. today (or last 45 days if empty).
+    # Historical backfill is handled SEPARATELY below (resumable) so it can't be lost
+    # if the long walk gets DataDome-throttled. The old "count==0 → full 2018 walk in
+    # one shot" had no resume: a 403 abort left SS stuck on recent-only forever.
+    try:
+        with sqlite3.connect(DB_NAME, timeout=15) as _c:
+            _r = _c.execute(
+                "SELECT substr(MAX(date),1,10) FROM sales WHERE stock='Shutterstock'"
+            ).fetchone()
+            _ss_max = _r[0] if _r and _r[0] else None
+        _ss_from = _date.fromisoformat(_ss_max) - timedelta(days=1) if _ss_max else today - timedelta(days=45)
+    except Exception:
+        _ss_from = today - timedelta(days=45)
+    scan_days = []
+    d = today
+    while d >= _ss_from:
+        scan_days.append(d); d -= timedelta(days=1)
+    _sync_log(f"⏩ Shutterstock direct: recent від {_ss_from} ({len(scan_days)} днів)")
 
     agg_cache = {}
     def _day_cats(day):
@@ -143,16 +137,11 @@ def _shutterstock_api_collect_direct():
         return [cat for cat in SS_CATEGORIES
                 if isinstance(info.get(cat), dict) and info[cat].get("earnings", 0) > 0]
 
-    total_saved = 0
-    stop_early = False
-    consec_403 = 0
-    for scan_day in scan_days:
-        if stop_early or _sync_stop_flag[0]:
-            break
-        date_str = scan_day.isoformat()
-        active_cats = _day_cats(scan_day)
-        if not active_cats:
-            continue
+    # Per-day scanner shared by the recent scan AND the historical backfill.
+    # Returns (day_new, day_already, hit_403_streak). On a 3× consecutive 403 the
+    # caller must stop (DataDome blocked us) — but progress is already persisted by
+    # the backfill cursor, so the next sync resumes where we left off.
+    def _collect_day(date_str, active_cats, counter):
         day_new = 0; day_already = 0
         for cat in active_cats:
             page_n = 1
@@ -161,14 +150,13 @@ def _shutterstock_api_collect_direct():
                            f"?display_column={cat}&date={date_str}&page={page_n}&per_page=100")
                 if "error" in data:
                     if data['error'] == 403:
-                        consec_403 += 1
-                        if consec_403 >= 3:
-                            _sync_log("🛑 Shutterstock direct: 3× HTTP 403 — datadome cookie expired, fallback")
-                            return False
+                        counter[0] += 1
+                        if counter[0] >= 3:
+                            return day_new, day_already, True
                     else:
                         _sync_log(f"  ⚠️ {date_str}/{cat} p{page_n}: {data['error']}")
                     break
-                consec_403 = 0
+                counter[0] = 0
                 items = data.get("media", [])
                 if not items:
                     break
@@ -186,17 +174,97 @@ def _shutterstock_api_collect_direct():
                     if thumb:
                         load_img_async(asset_id, thumb, None, stock="Shutterstock")
                     _save_record(rec)
-                    day_new += 1; total_saved += 1
+                    day_new += 1
                 if page_n >= data.get("pages", 1): break
                 page_n += 1
                 time.sleep(0.1)   # gentle throttle, well below trigger
+        return day_new, day_already, False
+
+    total_saved = 0
+    stop_early = False
+    consec = [0]
+    for scan_day in scan_days:
+        if stop_early or _sync_stop_flag[0]:
+            break
+        date_str = scan_day.isoformat()
+        active_cats = _day_cats(scan_day)
+        if not active_cats:
+            continue
+        day_new, day_already, blocked = _collect_day(date_str, active_cats, consec)
+        total_saved += day_new
+        if blocked:
+            _sync_log("🛑 Shutterstock direct: 3× HTTP 403 — datadome cookie expired, fallback")
+            return False
         if day_new > 0 and total_saved % 200 < day_new:
             _sync_log(f"  📆 {date_str}: +{day_new} (total {total_saved})")
         if _ss_count > 0 and day_new == 0 and day_already > 0:
             _sync_log(f"  ✅ {date_str}: caught up — stop")
             stop_early = True
 
-    _sync_log(f"✅ Shutterstock direct API: {total_saved} нових записів")
+    _sync_log(f"✅ Shutterstock direct API recent: {total_saved} нових записів")
+
+    # ── Historical backfill (resumable across syncs) ──────────────────────────
+    # Walk BELOW the earliest collected day toward account start. SS exposes every
+    # month/year back to signup, but the long day-by-day walk gets DataDome-throttled,
+    # so we persist a cursor (recipes/_processed_dates.json) and resume next sync until
+    # the floor is reached. Without this, an interrupted cold-start left SS recent-only
+    # forever (the 3809-vs-36847 gap) because incremental mode only scans FORWARD.
+    SS_FLOOR = _date(2015, 1, 1)
+    proc_file = os.path.join(RECIPES_DIR, "_processed_dates.json")
+    try:
+        with open(proc_file) as f: _ss_proc = json.load(f)
+    except Exception:
+        _ss_proc = {}
+
+    def _save_proc():
+        try:
+            with open(proc_file, "w") as f: json.dump(_ss_proc, f, indent=2)
+        except Exception: pass
+
+    if not _ss_proc.get("Shutterstock_backfill_done"):
+        cur = _ss_proc.get("Shutterstock_backfill_cursor")
+        if cur:
+            bday = _date.fromisoformat(cur) - timedelta(days=1)
+        else:
+            try:
+                with sqlite3.connect(DB_NAME, timeout=15) as _c:
+                    _r = _c.execute(
+                        "SELECT substr(MIN(date),1,10) FROM sales WHERE stock='Shutterstock'"
+                    ).fetchone()
+                    _ss_min = _r[0] if _r and _r[0] else today.isoformat()
+            except Exception:
+                _ss_min = today.isoformat()
+            bday = _date.fromisoformat(_ss_min) - timedelta(days=1)
+        _sync_log(f"⏬ Shutterstock backfill: {bday} → {SS_FLOOR}")
+        bf_saved = 0
+        reached_floor = True
+        while bday >= SS_FLOOR:
+            if _sync_stop_flag[0]:
+                reached_floor = False; break
+            date_str = bday.isoformat()
+            active_cats = _day_cats(bday)
+            if active_cats:
+                day_new, _da, blocked = _collect_day(date_str, active_cats, consec)
+                bf_saved += day_new
+                if day_new > 0 and bf_saved % 200 < day_new:
+                    _sync_log(f"  ⏬ {date_str}: +{day_new} (backfill {bf_saved})")
+                if blocked:
+                    # Persist progress and bail — resume here next sync.
+                    _ss_proc["Shutterstock_backfill_cursor"] = bday.isoformat()
+                    _save_proc()
+                    _sync_log(f"🛑 SS backfill: 403 — paused at {date_str}, resume next sync (+{bf_saved})")
+                    return True
+            # Persist cursor once per month so a crash loses at most a month of probes.
+            if bday.day == 1:
+                _ss_proc["Shutterstock_backfill_cursor"] = bday.isoformat()
+                _save_proc()
+            bday -= timedelta(days=1)
+        if reached_floor:
+            _ss_proc["Shutterstock_backfill_done"] = True
+            _ss_proc["Shutterstock_backfill_cursor"] = SS_FLOOR.isoformat()
+            _save_proc()
+            _sync_log(f"✅ Shutterstock backfill complete (+{bf_saved})")
+
     return True
 
 

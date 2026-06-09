@@ -452,20 +452,15 @@ def _load_browser_cookies():
         cached = _load_pw_cookie_cache()
         if cached:
             return _latin1_safe_cookies(cached)
-        # 2) App Chrome profiles (works only if the keychain key happens to match)
+        # 2) App Chrome profiles (works only if the keychain key happens to match).
+        #    NO Safari fallback: the architecture is "open the in-app isolated Chrome
+        #    profile, log into each stock, close — the app reads cookies back from THAT
+        #    profile" (via the pw cache above). Safari isn't part of the login flow and
+        #    its container is sandbox-blocked anyway (Operation not permitted spam).
         chrome_cookies = _load_appprofile_cookies_mac()
         if chrome_cookies:
             return _latin1_safe_cookies(chrome_cookies)
-        # 3) Fall back to Safari
-        path = os.path.expanduser(
-            "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
-        if not os.path.exists(path):
-            return []
-        try:
-            return _latin1_safe_cookies(_parse_safari_binarycookies(path))
-        except Exception as e:
-            _app_log(f"⚠️ Safari cookies parse failed: {e}")
-            return []
+        return []
     if IS_WIN:
         return _latin1_safe_cookies(_load_appprofile_cookies_windows())
     return []
@@ -714,6 +709,14 @@ def _stock_has_valid_session(stock_name):
         cookies = _load_browser_cookies()
     except Exception:
         return False
+    # GENERIC session detection (works for every stock, including future ones):
+    # the in-app login profile is the source of truth. After you log into a tab,
+    # the site leaves live cookies on its domains. We trust those. A named marker
+    # (_STOCK_AUTH_COOKIE) is only a FAST positive — never a gate. The old code
+    # REQUIRED a specific marker name for Getty/Envato/Shutterstock/MS+, but those
+    # names are either HttpOnly or minted only on a page we never land on (Getty's
+    # `ccw` lives on esp.* but login lands on accountmanagement.*), so freshly
+    # logged-in stocks were reported "not logged in". Don't reintroduce that gate.
     markers = _STOCK_AUTH_COOKIE.get(stock_name) or []
     now = _t.time()
     domain_hits = 0
@@ -725,12 +728,12 @@ def _stock_has_valid_session(stock_name):
         # expires -1/0 = session cookie (valid while present); >0 must be in future.
         if isinstance(exp, (int, float)) and exp > 0 and exp < now:
             continue
-        domain_hits += 1
         if markers and c.get('name') in markers:
-            return True
-    # Marker stock but no marker found → not logged in. Otherwise any live cookie
-    # on the stock's domains counts as a session.
-    return False if markers else domain_hits > 0
+            return True          # fast positive
+        domain_hits += 1
+    # No marker (or marker is HttpOnly/on another subdomain) → any live cookie on
+    # the stock's domains means the user logged in inside the app profile.
+    return domain_hits > 0
 
 
 def _stock_profile_dir(stock_name):

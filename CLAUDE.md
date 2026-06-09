@@ -6,7 +6,7 @@ Desktop sales aggregator for photo stocks. Playwright logs into stock sites, col
 
 **Flet has been fully removed.** `main.py` is Flask-only (~5500 lines, modularization in progress). UI is `ui-tauri/` (SvelteKit + Tauri).
 
-**Current version: v0.9.54** (Mac + Windows, GitHub Actions CI builds both).
+**Current version: v0.9.55** (Mac + Windows, GitHub Actions CI builds both).
 **Native macOS SwiftUI app: `mac-native/` (see section below) — shares the Python backend.**
 **Windows port: COMPLETE** (v0.9.50 merged). Key Windows fixes:
 - UTF-8 stdout/stderr (emoji crash fix)
@@ -230,7 +230,16 @@ Flask backend (`Backend.swift` spawns `main.py` with `STOCK_DATA_DIR` =
 #### Critical state file: `recipes/_processed_dates.json` → `"Adobe Stock": ["YYYY-MM", ...]`
 - A chunk's months are marked done **ONLY when API returned >0 records** (`range_total > 0`).
 - Empty chunks are NOT marked → re-checked next sync. This is intentional: Adobe's API has been observed to temporarily return empty for chunks that genuinely had sales (historical breakage in 2024-2025 silently wiped ~9,500 rows / $8,400 from our DB before we detected it). One extra request per empty month per sync is a tiny price for never losing history again.
-- **First-sale guard:** chunks whose `chunk_end < MIN(date) FROM sales WHERE stock='Adobe Stock'` are marked done unconditionally (pre-activity months are guaranteed empty).
+- **First-sale guard (ARMED ONLY AFTER A FULL WALK — 2026-06-09 fix):** chunks whose
+  `chunk_end < MIN(date) FROM sales WHERE stock='Adobe Stock'` are marked done
+  unconditionally — BUT this is gated behind the `_adobe_full_walk` sentinel in
+  `_processed_dates.json`. On a COLD START Pass 1 pulls only the recent window, so
+  `MIN(date)` is just that window's floor (e.g. 2025-06), NOT the real first sale.
+  Trusting it then made Pass 2 mark ALL older chunks "pre-first-sale" → done forever →
+  silently locked out years of history (the **73k → 14.9k** data-loss bug). So
+  `first_sale_d = None` until Pass 2 reaches the 10-year cutoff uninterrupted once, which
+  sets `_adobe_full_walk=True`. To force a full re-walk: delete BOTH the `"Adobe Stock"`
+  key and `"_adobe_full_walk"` from `_processed_dates.json`.
 - To force a full re-walk: delete `"Adobe Stock"` key from `_processed_dates.json`.
 
 #### Endpoint variants — don't confuse them
@@ -263,9 +272,64 @@ Flask backend (`Backend.swift` spawns `main.py` with `STOCK_DATA_DIR` =
 ### ✅ Envato Elements
 - **DONE.** Earnings (monthly aggregate + per-item), clean portfolio thumbnails, pHash grouping. See "✅ Envato — DONE" section below.
 
+### ✅ Freepik (magnific.com) — DONE (2026-06-09, `collectors/freepik.py`)
+- Host `contributor.magnific.com`. Auth: **cookie session + header `x-requested-with:
+  XMLHttpRequest`, NO CSRF**. `user_id` from `/xhr/user`.
+- **Earnings** = `/xhr/stats/download?user_id=&month=MM&year=YYYY` → per-asset monthly
+  CSV (`Freepik Asset ID, Downloads, Earnings EUR, File name`). Per-asset data exists
+  **only from 2025-01** (all earlier months return empty). Stored as `stock="Freepik"`,
+  EUR→USD per-month at the invoice date (frankfurter/ECB, cached `recipes/_fx_eur_usd.json`).
+- **Clean thumbnails** = `/xhr/resource/published?limit=100&page=N` → `{id, imgPreview
+  (img.magnific.com, watermark-free), downloads (all-time), date}`. `load_img` 400×400 →
+  `asset_meta` dHash → groups via the layered display fold (no Pass E/F).
+- **pre-2025 estimate** (`_collect_pre_history`): Freepik has no per-asset data before
+  2025 — anchor to REAL aggregate monthly revenue `/xhr/stats?format=monthly` (back to
+  2021), split per-asset by all-time download weight, one record per (asset, year)
+  dated `YYYY-12-31`. `date < 2025-01` = the separable estimate stream. **Collect ONCE**
+  (skip if any Freepik `date<2025-01` row exists) — never re-walk like other stocks.
+- Gate: invoice validates 4–10th → collect a month only after the 10th; `recipes/
+  _freepik_months.json` marks done months (never refetched).
+
 ### ⏳ Pond5 / 123RF
 - Chrome profiles already created, need: inspect real page + write dedicated collector
-- (Depositphotos ✅ done, Envato ✅ done)
+- (Depositphotos ✅ done, Envato ✅ done, Freepik ✅ done)
+
+## ⏭️ NEXT SESSION — detailed tasks
+
+### 1. Remove Playwright-based COLLECTION → direct-API + on-demand login window (HIGH)
+User: "плейрайт механіки ВЗАГАЛІ не потрібно" / "Адоб після того як треба було б
+залогінитись фолбекає на плейрайт — плейрайт механіки ВЗАГАЛІ не потрібно".
+- The browser window must open **ONLY** for a manual login (session expired), exactly
+  like the Windows version. After login, ALL collection is direct API using the captured
+  decrypted cookies (`recipes/_pw_cookies.json` on Mac), never a Playwright page.
+- Target flow per stock: `_stock_has_valid_session()` → if OK, run direct-API collect;
+  if 401/needs-login → open the login window for THAT stock only → user logs in →
+  `_capture_pw_cookies` → retry direct API once.
+- Refactor lands in `orchestrator.py` (`_run_collector_global`, `_sync_all_global`) +
+  the collectors (drop the `pw_page` collect path; keep only `*_collect_direct`).
+- Verify on the INSTALLED app, log `~/Library/Application Support/StockAutomation/app.log`.
+
+### 2. DB re-sync recovery (USER ACTION, already understood)
+The dedup data-loss is fixed (see Architecture Invariants). User re-syncs from scratch:
+Settings → Full Reset → Sync All. Watch Adobe top-seller download counts match the real
+Adobe dashboard (the 6564 vs 1108 proof).
+
+### 3. Done this session (verify still green)
+- Freepik collector (2025+ real, pre-2025 estimate, collect-once).
+- Layered grouping fold at display (Pass E/F disabled, force-rebuild from scratch).
+- numpy-vectorised matching (~35s).
+- Downloads Cmd/Shift multi-select → batch add/create group (mac-native).
+
+### 4. FIXED (2026-06-09) — "Sync All: not logged in" false negatives
+After login to all windows, Sync All reported the 4 marker stocks (Getty, Envato,
+Shutterstock, MS+) as not logged in. Root cause: `_stock_has_valid_session()` GATED on a
+hardcoded cookie NAME per stock (`ccw`, `accts_contributor`, `koa.sid`, envato session) —
+but those are HttpOnly or minted only on a subdomain the login URL never lands on (Getty's
+`ccw` lives on `esp.*`, login lands on `accountmanagement.*`). Fix: the in-app isolated
+Chrome profile is the source of truth — marker name is now a FAST POSITIVE only, never a
+gate; any live cookie on the stock's domains = logged in. Generic for all current + future
+stocks. Also removed the dead Safari-cookies fallback from `_load_browser_cookies` (Mac)
+— it was never part of the login flow and spammed "Operation not permitted".
 
 ## General API collector pattern (Adobe / Shutterstock / Getty)
 
@@ -282,6 +346,34 @@ Flask backend (`Backend.swift` spawns `main.py` with `STOCK_DATA_DIR` =
 
 **Why fetch inside browser instead of requests.get():**
 DataDome and similar anti-bot systems block direct HTTP requests. Browser-internal fetch looks like a legitimate request.
+
+## 🔍 Inspector — how to use its logs (EVERY future session, READ THIS)
+
+When you need a stock's API endpoint (new stock, missions, any unknown XHR), DO NOT ask
+the user to copy/paste request details by hand. The **user runs the in-app Inspector**
+(Browser tab → Inspector → pick a stock → browses/logs in), and it **records EVERYTHING
+to disk**. You then dig through those files yourself — they already contain every request,
+header, body, and a full curl. Workflow:
+
+1. **Where the logs live:** `<STOCK_DATA_DIR>/inspector_logs/` (on Mac:
+   `~/Library/Application Support/StockAutomation/inspector_logs/`). Files:
+   - `<Stock>.log` / `Universal.log` — human-readable stream: for each captured request a
+     **full `curl '<url>' -X … -H …  --data-raw …`** line PLUS the response body when it
+     looks like data. This is usually all you need.
+   - `Universal_<timestamp>.har` — full HAR (every request/response). Grep/parse this when
+     the `.log` filtered something out.
+   - `Universal_cookies.json` — cookies captured during the session.
+2. **How to find the endpoint:** grep the `.log` (or `.har`) for the money words —
+   `_DATA_HINTS` in `routes/sync.py`: `earning|sale|download|amount|commission|revenue|
+   payout|statement|item_id|asset|media|price|balance`. The inspector already DROPS noise
+   hosts (`_NOISE_HOSTS`: analytics/datadog/sentry/etc.) and only dumps bodies that
+   `_looks_like_data()` (JSON starting with `{`/`[` containing a data hint).
+   Example: `grep -i payout ~/Library/Application\ Support/StockAutomation/inspector_logs/Universal.log`
+3. **Then:** lift the URL + required headers from the curl, replicate as a browser-internal
+   `fetch()` (see pattern above) or direct `requests` with captured cookies, and write the
+   collector. The `.log` curl IS the source of truth — don't guess endpoints.
+4. The user's job is only "run Inspector and browse the relevant page"; YOUR job is reading
+   `inspector_logs/` and extracting what you need. Don't make them transcribe.
 
 ## Photo groups & cross-stock matching
 
@@ -347,9 +439,29 @@ touching any of these areas.
 - Date normalization: 5 input formats supported. Stored as 19-char
   `"YYYY-MM-DD HH:MM:SS"`. `/api/feed` slices to 10-char for display.
 
-### Dedup — `is_already_saved` (main.py:276)
-- Two-pass: (1) exact 19-char datetime match for new records, (2) `substr(date,1,10)` + price ± 0.005 fallback for legacy rows. **DO NOT add `AND LENGTH(date)=10`** — historical bug that misclassified all 19-char rows as new, causing 6,241 dups (deleted 2026-05-19).
+### Dedup — `is_already_saved` (db.py) — REWORKED 2026-06-09 (was destroying data)
+- **TIMESTAMPED incoming sale (Adobe, has HH:MM:SS): EXACT 19-char match ONLY.**
+  Different sales of the same photo on the same day at the same price have different
+  timestamps → they are DISTINCT. The old code fell through to a `substr(date,1,10)`
+  + price±0.005 day-match that treated every extra same-day same-price sale as a dup
+  → dropped real Adobe subscription sales (a 6564-download top-seller collapsed to
+  ~1108). NEVER reinstate the day+price fallback for timestamped sales.
+- **DATE-ONLY incoming sale (SS / Depositphotos daily aggregates): day+price fallback**
+  is still used (those have no time component; this dedups re-synced aggregates).
+  Still **DO NOT add `AND LENGTH(date)=10`** (separate historical bug).
+- `/api/deduplicate` was even worse: `GROUP BY stock, asset_id, DATE(date)` kept ONE
+  row per (photo, day) regardless of price/count → mass data loss across ALL stocks.
+  Now `GROUP BY stock, asset_id, date, price` (true exact dups only). **If you ever
+  re-aggregate by day you will silently destroy real sales — don't.**
 - Index `idx_sales_dedup ON sales(stock, asset_id, date)` is required for performance.
+
+### pHash matching is numpy-vectorised (`matching_engine.py`, 2026-06-09)
+- `_hash_based_matches` packs `thumb_hash` into a `uint64` array and finds candidates
+  via `XOR + popcount` (256-entry LUT) + masked stock/aspect/RGB filters, instead of
+  the old O(n²) pure-Python pair loop. 35k asset_meta: ~5 min → ~35 s, SAME verdict
+  (deterministic). Pure-Python fallback kept if numpy is missing. Flask dev server is
+  single-threaded → a rebuild still blocks the backend for those ~35 s (GIL means
+  threads won't help CPU matching; further speedup = LSH/prefix bucketing, not GPU).
 
 ### Adobe Stock — Pass 1 / Pass 2 contract (main.py:559+)
 See `### ✅ Adobe Stock` section above. Key invariants:
@@ -388,6 +500,17 @@ See `### ✅ Adobe Stock` section above. Key invariants:
 - Headless mode requires `networkidle` + `add_init_script(_STEALTH_JS)`. Without them → `/unsupported-browser`.
 - Header `x-end-app-name: contributor-web` is mandatory.
 - Incremental dedup: last 30 days via DB MAX(date) check (saves ~92→30 daily requests). Cold-start: full 92 days.
+- **Resumable historical backfill (`collectors/shutterstock.py`, 2026-06-09).** SS exposes
+  every month/year back to signup (dashboard year picker → 2015), so all-time IS
+  collectable. The direct collector now does TWO phases: (1) a RECENT forward scan from
+  `MAX(date)-1` (or last 45d if empty), then (2) a BACKFILL walking BELOW `MIN(date)`
+  toward `SS_FLOOR=2015`, resumable via `_processed_dates.json` keys
+  `Shutterstock_backfill_cursor` / `Shutterstock_backfill_done`. A 3× consecutive 403
+  (DataDome) during backfill PERSISTS the cursor and returns True (NOT False — that would
+  fall back to Playwright and lose the cursor), so the next sync resumes. **The old bug:**
+  once any SS row existed, sync went incremental from `MAX(date)` FORWARD only and never
+  backfilled — an interrupted cold-start walk left SS recent-only forever (3809 vs 36847).
+  To force a full re-backfill: delete both backfill keys from `_processed_dates.json`.
 
 ### Getty / iStock (main.py:_getty_collect_direct + _getty_api_collect_global)
 - ESP profile is SEPARATE (`getty_profile/`), not `chrome_profile/`.
