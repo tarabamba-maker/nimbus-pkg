@@ -254,10 +254,11 @@ def _shutterstock_api_collect_direct():
                     _save_proc()
                     _sync_log(f"🛑 SS backfill: 403 — paused at {date_str}, resume next sync (+{bf_saved})")
                     return True
-            # Persist cursor once per month so a crash loses at most a month of probes.
-            if bday.day == 1:
-                _ss_proc["Shutterstock_backfill_cursor"] = bday.isoformat()
-                _save_proc()
+            # Persist the cursor EVERY day so closing the app mid-walk loses nothing
+            # — on restart we resume from exactly here and never re-collect below it.
+            # (tiny <1KB file; writes are spread across the per-day throttle sleep.)
+            _ss_proc["Shutterstock_backfill_cursor"] = bday.isoformat()
+            _save_proc()
             bday -= timedelta(days=1)
         if reached_floor:
             _ss_proc["Shutterstock_backfill_done"] = True
