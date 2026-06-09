@@ -127,14 +127,6 @@ from collectors.browser import _open_browser_context, _apply_stealth
 from sync_state import _sync_log, _app_log
 
 
-def _app_log(msg):
-    try:
-        from main import _app_log
-        _app_log(msg)
-    except Exception:
-        print(msg)
-
-
 def _is_chrome_running():
     """Returns True if Google Chrome is currently running (would lock cookies file).
     Cross-platform: pgrep on Unix, tasklist on Windows."""

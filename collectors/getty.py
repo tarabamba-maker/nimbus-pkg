@@ -36,7 +36,6 @@ def _getty_collect_direct():
     /Reports/Export HTML, then POSTs to /Reports/Export per month period
     to download TSV statements. Returns True on success."""
     from image_utils import load_img_async
-    from main import _app_log
 
     _sync_log("🚀 Getty direct: старт...")
 
@@ -350,7 +349,6 @@ def _getty_collect_direct():
 def _getty_api_collect_global(pw_page, force=False):
     """Збирає Getty/iStock через ESP stats API + завантажує TSV виписки."""
     from image_utils import load_img_async
-    from main import _app_log
 
     from datetime import date as _date
     proc_file = os.path.join(RECIPES_DIR, "_processed_dates.json")
