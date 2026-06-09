@@ -1,9 +1,15 @@
 import SwiftUI
+import AppKit
+
+private struct MultiSel: Identifiable { let id = UUID() }
 
 struct DownloadsView: View {
     @Environment(AppModel.self) private var model
     @State private var popup: Sale?
     @State private var assign: AssignTarget?
+    @State private var selected: Set<String> = []   // multi-select asset_ids
+    @State private var lastIdx: Int?
+    @State private var multiAssign: MultiSel?
     private var cardW: CGFloat { model.surfaces.size("cardW", 168) }
     private var cols: [GridItem] { [GridItem(.adaptive(minimum: cardW, maximum: cardW), spacing: model.surfaces.cardSpacing)] }
     private var panelH: CGFloat { model.surfaces.panelH }
@@ -15,9 +21,9 @@ struct DownloadsView: View {
             filters
         } content: {
             LazyVGrid(columns: cols, spacing: model.surfaces.cardSpacing) {
-                ForEach(store.items) { sale in
-                    SaleCard(sale: sale)
-                        .onTapGesture { popup = sale }
+                ForEach(Array(store.items.enumerated()), id: \.element.id) { i, sale in
+                    SaleCard(sale: sale, isSelected: selected.contains(sale.asset_id))
+                        .onTapGesture { handleTap(sale, index: i) }
                         .contextMenu {
                             Button("Open") { popup = sale }
                             Button("Add to group…") { assign = AssignTarget(id: sale.asset_id) }
@@ -33,12 +39,54 @@ struct DownloadsView: View {
             if store.loading { ProgressView().padding() }
         }
         .task(id: model.period) { await store.select(period: model.period, stock: model.downloadsStock) }
+        // Cmd/Shift multi-select action bar.
+        .overlay(alignment: .bottom) {
+            if !selected.isEmpty {
+                HStack(spacing: 10) {
+                    Text("\(selected.count) selected").font(.system(size: 12, weight: .semibold)).foregroundStyle(.white)
+                    Button { multiAssign = MultiSel() } label: {
+                        Label("Add to group", systemImage: "folder.badge.plus").font(.system(size: 12, weight: .semibold)).foregroundStyle(.white)
+                    }.buttonStyle(.pill(.primary))
+                    Button { selected = [] } label: {
+                        Label("Clear", systemImage: "xmark").font(.system(size: 12, weight: .semibold)).foregroundStyle(.white)
+                    }.buttonStyle(.pill(.neutral))
+                }
+                .padding(.horizontal, 14).padding(.vertical, 9)
+                .glassCard()
+                .padding(.bottom, 18)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.snappy, value: selected.isEmpty)
         .popupHost(item: $popup) { s in
             PhotoPopup(assetID: s.asset_id, thumb: s.thumb_url, byStock: s.by_stock ?? [:],
                        onClose: { popup = nil }).environment(model)
         }
         .popupHost(item: $assign) { t in
             GroupAssignPopup(assetID: t.id, onClose: { assign = nil }).environment(model)
+        }
+        .popupHost(item: $multiAssign) { _ in
+            MultiAssignPopup(assetIDs: Array(selected), onDone: { selected = []; multiAssign = nil }).environment(model)
+        }
+    }
+
+    /// Cmd+click toggles, Shift+click range-selects from last, plain click opens
+    /// the photo (or clears an active selection).
+    private func handleTap(_ sale: Sale, index: Int) {
+        let mods = NSEvent.modifierFlags
+        if mods.contains(.command) {
+            if selected.contains(sale.asset_id) { selected.remove(sale.asset_id) }
+            else { selected.insert(sale.asset_id) }
+            lastIdx = index
+        } else if mods.contains(.shift), let last = lastIdx {
+            let lo = min(last, index), hi = max(last, index)
+            for s in store.items[lo...hi] { selected.insert(s.asset_id) }
+            lastIdx = index
+        } else if !selected.isEmpty {
+            selected = []
+        } else {
+            popup = sale
+            lastIdx = index
         }
     }
 
@@ -102,6 +150,7 @@ struct DownloadsView: View {
 
 struct SaleCard: View {
     let sale: Sale
+    var isSelected: Bool = false
     @Environment(AppModel.self) private var model
 
     private var groupLabel: String? { model.groups(for: sale.asset_id).first }
@@ -154,8 +203,14 @@ struct SaleCard: View {
         .frame(width: w)
         .clipShape(RoundedRectangle(cornerRadius: s.cardRadius))
         .cardSurface()
+        // Multi-select highlight (Cmd/Shift+click).
+        .overlay {
+            if isSelected {
+                RoundedRectangle(cornerRadius: s.cardRadius).strokeBorder(model.accent, lineWidth: 3)
+            }
+        }
         // One-shot "pop" when a freshly-synced (blue) sale appears.
-        .scaleEffect(pulse ? 1.05 : 1.0)
+        .scaleEffect(pulse ? 1.05 : (isSelected ? 0.97 : 1.0))
         .onAppear {
             guard isNew else { return }
             withAnimation(.spring(response: 0.22, dampingFraction: 0.5)) { pulse = true }

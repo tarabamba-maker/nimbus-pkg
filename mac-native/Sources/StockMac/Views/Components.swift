@@ -213,6 +213,65 @@ struct GroupAssignPopup: View {
     }
 }
 
+/// Batch version: add MANY selected assets to a group / create a new group with
+/// them (Downloads Shift/Cmd multi-select).
+struct MultiAssignPopup: View {
+    let assetIDs: [String]
+    var onDone: () -> Void
+    @Environment(AppModel.self) private var model
+    @State private var search = ""
+    @State private var newGroup = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("\(assetIDs.count) selected").font(.system(size: 14, weight: .bold))
+                Spacer()
+                CloseButton { onDone() }
+            }
+            TextField("Search groups…", text: $search)
+                .textFieldStyle(.plain).fieldWell()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(filtered, id: \.self) { g in
+                        Button {
+                            Task { await model.addToGroup(g, assetIDs: assetIDs); onDone() }
+                        } label: {
+                            HStack {
+                                Image(systemName: "folder")
+                                Text(g).font(.system(size: 12)).lineLimit(1)
+                                Spacer()
+                                Text("+\(assetIDs.count)").font(.system(size: 10)).foregroundStyle(model.t3)
+                            }
+                            .padding(.vertical, 3)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .topFade()
+            HStack {
+                TextField("Create new group…", text: $newGroup)
+                    .textFieldStyle(.plain).fieldWell()
+                    .onSubmit { create() }
+                Button { create() } label: { Image(systemName: "plus") }
+                    .buttonStyle(.plain).padding(8).glassPill(active: true).focusEffectDisabled()
+            }
+        }
+        .padding(16)
+        .popupChrome(width: 360, height: 460)
+    }
+
+    private var filtered: [String] {
+        let all = model.allGroupNames
+        return search.isEmpty ? all : all.filter { $0.localizedCaseInsensitiveContains(search) }
+    }
+    private func create() {
+        let n = newGroup; newGroup = ""
+        Task { await model.createGroup(n, assetIDs: assetIDs); onDone() }
+    }
+}
+
 /// A scroll view whose content slides UNDER a floating frosted panel at the top,
 /// fading out as it goes behind the panel (the macOS toolbar look).
 struct PanelScroll<Panel: View, Content: View>: View {

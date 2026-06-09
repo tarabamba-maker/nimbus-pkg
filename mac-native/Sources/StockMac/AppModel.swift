@@ -128,6 +128,27 @@ final class AppModel {
         try? await API.savePhotoGroups(map)
     }
 
+    /// Batch: add many assets to an existing group (Downloads multi-select).
+    func addToGroup(_ group: String, assetIDs: [String]) async {
+        var map = photoGroups
+        var ids = map[group] ?? []
+        let have = Set(ids)
+        for a in assetIDs where !have.contains(a) { ids.append(a) }
+        map[group] = ids
+        photoGroups = map
+        try? await API.savePhotoGroups(map)
+    }
+
+    /// Batch: create a new group seeded with many assets.
+    func createGroup(_ name: String, assetIDs: [String]) async {
+        let n = name.trimmingCharacters(in: .whitespaces)
+        guard !n.isEmpty, photoGroups[n] == nil, !assetIDs.isEmpty else { return }
+        var map = photoGroups
+        map[n] = Array(Set(assetIDs))
+        photoGroups = map
+        try? await API.savePhotoGroups(map)
+    }
+
     func renameGroup(_ old: String, to new: String) async {
         _ = try? await API.renameGroup(old: old, new: new)
         await reloadGroups()
