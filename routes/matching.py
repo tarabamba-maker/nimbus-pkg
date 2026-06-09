@@ -258,11 +258,11 @@ def api_compute_ms_hashes():
 
 
 @matching_bp.route('/api/rebuild-matches', methods=['POST'])
-def api_rebuild_matches():
+def api_rebuild_matches(force=False):
     """Rebuild cross-stock matches + sync ms_library groups into photo_groups.json.
     POST {"force": true} wipes the incremental state + group snapshot so the whole
     catalog is re-clustered from scratch (the normal call early-exits 'cached' when
-    nothing changed)."""
+    nothing changed). Internal callers (rebuild-from-db) pass force=True directly."""
     lib      = load_ms_library()
     overrides = _load_overrides()
 
@@ -273,8 +273,8 @@ def api_rebuild_matches():
     # context) — guard the request access or it raises "Working outside of request
     # context" and the rebuild aborts (groups vanish).
     from flask import has_request_context
-    _force = False
-    if has_request_context():
+    _force = bool(force)
+    if not _force and has_request_context():
         _force = bool((request.get_json(force=True, silent=True) or {}).get('force'))
     if _force:
         for _f in (_state_file, _snapshot_file,

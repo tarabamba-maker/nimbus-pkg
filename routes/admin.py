@@ -307,7 +307,11 @@ def api_rebuild_from_db():
 
     try:
         from routes.matching import api_rebuild_matches
-        resp = api_rebuild_matches()
+        # force=True → wipes incremental state + snapshot + cross-stock matches and
+        # re-clusters the WHOLE catalog from scratch. Without it the rebuild would
+        # early-exit 'cached' and leave the just-deleted groups empty (the recurring
+        # "rebuild-from-db does nothing" bug).
+        resp = api_rebuild_matches(force=True)
         return jsonify({'status': 'ok', 'result': resp.get_json()})
     except Exception as e:
         return jsonify({'status': 'error', 'msg': str(e)}), 500
