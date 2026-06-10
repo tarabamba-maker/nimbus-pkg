@@ -103,6 +103,8 @@ export function notifySyncDone() {
   _dlMem = null; _lsClear(_DL_KEY);
   _bsMem = null; _lsClear(_BS_KEY);
   _groupsLoaded = false;
+  // Refresh photoGroups so group badges in BestSellers/Downloads show updated data.
+  loadPhotoGroups();
   syncTick.update(n => n + 1);
 }
 
