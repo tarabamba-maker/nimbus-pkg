@@ -242,7 +242,9 @@ def _hash_based_matches(existing_matches, threshold=4, incremental_from_rowid=No
                 ctx = _mp.get_context('spawn')
                 with ctx.Pool(nproc, initializer=_mp_init,
                               initargs=(H, AR, R, G, B, has_rgb, S, _POP, threshold, full)) as pool:
-                    results = pool.map(_mp_scan, chunks)
+                    # Hard timeout → fall back to single-core if the spawn pool wedges.
+                    results = pool.map_async(_mp_scan, chunks).get(timeout=120)
+                    pool.terminate()
                 all_pairs = [p for r in results for p in r]
                 all_pairs.sort()                      # (i, j) asc = single-proc order
                 for i, j in all_pairs:
@@ -415,46 +417,67 @@ def _ms_visual_matches(aid_to_group, strict_hamming=4, loose_hamming=8, loose_rg
     additions = {}
     aid_to_anchor = {}    # aid → matched MS+ photo's canonical id (for the display fold)
 
-    # ── Multi-core path: each unmatched sale is independent → fan across cores. ──
-    # Workers return (idx, aid, gname); the parent applies them in idx (original
-    # sales) order with the same aid-dedup guard → bit-identical to single-core.
-    ncpu = os.cpu_count() or 1
-    if ncpu > 1 and len(sales_rows) * max(1, len(ms_resolved)) >= 5_000_000:
-        try:
-            import multiprocessing as _mp
-            work = []
-            for stock, aid, ha, ara, ra, ga, ba in sales_rows:
-                aid = str(aid)
-                if aid in aid_to_group:
-                    continue
-                try:
-                    ha_int = int(ha, 16)
-                except Exception:
-                    continue
-                is_new_sale = (new_sale_aids is None) or (aid in new_sale_aids)
-                work.append((len(work), aid, ha_int, ara, ra, ga, ba, is_new_sale))
-            if work:
-                nproc = min(ncpu, 8)
-                nch = max(nproc, min(len(work), nproc * 4))
-                chunks = [work[k::nch] for k in range(nch)]
-                chunks = [c for c in chunks if c]
-                _sync_log(f"⚙️ MS+ visual matching: {nproc} ядер, {len(work)}×{len(ms_resolved)}…")
-                with _mp.get_context('spawn').Pool(
-                        nproc, initializer=_msv_init,
-                        initargs=(ms_resolved, strict_hamming, loose_hamming, loose_rgb_max)) as pool:
-                    results = pool.map(_msv_scan, chunks)
-                merged = [t for r in results for t in r]
-                merged.sort()                          # by idx → original sales order
-                for _idx, aid, gn, anc in merged:
-                    if aid in aid_to_group:             # first (lowest idx) wins, like single-core
-                        continue
-                    additions.setdefault(gn, []).append(aid)
-                    aid_to_group[aid] = gn
-                    if anc: aid_to_anchor[aid] = anc
-            return additions, aid_to_anchor
-        except Exception as ex:
-            _sync_log(f"⚠️ MS+ visual multi-core failed ({ex}) — single-core fallback")
+    # ── numpy-vectorised single-core path ────────────────────────────────────
+    # For each sales photo, popcount(MS_hashes XOR sale) + RGB/aspect masks in one
+    # vectorised pass over all ms_meta. ~seconds on 33k×15k. NO multiprocessing here:
+    # a SECOND spawn Pool (after Pass A's) deadlocked inside the app-launched Flask
+    # server (workers wedged at 0% CPU forever). numpy keeps it fast AND reliable.
+    try:
+        import numpy as np
+        _have_np = True
+    except Exception:
+        _have_np = False
 
+    if _have_np and ms_resolved:
+        m = len(ms_resolved)
+        MH = np.zeros(m, dtype=np.uint64)
+        MAR = np.full(m, -1.0, dtype=np.float64)
+        MR = np.zeros(m, np.int64); MG = np.zeros(m, np.int64); MB = np.zeros(m, np.int64)
+        MNEW = np.zeros(m, bool); has_rgb_ms = np.zeros(m, bool)
+        MGN = [None] * m; MANC = [None] * m
+        for i, (gn, anc, h, hi, ar, r, g, b, is_new_ms) in enumerate(ms_resolved):
+            MH[i] = np.uint64(hi & 0xFFFFFFFFFFFFFFFF)
+            if ar: MAR[i] = float(ar)
+            if isinstance(r, int) and isinstance(g, int) and isinstance(b, int):
+                MR[i] = r; MG[i] = g; MB[i] = b; has_rgb_ms[i] = True
+            MNEW[i] = bool(is_new_ms); MGN[i] = gn; MANC[i] = anc
+        _POP = np.array([bin(x).count('1') for x in range(256)], dtype=np.uint8)
+        def _popc(arr): return _POP[arr.view(np.uint8).reshape(-1, 8)].sum(axis=1)
+        _sync_log(f"⚙️ MS+ visual matching (numpy): {len(sales_rows)}×{m}…")
+        for stock, aid, ha, ara, ra, ga, ba in sales_rows:
+            aid = str(aid)
+            if aid in aid_to_group:
+                continue
+            is_new_sale = (new_sale_aids is None) or (aid in new_sale_aids)
+            try:
+                ha_int = int(ha, 16)
+            except Exception:
+                continue
+            pop = _popc(MH ^ np.uint64(ha_int & 0xFFFFFFFFFFFFFFFF))
+            cand = pop <= loose_hamming
+            if not is_new_sale:
+                cand &= MNEW                       # incremental: ≥1 side new
+            if ara:
+                cand &= ((MAR < 0) | (np.abs(MAR - ara) <= 0.15))
+            if isinstance(ra, int) and isinstance(ga, int) and isinstance(ba, int):
+                rgb = np.abs(MR - ra) + np.abs(MG - ga) + np.abs(MB - ba)
+                strict_ok = (pop <= strict_hamming) & ((~has_rgb_ms) | (rgb <= 30))
+                loose_ok  = (pop > strict_hamming) & has_rgb_ms & (rgb <= loose_rgb_max)
+            else:
+                strict_ok = (pop <= strict_hamming)   # no sale RGB → strict on hamming only
+                loose_ok  = np.zeros(m, bool)          # loose needs RGB → reject
+            cand &= (strict_ok | loose_ok)
+            if not cand.any():
+                continue
+            idxs = np.nonzero(cand)[0]
+            j = int(idxs[np.argmin(pop[idxs])])        # best = min hamming (first on tie)
+            additions.setdefault(MGN[j], []).append(aid)
+            aid_to_group[aid] = MGN[j]
+            if MANC[j]:
+                aid_to_anchor[aid] = MANC[j]
+        return additions, aid_to_anchor
+
+    # ── pure-Python fallback (numpy unavailable) ──
     for stock, aid, ha, ara, ra, ga, ba in sales_rows:
         aid = str(aid)
         if aid in aid_to_group:
