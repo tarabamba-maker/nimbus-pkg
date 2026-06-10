@@ -443,8 +443,56 @@ def api_rebuild_matches(force=False):
     # ms_library shoot membership only. Same reason Pass F's append is gated.
     auto_added = 0
 
-    # ── Pass F: MS+ visual matching (DISABLED — folds at display, see above) ──
+    # ── Pass F: MS+ visual matching → DISPLAY FOLD (cross_stock_matches) ─────
+    # Photos sold ONLY on Envato/Freepik/Deposit (no Adobe/SS/iStock counterpart in
+    # asset_meta) can't link to their MS+ shoot via Pass A (pHash between sales
+    # photos). Pass F matches each sales photo against the MS+ reference thumbnails
+    # (ms_meta → ms_library group), then links the matched asset_id to that group's
+    # primary stockid IN _cross_stock_matches — so it folds into the group at DISPLAY
+    # (api_groups_get), WITHOUT writing into photo_groups (which stays MS+-authoritative).
+    #
+    # ⚠️ STRICT TIER ONLY (loose_hamming == strict_hamming): the loose tier is what
+    # historically bloated a group 339→3495 by dragging wrong shoots in. Strict
+    # (hamming ≤ 4 AND RGB ≤ 30) = effectively "the same photo", so cross-stock fold
+    # stays clean. Do NOT widen loose_hamming here.
     ms_added = 0
+    try:
+        _aid_to_grp_f = {m: k for k, members in groups.items() for m in members}
+        ms_visual, aid_to_anchor = _ms_visual_matches(
+            _aid_to_grp_f,
+            strict_hamming=4, loose_hamming=4, loose_rgb_max=20,
+            last_asset_meta_rowid=(None if _force else _last_am_rowid),
+            last_ms_meta_rowid=(None if _force else _last_mm_rowid))
+
+        # Link each visually-matched sales photo to the SPECIFIC MS+ photo it matched
+        # (its anchor id) in _cross_stock_matches → folds onto the correct card with
+        # correct earnings. Union-find merge so existing clusters stay intact.
+        aid_to_key_f = {m: k for k, members in matches.items() for m in members}
+        for aid, anchor in (aid_to_anchor or {}).items():
+            aid = str(aid); anchor = str(anchor)
+            if not anchor:
+                continue
+            ka = aid_to_key_f.get(aid)
+            kb = aid_to_key_f.get(anchor, anchor)
+            if ka == kb:
+                continue
+            if ka:                                   # merge aid's cluster into anchor's
+                merged = sorted(set(matches.get(kb, [kb])) | set(matches.get(ka, [ka])) | {anchor})
+                matches[kb] = merged
+                for m in matches.get(ka, []):
+                    aid_to_key_f[m] = kb
+                matches.pop(ka, None)
+            else:
+                cluster = sorted(set(matches.get(kb, [kb])) | {anchor, aid})
+                matches[kb] = cluster
+            aid_to_key_f[aid] = kb
+            aid_to_key_f[anchor] = kb
+            ms_added += 1
+        if ms_added:
+            _save_matches(matches)
+    except Exception as _exF:
+        _sync_log(f"⚠️ Pass F (MS+ visual) error: {_exF}")
+        ms_added = 0
 
     # ── Pass G: dedup ────────────────────────────────────────────────────
     for gname in list(groups.keys()):

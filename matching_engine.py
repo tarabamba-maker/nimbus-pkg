@@ -93,7 +93,7 @@ def _msv_scan(chunk):
     out = []
     for idx, aid, ha_int, ara, ra, ga, ba, is_new_sale in chunk:
         best = None
-        for gn, hb, hb_int, arb, rb, gb, bb, is_new_ms in ms:
+        for gn, anc, hb, hb_int, arb, rb, gb, bb, is_new_ms in ms:
             # Incremental: skip pairs where BOTH sides are old (already evaluated).
             if not is_new_sale and not is_new_ms:
                 continue
@@ -114,11 +114,11 @@ def _msv_scan(chunk):
                 if rgb_dist is None or rgb_dist > lrgb:
                     continue
             if best is None or d < best[0]:
-                best = (d, gn)
+                best = (d, gn, anc)
                 if d == 0:
                     break
         if best:
-            out.append((idx, aid, best[1]))
+            out.append((idx, aid, best[1], best[2]))
     return out
 
 
@@ -341,21 +341,32 @@ def _ms_visual_matches(aid_to_group, strict_hamming=4, loose_hamming=8, loose_rg
     # NEW: build basepath-based lookup. Disk filenames are derived from basepath
     # as "/A/B/file" → "A__B__file.jpg", so we map back the same way. Falls back
     # to filename for legacy disk entries from older builds.
+    # `*_to_anchor`: the MS+ photo's canonical id (its first stockid). This is NOT
+    # stockid-based MATCHING (matching is 100% pHash+RGB below) — it's only the join
+    # key the visual match folds onto, so each photo lands on the CORRECT card.
+    def _anchor_of(stockids):
+        vals = [str(v) for v in (stockids or {}).values() if v]
+        return vals[0] if vals else ''
     bp_to_group = {}
     fname_to_group = {}  # legacy fallback
     bp_to_disk = {}      # basepath → expected disk base name (no .jpg)
+    bp_to_anchor = {}
+    fname_to_anchor = {}
     for p in lib:
         bp = (p.get('basepath') or '').strip()
         fn = (p.get('filename') or '').strip()
         gn = (p.get('group') or '').strip()
+        anc = _anchor_of(p.get('stockids'))
         if bp and gn:
             bp_to_group[bp] = gn
             disk_base = bp.lstrip("/").replace("/", "__").replace("\\", "__")
             bp_to_disk[disk_base] = bp
+            if anc: bp_to_anchor[bp] = anc
         if fn and gn:
             fname_to_group[fn] = gn
+            if anc: fname_to_anchor[fn] = anc
     if not bp_to_group and not fname_to_group:
-        return {}
+        return {}, {}
 
     lib_filenames = set(fname_to_group.keys())
 
@@ -381,25 +392,28 @@ def _ms_visual_matches(aid_to_group, strict_hamming=4, loose_hamming=8, loose_rg
     ms_rows    = [(fn, h, ar, r, g, b)    for _rid, fn, h, ar, r, g, b in ms_rows]
 
     if not ms_rows:
-        return {}
+        return {}, {}
 
-    # Resolve each disk fname → group. First try basepath-derived disk name
-    # (new format), fall back to legacy filename lookup.
+    # Resolve each disk fname → group + the MS+ photo's anchor id. The anchor lets
+    # Pass F link a matched sales photo to the SPECIFIC MS+ photo it matched (so it
+    # folds onto the right card with the right earnings), not a per-group anchor.
     ms_resolved = []
     for fname, h, ar, r, g, b in ms_rows:
-        gn = None
+        gn = None; anc = ''
         if fname in bp_to_disk:
-            gn = bp_to_group.get(bp_to_disk[fname])
+            bp = bp_to_disk[fname]
+            gn = bp_to_group.get(bp); anc = bp_to_anchor.get(bp, '')
         if not gn:
             base = _ms_fname_to_libentry(fname, lib_filenames)
             if base:
-                gn = fname_to_group.get(base)
+                gn = fname_to_group.get(base); anc = fname_to_anchor.get(base, '')
         if not gn:
             continue
         is_new_ms = (new_ms_fnames is None) or (fname in new_ms_fnames)
-        ms_resolved.append((gn, h, int(h, 16), ar, r, g, b, is_new_ms))
+        ms_resolved.append((gn, anc, h, int(h, 16), ar, r, g, b, is_new_ms))
 
     additions = {}
+    aid_to_anchor = {}    # aid → matched MS+ photo's canonical id (for the display fold)
 
     # ── Multi-core path: each unmatched sale is independent → fan across cores. ──
     # Workers return (idx, aid, gname); the parent applies them in idx (original
@@ -431,12 +445,13 @@ def _ms_visual_matches(aid_to_group, strict_hamming=4, loose_hamming=8, loose_rg
                     results = pool.map(_msv_scan, chunks)
                 merged = [t for r in results for t in r]
                 merged.sort()                          # by idx → original sales order
-                for _idx, aid, gn in merged:
+                for _idx, aid, gn, anc in merged:
                     if aid in aid_to_group:             # first (lowest idx) wins, like single-core
                         continue
                     additions.setdefault(gn, []).append(aid)
                     aid_to_group[aid] = gn
-            return additions
+                    if anc: aid_to_anchor[aid] = anc
+            return additions, aid_to_anchor
         except Exception as ex:
             _sync_log(f"⚠️ MS+ visual multi-core failed ({ex}) — single-core fallback")
 
@@ -449,8 +464,8 @@ def _ms_visual_matches(aid_to_group, strict_hamming=4, loose_hamming=8, loose_rg
             ha_int = int(ha, 16)
         except Exception:
             continue
-        best = None  # (hamming, gname)
-        for gn, hb, hb_int, arb, rb, gb, bb, is_new_ms in ms_resolved:
+        best = None  # (hamming, gname, anchor)
+        for gn, anc, hb, hb_int, arb, rb, gb, bb, is_new_ms in ms_resolved:
             # Incremental: skip if BOTH sides are old (already evaluated in
             # a previous rebuild — same hashes + same thresholds → same verdict).
             if not is_new_sale and not is_new_ms:
@@ -479,14 +494,14 @@ def _ms_visual_matches(aid_to_group, strict_hamming=4, loose_hamming=8, loose_rg
                 if rgb_dist is None or rgb_dist > loose_rgb_max:
                     continue
             if best is None or d < best[0]:
-                best = (d, gn)
+                best = (d, gn, anc)
                 if d == 0:
                     break  # perfect match, no need to keep looking
         if best:
-            gn = best[1]
-            additions.setdefault(gn, []).append(aid)
-            aid_to_group[aid] = gn
-    return additions
+            additions.setdefault(best[1], []).append(aid)
+            aid_to_group[aid] = best[1]
+            if best[2]: aid_to_anchor[aid] = best[2]
+    return additions, aid_to_anchor
 
 
 def _filename_fallback_matches(matches, lib, threshold_hamming=4, threshold_rgb=30):
