@@ -337,34 +337,14 @@ def api_group_photos():
 
 @groups_bp.route('/api/photo-groups', methods=['GET'])
 def api_photo_groups_get():
-    """Returns merged groups: ms_library auto-groups + user photo_groups.json,
-    expanded to include all cross-stock siblings so Envato/Freepik/iStock cards
-    show the correct group badge in BestSellers and Downloads."""
+    """Returns photo_groups.json expanded with all pHash cross-stock siblings,
+    so group badges appear for Envato/Freepik/iStock/Getty cards in BestSellers/Downloads."""
     result: dict = {}
 
-    lib = load_ms_library()
-    for photo in lib:
-        gname = photo.get('group', '').strip()
-        if not gname:
-            continue
-        if gname not in result:
-            result[gname] = []
-        for k, v in photo.get('stockids', {}).items():
-            if k in _RELEVANT_STOCKS and v:
-                sid = str(v)
-                if sid not in result[gname]:
-                    result[gname].append(sid)
-
     for gname, aids in load_groups().items():
-        if gname not in result:
-            result[gname] = []
-        for aid in aids:
-            sid = str(aid)
-            if sid not in result[gname]:
-                result[gname].append(sid)
+        result[gname] = [str(a) for a in aids]
 
-    # Expand every group to include cross-stock siblings (Envato/Freepik/iStock etc.)
-    # so badge lookup in BestSellers/Downloads works for non-primary asset IDs.
+    # Expand to cross-stock siblings so non-primary asset_ids find their group.
     _matches = _load_matches()
     sib_of: dict = {}
     for _prim, _members in _matches.items():

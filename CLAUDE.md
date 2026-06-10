@@ -414,7 +414,7 @@ If you add a stock and groups bloat/mix, you re-introduced a write into photo_gr
 
 - `photo_groups.json` — user-managed groups. Stores **only ONE primary stockid per photo** (no siblings — that would cause duplicates in the UI).
 - `ms_library.json` — 14 000+ photos with `{filename, group, stockids: {adobestock, shutterstock, istock, esp, ...}}` — source of truth for cross-stock links.
-- `_cross_stock_matches.json` — maps `primary_id → [primary_id, sibling_id, ...]`, rebuilt from ms_library stockids. Used by `/api/best-sellers` and `/api/photo-groups` to aggregate earnings across sibling IDs.
+- `_cross_stock_matches.json` — maps `primary_id → [primary_id, sibling_id, ...]`, rebuilt by pHash+RGB matching only. Used by `/api/photo-groups` (expanded to siblings) and `api_groups_get` to aggregate earnings across sibling IDs.
 - **Rebuild flow** (`/api/rebuild-matches`): reads ms_library.json → groups photos by `group` field → for each photo picks ONE primary_id (adobestock > shutterstock > istock > esp) → writes to photo_groups.json.
 - **Dedup**: `api_rebuild_matches` has a dedup pass; `api_groups_get` tracks a `represented` set to skip siblings already covered by their primary.
 
@@ -544,7 +544,7 @@ See `### ✅ Adobe Stock` section above. Key invariants:
 ### rebuild-matches (main.py:5044, `api_rebuild_matches`)
 Pass ordering and incremental contracts (v0.9.37):
 - **Pass A (pHash clustering)** — incremental via `last_asset_meta_rowid` cursor in `recipes/_matches_state.json`. Old × old pairs skipped (hashes are immutable, threshold constants).
-- **Pass B (ms_library stockids)** — skipped when `ms_library` content fingerprint (sha1 of all `(basepath, group, sorted stockids)`) is unchanged.
+- **Pass B (ms_library stockids) — REMOVED.** Cross-stock matching is pHash+RGB only (Pass A + Pass F). ms_library stockids are no longer used for clustering.
 - **Pass D (MS+ groups → photo_groups) — SNAPSHOT DIFF.** `recipes/_ms_group_snapshot.json` stores `{primary_id: ms_group_name}` from last successful rebuild. Next rebuild computes `diff_added` and `diff_moved`. **Unchanged primaries are not touched — this is how user UI moves survive across rebuilds.**
 - **Pass F (MS+ visual matching)** — incremental with BOTH cursors (`last_asset_meta_rowid` + `last_ms_meta_rowid`). Pairs where both rows are old → skip (60M → ~10k comparisons typical).
 - **Full early-exit** at start: if asset_meta + ms_meta + ms_library fingerprint all unchanged → return cached counts immediately (no work).

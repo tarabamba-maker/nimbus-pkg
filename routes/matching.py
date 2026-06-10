@@ -333,30 +333,8 @@ def api_rebuild_matches(force=False):
         matches, hash_pairs, _new_am_rowid = _hash_based_matches(
             _load_matches(), incremental_from_rowid=_last_am_rowid)
 
-    # ── Pass B: ms_library stockids — skip when lib unchanged ────────────
-    aid_to_key = {m: k for k, members in matches.items() for m in members}
+    # Pass B (ms_library stockids clustering) removed — matching is pHash+RGB only.
     ms_added_pairs = 0
-    if not lib_unchanged or _last_lib_fp is None:
-        for photo in lib:
-            stockids = photo.get('stockids', {})
-            ids = [str(v) for k, v in stockids.items() if k in _RELEVANT_STOCKS and v]
-            if len(ids) < 2: continue
-            existing_keys = {aid_to_key[i] for i in ids if i in aid_to_key}
-            if existing_keys:
-                target = sorted(existing_keys)[0]
-                combined = set(matches.get(target, []))
-                for k in existing_keys - {target}:
-                    combined.update(matches.pop(k, []))
-                combined.update(ids)
-                matches[target] = sorted(combined)
-                for m in matches[target]:
-                    aid_to_key[m] = target
-            else:
-                primary = _pick_primary(stockids) or ids[0]
-                matches[primary] = sorted(set(ids))
-                for m in ids:
-                    aid_to_key[m] = primary
-                ms_added_pairs += len(ids) - 1
 
     # ── Pass C: filename fallback ────────────────────────────────────────
     matches, fn_pairs = _filename_fallback_matches(matches, lib)
