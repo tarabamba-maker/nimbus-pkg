@@ -1,11 +1,17 @@
 import SwiftUI
+import AppKit
+
+private struct MultiSel: Identifiable { let id = UUID() }
 
 struct BestSellersView: View {
     @Environment(AppModel.self) private var model
     @State private var assign: AssignTarget?
+    @State private var selected: Set<String> = []
+    @State private var lastIdx: Int?
+    @State private var multiAssign: MultiSel?
     @State private var ungrouped = false
     @State private var sortAsc = false
-    @State private var pendingMatch: String?     // asset_id awaiting a link target
+    @State private var pendingMatch: String?
     @State private var matchMsg = ""
     private var cardW: CGFloat { model.surfaces.size("cardW", 168) }
     private var cols: [GridItem] { [GridItem(.adaptive(minimum: cardW, maximum: cardW), spacing: model.surfaces.cardSpacing)] }
@@ -24,9 +30,10 @@ struct BestSellersView: View {
             controls
         } content: {
             LazyVGrid(columns: cols, spacing: model.surfaces.cardSpacing) {
-                ForEach(visible) { p in
-                    TopPhotoCard(photo: p, byCount: store.sort == "count")
-                        .onTapGesture { tap(p) }
+                ForEach(Array(visible.enumerated()), id: \.element.id) { i, p in
+                    TopPhotoCard(photo: p, byCount: store.sort == "count",
+                                 isSelected: selected.contains(p.asset_id))
+                        .onTapGesture { handleTap(p, index: i) }
                         .contextMenu {
                             Button("Open") { model.openPhoto(assetID: p.asset_id, thumb: p.thumb_url, byStock: p.by_stock ?? [:]) }
                             Button("Add to group…") { assign = AssignTarget(id: p.asset_id) }
@@ -37,7 +44,6 @@ struct BestSellersView: View {
                                 RoundedRectangle(cornerRadius: model.surfaces.cardRadius).strokeBorder(model.accent, lineWidth: 2)
                             }
                         }
-                        // infinite scroll: load next page as the last card appears
                         .onAppear {
                             if p.id == visible.last?.id { Task { await store.loadPage() } }
                         }
@@ -45,18 +51,49 @@ struct BestSellersView: View {
             }
             if store.loading { ProgressView().padding() }
         }
-        // Same period logic as Downloads: the Today/Week/Month/Year blocks set
-        // model.period → reload Best Sellers for that period (the store key includes
-        // period, so a new period = a fresh fetch).
         .task(id: model.period) { store.period = model.period; await store.ensure() }
         .onChange(of: model.syncTick) { _, _ in Task { await store.reloadCurrent() } }
+        // Multi-select action bar
+        .overlay(alignment: .bottom) {
+            if !selected.isEmpty {
+                HStack(spacing: 10) {
+                    Text("\(selected.count) selected").font(.system(size: 12, weight: .semibold)).foregroundStyle(.white)
+                    Button { multiAssign = MultiSel() } label: {
+                        Label("Add to group", systemImage: "folder.badge.plus").font(.system(size: 12, weight: .semibold)).foregroundStyle(.white)
+                    }.buttonStyle(.pill(.primary))
+                    Button { selected = [] } label: {
+                        Label("Clear", systemImage: "xmark").font(.system(size: 12, weight: .semibold)).foregroundStyle(.white)
+                    }.buttonStyle(.pill(.neutral))
+                }
+                .padding(.horizontal, 14).padding(.vertical, 9)
+                .glassCard()
+                .padding(.bottom, 18)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.snappy, value: selected.isEmpty)
         .popupHost(item: $assign) { t in
             GroupAssignPopup(assetID: t.id, onClose: { assign = nil }).environment(model)
         }
+        .popupHost(item: $multiAssign) { _ in
+            MultiAssignPopup(assetIDs: Array(selected), onDone: { selected = []; multiAssign = nil }).environment(model)
+        }
     }
 
-    private func tap(_ p: TopPhoto) {
-        if let primary = pendingMatch, primary != p.asset_id {
+    /// Cmd+click toggles, Shift+click range-selects, plain click opens (or clears selection).
+    private func handleTap(_ p: TopPhoto, index: Int) {
+        let mods = NSEvent.modifierFlags
+        if mods.contains(.command) {
+            if selected.contains(p.asset_id) { selected.remove(p.asset_id) }
+            else { selected.insert(p.asset_id) }
+            lastIdx = index
+        } else if mods.contains(.shift), let last = lastIdx {
+            let lo = min(last, index), hi = max(last, index)
+            for item in visible[lo...hi] { selected.insert(item.asset_id) }
+            lastIdx = index
+        } else if !selected.isEmpty {
+            selected = []
+        } else if let primary = pendingMatch, primary != p.asset_id {
             Task {
                 _ = try? await API.matchOverride(action: "link", primary: primary, assetID: p.asset_id)
                 matchMsg = "Linked ✓"; pendingMatch = nil
@@ -64,6 +101,7 @@ struct BestSellersView: View {
             }
         } else {
             model.openPhoto(assetID: p.asset_id, thumb: p.thumb_url, byStock: p.by_stock ?? [:])
+            lastIdx = index
         }
     }
 
@@ -110,6 +148,7 @@ struct BestSellersView: View {
 struct TopPhotoCard: View {
     let photo: TopPhoto
     let byCount: Bool
+    var isSelected: Bool = false
     @Environment(AppModel.self) private var model
 
     private var groupLabel: String? { model.groups(for: photo.asset_id).first }
@@ -145,6 +184,15 @@ struct TopPhotoCard: View {
         .frame(width: w)
         .clipShape(RoundedRectangle(cornerRadius: s.cardRadius))
         .cardSurface()
+        .overlay {
+            if isSelected {
+                RoundedRectangle(cornerRadius: s.cardRadius)
+                    .strokeBorder(model.accent, lineWidth: 2)
+                    .background(RoundedRectangle(cornerRadius: s.cardRadius).fill(model.accent.opacity(0.15)))
+            }
+        }
+        .scaleEffect(isSelected ? 0.97 : 1.0)
+        .animation(.snappy(duration: 0.15), value: isSelected)
         .scrollTransition { content, phase in
             content.opacity(phase.isIdentity ? 1 : 0.0).scaleEffect(phase.isIdentity ? 1 : 0.94)
         }
