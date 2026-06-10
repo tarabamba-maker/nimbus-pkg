@@ -29,7 +29,6 @@ struct GroupsView: View {
     @State private var search = ""
     @State private var sort = "Earnings"          // Earnings | Sales | Name
     @State private var sortAsc = false
-    @State private var selected: PhotoGroup?
     @State private var renaming: PhotoGroup?
     @State private var renameText = ""
     @State private var mergePending: PhotoGroup?   // merge mode: source awaiting a target click
@@ -41,7 +40,7 @@ struct GroupsView: View {
             if src.name != g.name { Task { await model.mergeGroup(source: src.name, into: g.name) } }
             withAnimation(.snappy) { mergePending = nil }
         } else {
-            selected = g
+            model.groupModal = g          // presented globally at RootView
         }
     }
 
@@ -80,7 +79,6 @@ struct GroupsView: View {
             }
         }
         .task(id: model.period) { await store.reload(period: model.period) }
-        .popupHost(item: $selected) { g in GroupModal(group: g, onClose: { selected = nil }).environment(model) }
         // Merge mode has NO window/banner: the source card is outlined accent and
         // other cards highlight on hover. Click a target group to merge; click the
         // source again to cancel.
@@ -292,7 +290,6 @@ struct GroupModal: View {
     @State private var sort = "Earnings"      // Earnings | Downloads | Name
     @State private var sortAsc = false
     @State private var assign: AssignTarget?
-    @State private var photoPopup: GroupPhoto?
     private let cols = [GridItem(.adaptive(minimum: 132, maximum: 132), spacing: 10)]
 
     var body: some View {
@@ -343,11 +340,16 @@ struct GroupModal: View {
                         }
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                         .shadow(color: .black.opacity(0.25), radius: 4, y: 2)
-                        // Same action as a card tap on Downloads/BestSellers: open the
-                        // photo detail popup (per-stock breakdown + group membership).
-                        .onTapGesture { photoPopup = ph }
+                        // EXACTLY the same action as a card tap on Downloads/BestSellers:
+                        // open the shared PhotoPopup — presented globally at RootView so
+                        // it sits OVER this group modal (same card, same material).
+                        .onTapGesture {
+                            model.openPhoto(assetID: ph.asset_id, thumb: ph.thumb, byStock: ph.by_stock ?? [:])
+                        }
                         .contextMenu {
-                            Button("Open") { photoPopup = ph }
+                            Button("Open") {
+                                model.openPhoto(assetID: ph.asset_id, thumb: ph.thumb, byStock: ph.by_stock ?? [:])
+                            }
                             Button("Add to group…") { assign = AssignTarget(id: ph.asset_id) }
                         }
                     }
@@ -361,10 +363,6 @@ struct GroupModal: View {
                     radius: model.surfaces.popupRadius)
         .popupHost(item: $assign) { t in
             GroupAssignPopup(assetID: t.id, onClose: { assign = nil }).environment(model)
-        }
-        .popupHost(item: $photoPopup) { ph in
-            PhotoPopup(assetID: ph.asset_id, thumb: ph.thumb, byStock: ph.by_stock ?? [:],
-                       onClose: { photoPopup = nil }).environment(model)
         }
     }
 

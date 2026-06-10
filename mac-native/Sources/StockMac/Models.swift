@@ -56,6 +56,14 @@ struct SaleStockStat: Codable, Equatable {
     var total: Double = 0
 }
 
+/// Payload for the global photo-detail popup (presented at RootView).
+struct PhotoPopupData: Identifiable, Equatable {
+    let assetID: String
+    let thumb: String?
+    let byStock: [String: SaleStockStat]
+    var id: String { assetID }
+}
+
 struct Feed: Codable {
     var items: [Sale] = []
     var total: Int?

@@ -5,7 +5,6 @@ private struct MultiSel: Identifiable { let id = UUID() }
 
 struct DownloadsView: View {
     @Environment(AppModel.self) private var model
-    @State private var popup: Sale?
     @State private var assign: AssignTarget?
     @State private var selected: Set<String> = []   // multi-select asset_ids
     @State private var lastIdx: Int?
@@ -25,7 +24,7 @@ struct DownloadsView: View {
                     SaleCard(sale: sale, isSelected: selected.contains(sale.asset_id))
                         .onTapGesture { handleTap(sale, index: i) }
                         .contextMenu {
-                            Button("Open") { popup = sale }
+                            Button("Open") { model.openPhoto(assetID: sale.asset_id, thumb: sale.thumb_url, byStock: sale.by_stock ?? [:]) }
                             Button("Add to group…") { assign = AssignTarget(id: sale.asset_id) }
                         }
                         // infinite scroll: load next page as the last card appears
@@ -58,10 +57,6 @@ struct DownloadsView: View {
             }
         }
         .animation(.snappy, value: selected.isEmpty)
-        .popupHost(item: $popup) { s in
-            PhotoPopup(assetID: s.asset_id, thumb: s.thumb_url, byStock: s.by_stock ?? [:],
-                       onClose: { popup = nil }).environment(model)
-        }
         .popupHost(item: $assign) { t in
             GroupAssignPopup(assetID: t.id, onClose: { assign = nil }).environment(model)
         }
@@ -85,7 +80,7 @@ struct DownloadsView: View {
         } else if !selected.isEmpty {
             selected = []
         } else {
-            popup = sale
+            model.openPhoto(assetID: sale.asset_id, thumb: sale.thumb_url, byStock: sale.by_stock ?? [:])
             lastIdx = index
         }
     }

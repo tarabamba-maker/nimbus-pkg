@@ -32,6 +32,17 @@ final class AppModel {
     // Incremented every time a sync finishes — all tabs watch this to auto-reload.
     var syncTick: Int = 0
 
+    // ── Global popups (presented at RootView so the blur covers the WHOLE app and
+    // a photo can appear OVER an open group modal — the SAME PhotoPopup everywhere) ──
+    var photoPopup: PhotoPopupData?      // photo detail (top layer)
+    var groupModal: PhotoGroup?          // group detail (under the photo popup)
+
+    /// Open the shared photo-detail popup from anywhere (Downloads/BestSellers card,
+    /// or a photo inside a group modal). One function, called from three places.
+    func openPhoto(assetID: String, thumb: String?, byStock: [String: SaleStockStat]) {
+        photoPopup = PhotoPopupData(assetID: assetID, thumb: thumb, byStock: byStock)
+    }
+
     // Shared sync state so the Downloads "Sync" and Browser "Sync All" buttons are
     // literally the SAME action in two places (same spinner, same disabled state).
     var syncing = false

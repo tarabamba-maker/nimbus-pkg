@@ -2,7 +2,6 @@ import SwiftUI
 
 struct BestSellersView: View {
     @Environment(AppModel.self) private var model
-    @State private var popup: TopPhoto?
     @State private var assign: AssignTarget?
     @State private var ungrouped = false
     @State private var sortAsc = false
@@ -29,7 +28,7 @@ struct BestSellersView: View {
                     TopPhotoCard(photo: p, byCount: store.sort == "count")
                         .onTapGesture { tap(p) }
                         .contextMenu {
-                            Button("Open") { popup = p }
+                            Button("Open") { model.openPhoto(assetID: p.asset_id, thumb: p.thumb_url, byStock: p.by_stock ?? [:]) }
                             Button("Add to group…") { assign = AssignTarget(id: p.asset_id) }
                             Button("Link to another photo") { pendingMatch = p.asset_id; matchMsg = "Click another photo to link" }
                         }
@@ -50,10 +49,6 @@ struct BestSellersView: View {
         // model.period → reload Best Sellers for that period (the store key includes
         // period, so a new period = a fresh fetch).
         .task(id: model.period) { store.period = model.period; await store.ensure() }
-        .popupHost(item: $popup) { p in
-            PhotoPopup(assetID: p.asset_id, thumb: p.thumb_url, byStock: p.by_stock ?? [:],
-                       onClose: { popup = nil }).environment(model)
-        }
         .popupHost(item: $assign) { t in
             GroupAssignPopup(assetID: t.id, onClose: { assign = nil }).environment(model)
         }
@@ -67,7 +62,7 @@ struct BestSellersView: View {
                 await store.reloadCurrent()
             }
         } else {
-            popup = p
+            model.openPhoto(assetID: p.asset_id, thumb: p.thumb_url, byStock: p.by_stock ?? [:])
         }
     }
 

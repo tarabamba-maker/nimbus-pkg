@@ -30,10 +30,14 @@ struct RootView: View {
                 .transition(.opacity)
             }
         }
-        // Blur everything behind the Settings window (the overlay below is added
-        // AFTER this modifier, so the settings panel itself stays sharp).
-        .blur(radius: showSettings ? model.surfaces.settingsBlurRadius : 0)
+        // ONE global blur over the WHOLE app for ANY popup (settings, group, photo).
+        // Overlays are added AFTER this, so the popups themselves stay sharp. This is
+        // why every popup dims/blurs the entire window identically (incl. topbar/tabs),
+        // not just the scroll canvas.
+        .blur(radius: globalBlur)
         .animation(.snappy(duration: 0.22), value: showSettings)
+        .animation(.snappy(duration: 0.22), value: model.groupModal)
+        .animation(.snappy(duration: 0.22), value: model.photoPopup)
         .animation(.smooth(duration: 0.25), value: model.ready)
         .preferredColorScheme(model.isDark ? .dark : .light)
         .overlay {
@@ -49,6 +53,35 @@ struct RootView: View {
                 .animation(.snappy(duration: 0.22), value: showSettings)
             }
         }
+        // Group detail — layer 1. Blurs itself when a photo popup sits on top of it.
+        .overlay {
+            if let g = model.groupModal {
+                ZStack {
+                    BokehDim(dimAlpha: model.surfaces.popupDimAlpha).ignoresSafeArea()
+                        .onTapGesture { model.groupModal = nil }
+                    GroupModal(group: g, onClose: { model.groupModal = nil })
+                        .environment(model)
+                        .blur(radius: model.photoPopup != nil ? model.surfaces.popupBlurRadius : 0)
+                        .transition(.scale(scale: 0.96).combined(with: .opacity))
+                }
+                .animation(.snappy(duration: 0.22), value: model.groupModal)
+                .animation(.snappy(duration: 0.22), value: model.photoPopup)
+            }
+        }
+        // Photo detail — top layer. The SAME PhotoPopup everywhere (cards + group
+        // photos), centered over the whole app above an open group modal.
+        .overlay {
+            if let d = model.photoPopup {
+                ZStack {
+                    BokehDim(dimAlpha: model.surfaces.popupDimAlpha).ignoresSafeArea()
+                        .onTapGesture { model.photoPopup = nil }
+                    PhotoPopup(assetID: d.assetID, thumb: d.thumb, byStock: d.byStock,
+                               onClose: { model.photoPopup = nil }).environment(model)
+                        .transition(.scale(scale: 0.96).combined(with: .opacity))
+                }
+                .animation(.snappy(duration: 0.22), value: model.photoPopup)
+            }
+        }
         .overlay(alignment: .trailing) {
             if showLab {
                 MaterialsLab(onClose: { showLab = false })
@@ -62,6 +95,13 @@ struct RootView: View {
 
     private var bindingTab: Binding<Int> {
         Binding(get: { model.activeTab }, set: { model.activeTab = $0 })
+    }
+
+    /// One blur amount for the whole app, driven by whichever popup is open.
+    private var globalBlur: CGFloat {
+        if showSettings { return model.surfaces.settingsBlurRadius }
+        if model.groupModal != nil || model.photoPopup != nil { return model.surfaces.popupBlurRadius }
+        return 0
     }
 
     /// Title + stats + tab bar share one GlassEffectContainer so the Liquid Glass
