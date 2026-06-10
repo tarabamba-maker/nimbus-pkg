@@ -48,7 +48,7 @@ from datetime import date, datetime, timedelta
 
 import requests as _rq
 
-from app_globals import DB_NAME, RECIPES_DIR
+from app_globals import DB_NAME, RECIPES_DIR, CACHE_DIR
 from collectors.browser import _is_login_url
 from image_utils import load_img_async
 from sync_state import _app_log, _save_record, _sync_log, _sync_stop_flag
@@ -345,7 +345,7 @@ def _freepik_collect(pw_page):
     _save_json(_MONTHS_FILE, months_state)
     _sync_log(f"✅ Freepik: {total_saved} per-asset records (2024+)")
 
-    # 3) download clean thumbs (load_img skips already-cached ids) → asset_meta dHash
+    # 3) download clean thumbs for newly-collected assets
     dl = 0
     for aid, turl in thumbs_needed.items():
         if _sync_stop_flag[0]:
@@ -354,6 +354,23 @@ def _freepik_collect(pw_page):
             load_img_async(aid, turl, None, is_adobe=False, stock="Freepik")
             dl += 1
     _sync_log(f"🖼️ Freepik thumbnails: {dl} clean queued")
+
+    # 4) backfill: download thumbs for any DB asset still missing from img_cache
+    cached_set = set(f[:-4] for f in os.listdir(CACHE_DIR) if f.endswith('.jpg')) if os.path.isdir(CACHE_DIR) else set()
+    missing_thumbs = []
+    with sqlite3.connect(DB_NAME, timeout=15) as _c:
+        for aid, turl in _c.execute(
+            "SELECT DISTINCT asset_id, thumb_url FROM sales "
+            "WHERE stock='Freepik' AND thumb_url IS NOT NULL AND thumb_url != ''"
+        ).fetchall():
+            if aid and aid not in cached_set:
+                missing_thumbs.append((aid, turl))
+    if missing_thumbs:
+        _sync_log(f"🖼️ Freepik backfill: {len(missing_thumbs)} missing thumbs queued")
+        for aid, turl in missing_thumbs:
+            if _sync_stop_flag[0]:
+                break
+            load_img_async(aid, turl, None, is_adobe=False, stock="Freepik")
 
     if COLLECT_PRE_HISTORY and not _sync_stop_flag[0]:
         _collect_pre_history(pw_page, uid, portfolio, end_ym)
