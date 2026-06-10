@@ -31,6 +31,35 @@ final class AppModel {
     // Incremented every time a sync finishes — all tabs watch this to auto-reload.
     var syncTick: Int = 0
 
+    // Shared sync state so the Downloads "Sync" and Browser "Sync All" buttons are
+    // literally the SAME action in two places (same spinner, same disabled state).
+    var syncing = false
+
+    /// Canonical sync: POST /api/sync/start (optionally one stock) → wait for the SSE
+    /// 'done' → notifySyncDone (blue keys + clear caches + bump syncTick → every tab
+    /// reloads). Guarded so the two buttons can't double-start.
+    func startSync(stock: String? = nil) async {
+        guard !syncing else { return }
+        syncing = true
+        defer { syncing = false }
+        var req = URLRequest(url: URL(string: API.base + "/api/sync/start")!)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body = stock.map { ["stock": $0] } ?? [:]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        _ = try? await URLSession.shared.data(for: req)
+        if let url = URL(string: API.base + "/api/sync/stream"),
+           let (stream, _) = try? await URLSession.shared.bytes(from: url) {
+            do {
+                for try await line in stream.lines {
+                    if line.hasPrefix("data:"),
+                       line.dropFirst(5).trimmingCharacters(in: .whitespaces) == "done" { break }
+                }
+            } catch {}
+        }
+        await notifySyncDone()
+    }
+
     func notifySyncDone() async {
         await fetchNewKeys()
         await refresh()

@@ -90,7 +90,6 @@ struct DownloadsView: View {
         }
     }
 
-    @State private var syncing = false
     @State private var spinDeg: Double = 0
 
     private var filters: some View {
@@ -101,50 +100,33 @@ struct DownloadsView: View {
                 Task { await store.select(period: model.period, stock: s) }
             }
             Spacer()
+            // Same shared action as Browser's "Sync All" — one button in two places.
             Button {
-                guard !syncing else { return }
-                Task { await doSync() }
+                Task { await model.startSync() }
             } label: {
                 HStack(spacing: 5) {
                     Image(systemName: "arrow.triangle.2.circlepath")
                         .font(.system(size: 13, weight: .semibold))
                         .rotationEffect(.degrees(spinDeg))
-                    Text(syncing ? "Syncing…" : "Sync")
+                    Text(model.syncing ? "Syncing…" : "Sync")
                         .font(.system(size: 13, weight: .semibold))
                 }
                 .foregroundStyle(.white)
             }
             .buttonStyle(.pill(.primary))
-            .disabled(syncing)
+            .disabled(model.syncing)
+            .onChange(of: model.syncing) { _, now in
+                if now { withAnimation(.linear(duration: 1).repeatForever(autoreverses: false)) { spinDeg = 360 } }
+                else { withAnimation { spinDeg = 0 } }
+            }
         }
         .padding(10)
         .glassCard()
         .frame(height: panelH)
-    }
-
-    private func doSync() async {
-        syncing = true
-        withAnimation(.linear(duration: 1).repeatForever(autoreverses: false)) { spinDeg = 360 }
-        var req = URLRequest(url: URL(string: API.base + "/api/sync/start")!)
-        req.httpMethod = "POST"; req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = Data("{}".utf8)
-        _ = try? await URLSession.shared.data(for: req)
-        // wait for SSE done
-        if let url = URL(string: API.base + "/api/sync/stream"),
-           let (stream, _) = try? await URLSession.shared.bytes(from: url) {
-            do {
-                for try await line in stream.lines {
-                    if line.hasPrefix("data:") && line.dropFirst(5).trimmingCharacters(in: .whitespaces) == "done" { break }
-                }
-            } catch {}
+        // Reload the feed when ANY sync (here or in Browser) finishes.
+        .onChange(of: model.syncTick) { _, _ in
+            Task { await store.select(period: model.period, stock: model.downloadsStock) }
         }
-        withAnimation { spinDeg = 0 }
-        syncing = false
-        // notifySyncDone fetches newSaleKeys (blue highlight), refreshes stats and
-        // CLEARS the downloads cache so the reload below pulls the new sales. Without
-        // this the just-synced sales never turned blue — the bug that kept recurring.
-        await model.notifySyncDone()
-        await store.select(period: model.period, stock: model.downloadsStock)
     }
 }
 

@@ -33,13 +33,14 @@ struct BrowserView: View {
 
     private var syncBar: some View {
         HStack(spacing: 8) {
-            actionButton(status.running ? "Syncing…" : "Sync All",
+            // Same shared action as the Downloads "Sync" button — one button, two places.
+            actionButton(model.syncing ? "Syncing…" : "Sync All",
                          icon: "arrow.triangle.2.circlepath", primary: true) {
-                Task { await start(stock: nil) }
+                Task { await model.startSync() }
             }
-            .disabled(status.running)
+            .disabled(model.syncing)
 
-            if status.running {
+            if model.syncing || status.running {
                 actionButton("Stop", icon: "stop.fill") { Task { await stop() } }
             }
 
@@ -57,7 +58,7 @@ struct BrowserView: View {
                             .foregroundStyle(.white)
                         }
                         .buttonStyle(.pill(.primary))
-                        .disabled(status.running)
+                        .disabled(model.syncing || status.running)
                     }
                 }
             }
