@@ -224,35 +224,11 @@ def _hash_based_matches(existing_matches, threshold=4, incremental_from_rowid=No
         full = new_aids is None
         rows_to_scan = list(range(n)) if full else [idxmap[a] for a in aids if a in new_aids]
 
-        # ── Multi-core path: fan the candidate search across all CPU cores. ──
-        # Only when the work is big enough to beat process-spawn overhead. The
-        # union-find merge below stays sequential over (i, j)-sorted pairs → the
-        # result is bit-identical to the single-process loop, just faster.
-        ncpu = os.cpu_count() or 1
-        if ncpu > 1 and len(rows_to_scan) * n >= 5_000_000:
-            try:
-                import multiprocessing as _mp
-                nproc = min(ncpu, 8)
-                # Strided chunks balance load (rows with many candidates get spread
-                # across workers). Final sort makes chunk order irrelevant.
-                nch = max(nproc, min(len(rows_to_scan), nproc * 4))
-                chunks = [rows_to_scan[k::nch] for k in range(nch)]
-                chunks = [c for c in chunks if c]
-                _sync_log(f"⚙️ pHash matching: {nproc} ядер, {len(rows_to_scan)} рядків…")
-                ctx = _mp.get_context('spawn')
-                with ctx.Pool(nproc, initializer=_mp_init,
-                              initargs=(H, AR, R, G, B, has_rgb, S, _POP, threshold, full)) as pool:
-                    # Hard timeout → fall back to single-core if the spawn pool wedges.
-                    results = pool.map_async(_mp_scan, chunks).get(timeout=120)
-                    pool.terminate()
-                all_pairs = [p for r in results for p in r]
-                all_pairs.sort()                      # (i, j) asc = single-proc order
-                for i, j in all_pairs:
-                    _merge(aids[i], aids[j])
-                return existing_matches, new_pairs, max_rowid
-            except Exception as ex:
-                _sync_log(f"⚠️ pHash multi-core failed ({ex}) — single-core fallback")
-
+        # ⚠️ Multiprocessing DISABLED. A spawn Pool deadlocks inside the app-launched
+        # Flask server (workers wedge at 0% CPU forever → the whole rebuild hangs).
+        # The single-core numpy loop below is already vectorised (popcount LUT) and
+        # fast enough (~35s on 35k) — reliability beats the few seconds saved.
+        _sync_log(f"⚙️ pHash matching: {len(rows_to_scan)} рядків…")
         for i in rows_to_scan:
             cand = _popcount(H ^ H[i]) <= threshold       # hamming ≤ threshold
             cand[i] = False
