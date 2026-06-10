@@ -337,7 +337,9 @@ def api_group_photos():
 
 @groups_bp.route('/api/photo-groups', methods=['GET'])
 def api_photo_groups_get():
-    """Returns merged groups: ms_library auto-groups + user photo_groups.json."""
+    """Returns merged groups: ms_library auto-groups + user photo_groups.json,
+    expanded to include all cross-stock siblings so Envato/Freepik/iStock cards
+    show the correct group badge in BestSellers and Downloads."""
     result: dict = {}
 
     lib = load_ms_library()
@@ -360,6 +362,21 @@ def api_photo_groups_get():
             sid = str(aid)
             if sid not in result[gname]:
                 result[gname].append(sid)
+
+    # Expand every group to include cross-stock siblings (Envato/Freepik/iStock etc.)
+    # so badge lookup in BestSellers/Downloads works for non-primary asset IDs.
+    _matches = _load_matches()
+    sib_of: dict = {}
+    for _prim, _members in _matches.items():
+        _cluster = {str(_prim)} | {str(m) for m in _members}
+        for _x in _cluster:
+            sib_of[_x] = _cluster
+
+    for gname in list(result.keys()):
+        expanded = set(result[gname])
+        for sid in list(expanded):
+            expanded |= sib_of.get(sid, set())
+        result[gname] = sorted(expanded)
 
     return jsonify(result)
 
