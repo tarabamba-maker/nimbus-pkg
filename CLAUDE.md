@@ -322,11 +322,35 @@ The dedup data-loss is fixed (see Architecture Invariants). User re-syncs from s
 Settings → Full Reset → Sync All. Watch Adobe top-seller download counts match the real
 Adobe dashboard (the 6564 vs 1108 proof).
 
-### 3. Done this session (verify still green)
-- Freepik collector (2025+ real, pre-2025 estimate, collect-once).
-- Layered grouping fold at display (Pass E/F disabled, force-rebuild from scratch).
-- numpy-vectorised matching (~35s).
-- Downloads Cmd/Shift multi-select → batch add/create group (mac-native).
+### 3. FIXED (2026-06-10) — group badges not showing in BestSellers/Downloads/Groups after sync
+
+**Root causes (all fixed this session):**
+
+1. **`notifySyncDone()` did not refresh `photoGroups`** (Svelte + Swift).
+   - Svelte: added `loadPhotoGroups()` call in `notifySyncDone()` (`appState.js`).
+   - Swift: `notifySyncDone()` already called `refresh()` which fetches photoGroups — but
+     BestSellersView and GroupsView had no `onChange(of: model.syncTick)` → never reloaded.
+     Fixed by adding `.onChange(of: model.syncTick)` to both views.
+
+2. **`/api/photo-groups` returned only ms_library stockids + photo_groups.json primaries** —
+   no Envato/Freepik/iStock IDs. Fixed: endpoint now returns `photo_groups.json` + full
+   sib_of expansion from `_cross_stock_matches` (pHash clusters). Non-primary asset_ids
+   (Envato UUIDs, Freepik numeric IDs, iStock IDs) now map to their group correctly.
+
+3. **Pass B removed** — ms_library stockids clustering was a relic. Matching is now
+   **pHash+RGB only** (Pass A + Pass F). `api_photo_groups_get` no longer reads ms_library
+   stockids at all.
+
+4. **Freepik: 2615 assets had no thumbnail in `img_cache/`** → no pHash → not matchable.
+   Fixed: Freepik collector now backfills missing thumbnails on every sync (step 4 in
+   `_freepik_collect`). After next sync + Rebuild Matches → all Freepik photos get pHash
+   and will appear in correct groups.
+
+5. **BestSellers multi-select** — added Cmd/Shift+click + "Add to group" action bar
+   (identical to Downloads). `TopPhotoCard` now accepts `isSelected` param with accent
+   border + scale highlight.
+
+**After restart + sync + Rebuild Matches** all stocks should show group badges.
 
 ### 4. FIXED (2026-06-09) — "Sync All: not logged in" false negatives
 After login to all windows, Sync All reported the 4 marker stocks (Getty, Envato,
