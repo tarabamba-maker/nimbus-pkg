@@ -241,6 +241,14 @@ Flask backend (`Backend.swift` spawns `main.py` with `STOCK_DATA_DIR` =
   sets `_adobe_full_walk=True`. To force a full re-walk: delete BOTH the `"Adobe Stock"`
   key and `"_adobe_full_walk"` from `_processed_dates.json`.
 - To force a full re-walk: delete `"Adobe Stock"` key from `_processed_dates.json`.
+- **⚠️ NEVER add `pv=` or `timestamp=` to a DATE-FILTERED sales-earnings/other-payments
+  request (2026-06-10 fix).** With a date filter present, `pv` makes Adobe IGNORE
+  `start_date`/`end_date` and return the FULL recent dataset (~48k dupes) → `range_total>0`
+  → old months wrongly marked done → years of history skipped (the **$11k Adobe gap**:
+  2020-2023 per-sale history silently lost). The real browser sends NEITHER param with a
+  date filter (Inspector-verified: `?start_date=2021-01-01&end_date=2022-01-01&time_range=day`
+  → 748 recs; 2020 → 105; 2019 → 0). Pass 1 (recent, NO date filter) may keep `pv` as a
+  cache-buster — it has no date filter to break.
 
 #### Endpoint variants — don't confuse them
 - `/en/insights/sales-earnings` — **individual sales list** (what we use). Accepts date params. Returns `sales.history[]`.
