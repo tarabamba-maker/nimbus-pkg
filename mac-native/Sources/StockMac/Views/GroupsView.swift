@@ -79,6 +79,7 @@ struct GroupsView: View {
             }
         }
         .task(id: model.period) { await store.reload(period: model.period) }
+        .onChange(of: model.syncTick) { _, _ in Task { await store.load() } }
         // Merge mode has NO window/banner: the source card is outlined accent and
         // other cards highlight on hover. Click a target group to merge; click the
         // source again to cancel.
@@ -129,6 +130,9 @@ struct GroupsView: View {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         // force: wipe state + full re-cluster (plain call early-exits "cached")
         req.httpBody = Data(#"{"force": true}"#.utf8)
+        // A full rebuild takes ~60s+; the default 60s timeout would abort it and
+        // reload STALE data ("groups don't update after Rebuild"). Wait up to 10 min.
+        req.timeoutInterval = 600
         _ = try? await URLSession.shared.data(for: req)
         rebuilding = false
         store.loaded = false

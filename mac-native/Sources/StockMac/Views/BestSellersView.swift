@@ -49,6 +49,7 @@ struct BestSellersView: View {
         // model.period → reload Best Sellers for that period (the store key includes
         // period, so a new period = a fresh fetch).
         .task(id: model.period) { store.period = model.period; await store.ensure() }
+        .onChange(of: model.syncTick) { _, _ in Task { await store.reloadCurrent() } }
         .popupHost(item: $assign) { t in
             GroupAssignPopup(assetID: t.id, onClose: { assign = nil }).environment(model)
         }
