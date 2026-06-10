@@ -226,10 +226,15 @@ def _adobe_collect_direct():
         e_str = chunk_end.strftime("%Y-%m-%d")
         _sync_log(f"📅 Adobe direct: {s_str} → {e_str}")
 
-        ts = int(time.time() * 1000)
+        # ⚠️ DO NOT add `pv=`/`timestamp=` here. With a date filter, Adobe's
+        # sales-earnings endpoint IGNORES start_date/end_date when `pv` is present
+        # and returns the FULL recent dataset (~48k dupes) → range_total>0 → old
+        # months wrongly marked done → years of history silently skipped. The real
+        # browser sends NEITHER param with date filters (verified via Inspector);
+        # without `pv`, the date filter works correctly (2021→748 recs, 2020→105).
         d0 = _get_page(f"/en/insights/sales-earnings"
                       f"?end_date={e_str}&start_date={s_str}"
-                      f"&time_range=day&timestamp={ts}&pv={ts}&limit=1000&page=1")
+                      f"&time_range=day&limit=1000&page=1")
         if "error" in d0:
             _sync_log(f"  ⚠️ {d0['error']} — skip chunk")
             chunk_end = chunk_start - timedelta(days=1); continue
@@ -241,11 +246,10 @@ def _adobe_collect_direct():
         chunk_new = 0
         for pg in range(1, range_pages + 1):
             if _sync_stop_flag[0]: break
-            ts = int(time.time() * 1000)
             d = d0 if pg == 1 else _get_page(
                 f"/en/insights/sales-earnings"
                 f"?end_date={e_str}&start_date={s_str}"
-                f"&time_range=day&timestamp={ts}&pv={ts}&limit=1000&page={pg}")
+                f"&time_range=day&limit=1000&page={pg}")
             if "error" in d:
                 _sync_log(f"  ⚠️ page={pg}: {d['error']}"); continue
             for item in d.get("sales", {}).get("history", []):
@@ -347,10 +351,11 @@ def _adobe_collect_missions(_get_page):
         page = 1
         while True:
             if _sync_stop_flag[0]: break
-            ts = int(time.time() * 1000)
+            # No pv/timestamp — same reason as Pass 2 (pv makes Adobe ignore the
+            # date filter and return the full set).
             d = _get_page(f"/en/insights/other-payments"
                           f"?end_date={e_str}&start_date={s_str}&time_range=day"
-                          f"&limit=50&page={page}&timestamp={ts}&pv={ts}")
+                          f"&limit=50&page={page}")
             if "error" in d:
                 _sync_log(f"  ⚠️ missions {s_str}→{e_str} p{page}: {d['error']}")
                 break
@@ -491,11 +496,10 @@ def _adobe_api_collect_global(pw_page):
     adobe_done = set(all_proc.get("Adobe Stock", []))
 
     def _fetch_range(start_str, end_str, pg):
-        ts = int(time.time() * 1000)
+        # No pv/timestamp — pv makes Adobe ignore the date filter (see direct Pass 2).
         url = (f"/en/insights/sales-earnings"
                f"?end_date={end_str}&start_date={start_str}"
-               f"&time_range=day&timestamp={ts}&pv={ts}"
-               f"&limit=1000&page={pg}")
+               f"&time_range=day&limit=1000&page={pg}")
         js = f"""async () => {{
             try {{
                 const r = await fetch("{url}", {{
