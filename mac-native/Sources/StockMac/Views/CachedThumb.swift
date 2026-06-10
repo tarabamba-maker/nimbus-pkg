@@ -18,6 +18,9 @@ actor ThumbCache {
         return nil
     }
 
+    /// Drop a cached entry so the next fetch re-pulls (after a manual thumb upload).
+    func invalidate(_ assetID: String) { cache[assetID] = nil }
+
     private func fetch(_ url: URL) async -> NSImage? {
         guard let (data, _) = try? await URLSession.shared.data(from: url) else { return nil }
         return NSImage(data: data)
@@ -41,5 +44,17 @@ struct CachedThumb: View {
         .task(id: assetID) {
             image = await ThumbCache.shared.image(assetID: assetID, fallback: fallback)
         }
+        // Refresh when this asset's thumbnail is manually replaced.
+        .onReceive(NotificationCenter.default.publisher(for: .thumbUpdated)) { note in
+            guard (note.object as? String) == assetID else { return }
+            Task {
+                await ThumbCache.shared.invalidate(assetID)
+                image = await ThumbCache.shared.image(assetID: assetID, fallback: fallback)
+            }
+        }
     }
+}
+
+extension Notification.Name {
+    static let thumbUpdated = Notification.Name("thumbUpdated")
 }

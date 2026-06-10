@@ -70,8 +70,11 @@ struct GroupsView: View {
                                 onDelete: { Task { await model.deleteGroup(g.name) } }
                             )
                             .onTapGesture { handleGroupTap(g) }
+                            .transition(.scale.combined(with: .opacity))
                         }
                     }
+                    // Smoothly reposition remaining cards when one merges away.
+                    .animation(.snappy, value: store.groups)
                 }
             }
         }

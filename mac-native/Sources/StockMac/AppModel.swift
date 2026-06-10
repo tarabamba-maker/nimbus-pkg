@@ -158,8 +158,53 @@ final class AppModel {
         await reloadGroups()
     }
     func mergeGroup(source: String, into target: String) async {
-        _ = try? await API.mergeGroup(source: source, target: target)
-        await reloadGroups()
+        // Optimistic LOCAL merge — move source's photos into target and drop the
+        // source card with animation, instead of reloading the whole page. The
+        // server call fires in the background; only a failure triggers a reload.
+        if let si = groupsStore.groups.firstIndex(where: { $0.name == source }),
+           let ti = groupsStore.groups.firstIndex(where: { $0.name == target }) {
+            let src = groupsStore.groups[si]
+            var tgt = groupsStore.groups[ti]
+            let have = Set(tgt.photos.map { $0.asset_id })
+            tgt.photos.append(contentsOf: src.photos.filter { !have.contains($0.asset_id) })
+            tgt.total += src.total
+            tgt.sales += src.sales
+            tgt.count  = tgt.photos.count
+            withAnimation(.snappy) {
+                groupsStore.groups[ti] = tgt
+                groupsStore.groups.removeAll { $0.name == source }
+            }
+        }
+        // Mirror in the membership map so other tabs/PhotoPopup stay consistent.
+        if let srcIds = photoGroups[source] {
+            var tIds = photoGroups[target] ?? []
+            let have = Set(tIds)
+            tIds.append(contentsOf: srcIds.filter { !have.contains($0) })
+            photoGroups[target] = tIds
+            photoGroups[source] = nil
+        }
+        do {
+            _ = try await API.mergeGroup(source: source, target: target)
+        } catch {
+            await reloadGroups()   // rollback to server truth only on failure
+        }
+    }
+
+    /// Manually set a card's thumbnail (for cards with no auto image, e.g. the
+    /// Adobe Missions card or photos whose stock thumb never downloaded). POSTs the
+    /// raw image bytes to /img/cache/<id>; on success busts the thumb cache so every
+    /// card showing this asset refreshes.
+    @discardableResult
+    func uploadThumb(assetID: String, imageData: Data) async -> Bool {
+        guard let url = URL(string: API.base + "/img/cache/\(assetID)") else { return false }
+        var req = URLRequest(url: url); req.httpMethod = "POST"
+        req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        req.httpBody = imageData
+        guard let (_, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200 else { return false }
+        await ThumbCache.shared.invalidate(assetID)
+        NotificationCenter.default.post(name: .thumbUpdated, object: assetID)
+        return true
     }
 
     private func reloadGroups() async {

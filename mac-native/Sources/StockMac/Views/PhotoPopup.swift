@@ -1,4 +1,6 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 
 /// Detail popup for a photo — per-stock earnings breakdown + group management
 /// (toggle membership, search groups, create a new group). Mirrors the old
@@ -11,6 +13,7 @@ struct PhotoPopup: View {
     @Environment(AppModel.self) private var model
     @State private var groupSearch = ""
     @State private var newGroup = ""
+    @State private var uploading = false
 
     private var total: Double { byStock.values.reduce(0) { $0 + $1.total } }
     private var count: Int { byStock.values.reduce(0) { $0 + $1.count } }
@@ -20,6 +23,20 @@ struct PhotoPopup: View {
         VStack(spacing: 0) {
             CachedThumb(assetID: assetID, fallback: thumb)
                 .frame(height: 200).frame(maxWidth: .infinity).clipped()
+                // Manually set this card's image (for cards without an auto thumbnail).
+                .overlay(alignment: .bottomTrailing) {
+                    Button { pickAndUpload() } label: {
+                        Label("Set photo", systemImage: "photo.badge.plus")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 9).padding(.vertical, 5)
+                            .background(.black.opacity(0.55), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(10)
+                    .opacity(uploading ? 0.5 : 1)
+                    .disabled(uploading)
+                }
 
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
@@ -101,6 +118,21 @@ struct PhotoPopup: View {
         let name = newGroup
         newGroup = ""
         Task { await model.createGroup(name, with: assetID) }
+    }
+
+    /// Open a file picker, read the chosen image, and upload it as this card's thumb.
+    private func pickAndUpload() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.png, .jpeg, .image]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK, let url = panel.url,
+              let data = try? Data(contentsOf: url) else { return }
+        uploading = true
+        Task {
+            _ = await model.uploadThumb(assetID: assetID, imageData: data)
+            uploading = false
+        }
     }
 }
 

@@ -11,7 +11,7 @@ import sqlite3
 from io import BytesIO
 
 import requests as req_lib
-from flask import Blueprint, Response, abort, make_response, send_file
+from flask import Blueprint, Response, abort, make_response, send_file, request, jsonify
 from PIL import Image, ImageOps
 
 from app_globals import CACHE_DIR, DB_NAME, ICON_CACHE_DIR, MS_CACHE_DIR
@@ -53,6 +53,36 @@ def img_cache_serve(aid):
     except Exception:
         pass
     abort(404)
+
+
+@images_bp.route('/img/cache/<aid>', methods=['POST'])
+def img_cache_upload(aid):
+    """Manually set a card's thumbnail. Body = raw image bytes (PNG/JPEG). Center-fits
+    to 400×400 → img_cache/<aid>.jpg, so /img/cache/<aid> then serves it. Used for
+    cards that have no auto thumbnail (e.g. synthetic 'adobe-missions', or photos whose
+    stock thumb never downloaded). Also refreshes asset_meta dHash so the manual image
+    participates in matching."""
+    data = request.get_data() or b''
+    if len(data) < 64:
+        return jsonify({'status': 'error', 'msg': 'empty image body'}), 400
+    try:
+        img = Image.open(BytesIO(data)).convert('RGB')
+        img = ImageOps.fit(img, (400, 400), Image.Resampling.LANCZOS)
+        p = os.path.join(CACHE_DIR, f"{aid}.jpg")
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        img.save(p, 'JPEG', quality=90)
+    except Exception as e:
+        return jsonify({'status': 'error', 'msg': f'bad image: {e}'}), 400
+    # Best-effort: recompute asset_meta hash for this asset so it can match/group.
+    try:
+        from image_utils import _save_asset_meta
+        with sqlite3.connect(DB_NAME, timeout=15) as _c:
+            row = _c.execute("SELECT stock FROM sales WHERE asset_id=? LIMIT 1", (aid,)).fetchone()
+        if row and row[0]:
+            _save_asset_meta(row[0], aid, p)
+    except Exception:
+        pass
+    return jsonify({'status': 'ok', 'aid': aid})
 
 
 @images_bp.route('/img/placeholder')
