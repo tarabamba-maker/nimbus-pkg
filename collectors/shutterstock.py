@@ -126,6 +126,11 @@ def _shutterstock_api_collect_direct():
         scan_days.append(d); d -= timedelta(days=1)
     _sync_log(f"⏩ Shutterstock direct: recent від {_ss_from} ({len(scan_days)} днів)")
 
+    # Non-category keys in the aggregate day object (summaries/metadata) — never
+    # query media_stats for these (would double-count or error).
+    _AGG_DENYLIST = {"date", "total", "totals", "all", "summary", "earnings", "downloads"}
+    _seen_cats = set(SS_CATEGORIES)
+
     agg_cache = {}
     def _day_cats(day):
         ym = (day.year, day.month)
@@ -134,8 +139,18 @@ def _shutterstock_api_collect_direct():
             agg_cache[ym] = {} if "error" in agg else \
                 {d.get("date","")[:10]: d for d in agg.get("days", [])}
         info = agg_cache[ym].get(day.isoformat(), {})
-        return [cat for cat in SS_CATEGORIES
-                if isinstance(info.get(cat), dict) and info[cat].get("earnings", 0) > 0]
+        # DYNAMIC category discovery: collect EVERY key that's a per-category dict
+        # with earnings>0 — not just a hardcoded whitelist. The old whitelist silently
+        # dropped categories it didn't know (footage/video/spark_video) → missing $.
+        cats = []
+        for k, v in info.items():
+            if k in _AGG_DENYLIST: continue
+            if isinstance(v, dict) and v.get("earnings", 0) > 0:
+                cats.append(k)
+                if k not in _seen_cats:
+                    _seen_cats.add(k)
+                    _sync_log(f"  🆕 Shutterstock: нова категорія '{k}' (раніше ігнорувалась)")
+        return cats
 
     # Per-day scanner shared by the recent scan AND the historical backfill.
     # Returns (day_new, day_already, hit_403_streak). On a 3× consecutive 403 the
@@ -371,6 +386,9 @@ def _shutterstock_api_collect_global(pw_page):
 
     _agg_cache = {}
 
+    _AGG_DENYLIST = {"date", "total", "totals", "all", "summary", "earnings", "downloads"}
+    _seen_cats2 = set(SS_CATEGORIES)
+
     def _get_day_cats(day: _date):
         ym = (day.year, day.month)
         if ym not in _agg_cache:
@@ -379,9 +397,16 @@ def _shutterstock_api_collect_global(pw_page):
             _agg_cache[ym] = {d.get("date","")[:10]: d
                               for d in agg.get("days", [])} if "error" not in agg else {}
         day_info = _agg_cache[ym].get(day.isoformat(), {})
-        return [cat for cat in SS_CATEGORIES
-                if isinstance(day_info.get(cat), dict)
-                and day_info[cat].get("earnings", 0) > 0]
+        # Dynamic discovery (see direct collector) — never drop unknown categories.
+        cats = []
+        for k, v in day_info.items():
+            if k in _AGG_DENYLIST: continue
+            if isinstance(v, dict) and v.get("earnings", 0) > 0:
+                cats.append(k)
+                if k not in _seen_cats2:
+                    _seen_cats2.add(k)
+                    _sync_log(f"  🆕 Shutterstock: нова категорія '{k}'")
+        return cats
 
     for scan_day in recent_days:
         if stop_early:
