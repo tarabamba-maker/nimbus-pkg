@@ -117,56 +117,67 @@ def _depositphotos_collect(pw_page):
 
     backfill_done = bool(_dp_proc.get("Depositphotos_backfill_done"))
 
+    def _mark_backfill_done(why):
+        _dp_proc["Depositphotos_backfill_done"] = True
+        _dp_proc.pop("Depositphotos_backfill_page", None)
+        _save_dp_proc()
+        _sync_log(f"✅ Depositphotos: backfill complete ({why})")
+
     if not backfill_done:
         # ── Resumable historical backfill ──────────────────────────────────
-        # ⚠️ Depositphotos pagination REPEATS the last page forever past the end
-        # (it never returns an empty page), so we detect the end by 2 consecutive
-        # all-known pages whose max date stops changing. Resume from a persisted
-        # page cursor so an interrupted run continues DEEPER next sync instead of
-        # re-walking from page 1 (the "проходить до самого початку щоразу" bug).
-        page = max(1, int(_dp_proc.get("Depositphotos_backfill_page", 1)) - 1)  # 1pg overlap
+        # ⚠️ Depositphotos REPEATS the last page forever past the end (never an
+        # empty page). Stop EARLY — the moment we hit 6 consecutive already-saved
+        # rows we've reached the collected/repeating tail → bail mid-page (don't
+        # finish it). Resume from a persisted page cursor so an interrupted run
+        # continues DEEPER next sync instead of re-walking from page 1.
+        #   The 6-known-rows stop is ARMED only after we've seen ≥1 NEW row this
+        #   run — otherwise resuming onto an already-collected page (cursor) would
+        #   trip it immediately and never reach the deeper un-collected pages.
+        page = max(1, int(_dp_proc.get("Depositphotos_backfill_page", 1)))
         prev_max = None
-        repeat_streak = 0
+        stale_pages = 0
+        consec_known = 0
+        saw_new = False
+        stop = False
         _sync_log(f"🔄 Depositphotos backfill: resume page {page}")
-        while not _sync_stop_flag[0] and page <= 600:
+        while not _sync_stop_flag[0] and page <= 600 and not stop:
             rows = _fetch_rows(page)
             if rows is None:
                 break                    # error → resume from cursor next sync
             if not rows:
-                _dp_proc["Depositphotos_backfill_done"] = True
-                _dp_proc.pop("Depositphotos_backfill_page", None)
-                _save_dp_proc()
-                _sync_log("✅ Depositphotos: backfill complete (empty page)")
-                break
+                _mark_backfill_done("empty page"); break
             new = 0; pmax = ''
             for row in rows:
                 if not row["date"]: continue
                 if row["date"] > pmax: pmax = row["date"]
                 if is_already_saved("Depositphotos", row["asset_id"], row["price"], row["date"]):
+                    consec_known += 1
+                    if saw_new and consec_known >= 6:
+                        _mark_backfill_done("6 known rows — reached collected tail")
+                        stop = True; break
                     continue
+                consec_known = 0
+                saw_new = True
                 _save_row(row); new += 1; total_saved += 1
             _sync_log(f"Depositphotos backfill page {page}: +{new} (max {pmax})")
+            if stop: break
             _dp_proc["Depositphotos_backfill_page"] = page
             _save_dp_proc()
-            # End detection: page is all-known AND max date didn't advance → DP is
-            # echoing the last page → we've reached account start.
+            # Backstop for the already-fully-collected case (resume when everything
+            # is done but the flag wasn't set): max date stops advancing on all-known
+            # pages → DP is echoing the last page → done.
             if new == 0 and pmax and pmax == prev_max:
-                repeat_streak += 1
-                if repeat_streak >= 2:
-                    _dp_proc["Depositphotos_backfill_done"] = True
-                    _dp_proc.pop("Depositphotos_backfill_page", None)
-                    _save_dp_proc()
-                    _sync_log("✅ Depositphotos: backfill complete (reached account start)")
-                    break
+                stale_pages += 1
+                if stale_pages >= 2:
+                    _mark_backfill_done("page repeats — reached account start"); break
             else:
-                repeat_streak = 0
+                stale_pages = 0
             prev_max = pmax
             page += 1
     else:
         # ── Fast incremental top-scan ──────────────────────────────────────
-        # Rows are newest-first; once we hit 3 consecutive already-saved rows we've
-        # reached collected territory → stop (don't scrape further pages). Exactly
-        # the "після 2-3 повторених рядків далі не скрепи" behaviour.
+        # Rows are newest-first; once we hit 6 consecutive already-saved rows we've
+        # reached collected territory → stop mid-page (don't scrape further pages).
         page = 1
         known_streak = 0
         stop = False
@@ -179,7 +190,7 @@ def _depositphotos_collect(pw_page):
                 if not row["date"]: continue
                 if is_already_saved("Depositphotos", row["asset_id"], row["price"], row["date"]):
                     known_streak += 1
-                    if known_streak >= 3:
+                    if known_streak >= 6:
                         stop = True; break
                     continue
                 known_streak = 0
