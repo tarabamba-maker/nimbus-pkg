@@ -18,6 +18,7 @@ struct GroupPhoto: Codable, Identifiable, Equatable {
     var sales_count: Int?
     var filename: String?
     var thumb: String?
+    var by_stock: [String: SaleStockStat]?
     var id: String { asset_id }
 }
 
@@ -95,14 +96,20 @@ struct GroupsView: View {
 
     private var controls: some View {
         HStack(spacing: 8) {
-            Text("My Groups").font(.system(size: 16, weight: .bold))
+            // Same stock-filter pills as Downloads/BestSellers — drives the top stat
+            // blocks (model.activeStock) on the Groups tab and filters the list.
+            ScrollView(.horizontal, showsIndicators: false) {
+                SlidingPills(options: model.stockList, selected: model.groupsStock) { s in
+                    model.groupsStock = s
+                }
+            }
             SortSegmented(
                 options: ["Earnings", "Sales", "Name"],
                 selected: sort, asc: sortAsc,
                 onSelect: { sort = $0; sortAsc = false },
                 onToggleDir: { sortAsc.toggle() })
                 .offset(x: model.surfaces.pillOffsetX, y: model.surfaces.pillOffsetY)
-            Text("\(store.groups.count)").font(.system(size: 11)).foregroundStyle(model.t3)
+            Text("\(visible.count)").font(.system(size: 11)).foregroundStyle(model.t3)
             Spacer()
             TextField("Search…", text: $search)
                 .textFieldStyle(.plain).frame(width: 130).fieldWell()
@@ -133,6 +140,10 @@ struct GroupsView: View {
     private var visible: [PhotoGroup] {
         var list = search.isEmpty ? store.groups
             : store.groups.filter { $0.name.localizedCaseInsensitiveContains(search) }
+        // Stock filter: show only groups that have earnings from the selected stock.
+        if model.groupsStock != "All" {
+            list = list.filter { ($0.by_stock?[model.groupsStock]?.total ?? 0) > 0 }
+        }
         switch sort {
         case "Sales": list.sort { $0.sales > $1.sales }
         case "Name":  list.sort { $0.name < $1.name }
@@ -281,6 +292,7 @@ struct GroupModal: View {
     @State private var sort = "Earnings"      // Earnings | Downloads | Name
     @State private var sortAsc = false
     @State private var assign: AssignTarget?
+    @State private var photoPopup: GroupPhoto?
     private let cols = [GridItem(.adaptive(minimum: 132, maximum: 132), spacing: 10)]
 
     var body: some View {
@@ -331,7 +343,11 @@ struct GroupModal: View {
                         }
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                         .shadow(color: .black.opacity(0.25), radius: 4, y: 2)
+                        // Same action as a card tap on Downloads/BestSellers: open the
+                        // photo detail popup (per-stock breakdown + group membership).
+                        .onTapGesture { photoPopup = ph }
                         .contextMenu {
+                            Button("Open") { photoPopup = ph }
                             Button("Add to group…") { assign = AssignTarget(id: ph.asset_id) }
                         }
                     }
@@ -345,6 +361,10 @@ struct GroupModal: View {
                     radius: model.surfaces.popupRadius)
         .popupHost(item: $assign) { t in
             GroupAssignPopup(assetID: t.id, onClose: { assign = nil }).environment(model)
+        }
+        .popupHost(item: $photoPopup) { ph in
+            PhotoPopup(assetID: ph.asset_id, thumb: ph.thumb, byStock: ph.by_stock ?? [:],
+                       onClose: { photoPopup = nil }).environment(model)
         }
     }
 

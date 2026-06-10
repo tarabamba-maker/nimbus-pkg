@@ -9,6 +9,7 @@ final class AppModel {
     var stockList: [String] = ["All"]
     var period: Period = .all
     var downloadsStock = "All"
+    var groupsStock = "All"
     var activeTab = 0
     var isDark = true            // theme toggle
     var bgTick = 0              // bump to reload the imported background image
@@ -242,10 +243,11 @@ final class AppModel {
         await groupsStore.ensure()
     }
 
-    /// Active stock filter — Downloads stock on tab 0, BestSellers stock on tab 1.
+    /// Active stock filter — Downloads (0), BestSellers (1), Groups (2).
     var activeStock: String {
         switch activeTab {
         case 1: return best.stock
+        case 2: return groupsStock
         default: return downloadsStock
         }
     }
