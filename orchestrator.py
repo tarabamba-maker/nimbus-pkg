@@ -175,22 +175,6 @@ def _collect_one_stock_global(name, url, allow_login=False):
         except Exception as ex:
             _sync_log(f"[Microstock+] direct API exception: {ex} — fallback")
     if name == "Getty Images":
-        # Getty has the 21st-of-month gate (statements publish ~21st). BUT only gate
-        # once we ALREADY have Getty data — on a cold start (no iStock rows yet) we
-        # must let it run so it pulls whatever statements are already available,
-        # rather than leaving Getty completely empty until the 21st.
-        from datetime import date as _date_g
-        _has_getty = False
-        try:
-            with sqlite3.connect(DB_NAME, timeout=15) as _gc:
-                _has_getty = _gc.execute(
-                    "SELECT 1 FROM sales WHERE stock IN ('iStock','iStockphoto') LIMIT 1"
-                ).fetchone() is not None
-        except Exception:
-            pass
-        if _has_getty and _date_g.today().day < 21:
-            _sync_log(f"📅 [Getty Images] skipped — available from the 21st (today {_date_g.today().day})")
-            return
         try:
             if _getty_collect_direct():
                 return

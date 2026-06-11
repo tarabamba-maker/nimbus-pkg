@@ -591,7 +591,7 @@ _STOCK_LOGIN_URLS = {
     "Adobe Stock":   "https://contributor.stock.adobe.com/en/insights/sales-earnings",
     "Shutterstock":  "https://submit.shutterstock.com/earnings",
     "Depositphotos": "https://depositphotos.com/account/sales-history.html",
-    "Getty Images":  "https://accountmanagement.gettyimages.com/Reports/Export",
+    "Getty Images":  "https://esp.gettyimages.com/contribute/stats",
     "Microstock+":   "https://microstock.plus/myfiles",
     "Envato":        "https://author.envato.com/reports/performance",
     "Freepik":       "https://contributor.magnific.com/statistics",

@@ -38,26 +38,28 @@ def _getty_collect_direct():
 
     _sync_log("🚀 Getty direct: старт...")
 
-    # Once-per-month gate: Getty publishes statements monthly (around the 21st).
-    # Skip entire collector if already ran this calendar month, UNLESS today is
-    # past the 21st and last run was before the 21st (new statement just dropped).
     from datetime import date as _date_gt
     today = _date_gt.today()
+
+    # Statement-availability gate: Getty publishes the statement for month M
+    # around the 21st of month M+1. Skip ONLY when the newest statement that
+    # could exist is already imported (in Getty_statements). If a previous
+    # period is missing — always run, regardless of the day of month.
     proc_file_gt = os.path.join(RECIPES_DIR, "_processed_dates.json")
     try:
         with open(proc_file_gt) as _f: _pd_gt = json.load(_f)
     except Exception:
         _pd_gt = {}
-    last_run_str = _pd_gt.get("Getty_last_run", "")
-    try:
-        from datetime import datetime as _dt_gt
-        last_run = _dt_gt.strptime(last_run_str, "%Y-%m-%d").date() if last_run_str else None
-    except Exception:
-        last_run = None
-    if last_run and last_run.strftime("%Y-%m") == today.strftime("%Y-%m"):
-        # Same month — only re-run if statement-release window crossed (21st).
-        if not (today.day >= 21 and last_run.day < 21):
-            _sync_log(f"⏭️  Getty: вже синкався {last_run_str} (раз на місяць досить) — skip")
+    done_gt = set(_pd_gt.get("Getty_statements", []))
+    if done_gt:
+        # newest statement that should be available now
+        y, m = today.year, today.month
+        m -= 1 if today.day >= 21 else 2
+        while m <= 0:
+            m += 12; y -= 1
+        expected = f"{y}-{m:02d}"
+        if expected in done_gt:
+            _sync_log(f"⏭️  Getty: останній доступний statement {expected} вже імпортовано — skip")
             return True
 
     try:
