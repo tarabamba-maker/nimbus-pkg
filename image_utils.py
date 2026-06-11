@@ -141,8 +141,11 @@ def save_groups(groups: dict):
     # Deduplicate: remove duplicate IDs within each group
     clean = {name: list(dict.fromkeys(str(a) for a in ids))
              for name, ids in groups.items() if ids}
-    with open(GROUPS_FILE, "w") as f:
+    # Atomic write: a crash mid-dump must not leave a truncated groups file.
+    tmp = GROUPS_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(clean, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, GROUPS_FILE)
 
 
 _ms_library_cache: list = []

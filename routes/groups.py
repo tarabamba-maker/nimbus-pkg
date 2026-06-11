@@ -363,9 +363,41 @@ def api_photo_groups_get():
 
 @groups_bp.route('/api/photo-groups', methods=['POST'])
 def api_photo_groups_post():
-    """Оновлює ручні групи."""
+    """Оновлює ручні групи.
+
+    ⚠️ Sanitizer (layer-2 guard): GET returns groups EXPANDED to full pHash
+    clusters (sib_of), and both UIs persist the whole map back on any edit.
+    Without collapsing here, every toggle would write all cross-stock siblings
+    INTO photo_groups.json — the exact bloat regression Pass E/F caused.
+    Rule: within a group keep ONE id per cluster (first occurrence wins;
+    later same-cluster ids are GET-expansion echo-back and get dropped)."""
     data = request.get_json(force=True, silent=True) or {}
-    save_groups(data)
+
+    _matches = _load_matches()
+    cluster_key: dict = {}
+    for _prim, _members in _matches.items():
+        for _x in {str(_prim)} | {str(m) for m in _members}:
+            cluster_key[_x] = str(_prim)
+
+    # Prefer the id that's ALREADY stored on disk for that group, so the
+    # authoritative primary doesn't drift to an arbitrary cluster member.
+    disk = load_groups()
+    clean: dict = {}
+    for gname, aids in (data or {}).items():
+        on_disk = {str(a) for a in disk.get(gname, [])}
+        by_cluster: dict = {}
+        order: list = []
+        for a in (aids or []):
+            a = str(a)
+            ck = cluster_key.get(a, a)   # singleton = its own cluster
+            if ck not in by_cluster:
+                by_cluster[ck] = a
+                order.append(ck)
+            elif a in on_disk and by_cluster[ck] not in on_disk:
+                by_cluster[ck] = a
+        clean[gname] = [by_cluster[ck] for ck in order]
+
+    save_groups(clean)
     return jsonify({"status": "ok"})
 
 

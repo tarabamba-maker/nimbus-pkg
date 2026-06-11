@@ -257,12 +257,24 @@ def api_compute_ms_hashes():
                     'total_complete': len(complete) + computed})
 
 
+# Serializes rebuild-matches: callers are the UI button (Flask request thread),
+# the post-sync auto-rebuild (orchestrator background thread) and the iStock
+# thumbs refresh thread. Concurrent runs would read-modify-write the same JSONs
+# (_cross_stock_matches / photo_groups / _matches_state) and lose data.
+_rebuild_lock = threading.Lock()
+
+
 @matching_bp.route('/api/rebuild-matches', methods=['POST'])
 def api_rebuild_matches(force=False):
     """Rebuild cross-stock matches + sync ms_library groups into photo_groups.json.
     POST {"force": true} wipes the incremental state + group snapshot so the whole
     catalog is re-clustered from scratch (the normal call early-exits 'cached' when
     nothing changed). Internal callers (rebuild-from-db) pass force=True directly."""
+    with _rebuild_lock:
+        return _rebuild_matches_locked(force)
+
+
+def _rebuild_matches_locked(force=False):
     lib      = load_ms_library()
     overrides = _load_overrides()
 
@@ -420,6 +432,20 @@ def api_rebuild_matches(force=False):
     # ms_library shoot membership only. Same reason Pass F's append is gated.
     auto_added = 0
 
+    # ── Pass G: dedup + SAVE groups (BEFORE the slow Pass F) ─────────────
+    # Saving here (not after Pass F) shrinks the lost-update window: a user
+    # group edit during the long visual-matching pass would otherwise be
+    # overwritten by our stale in-memory snapshot. Pass F only READS `groups`.
+    for gname in list(groups.keys()):
+        seen: set = set()
+        deduped = []
+        for aid in groups[gname]:
+            if aid not in seen:
+                seen.add(aid)
+                deduped.append(aid)
+        groups[gname] = deduped
+    save_groups(groups)
+
     # ── Pass F: MS+ visual matching → DISPLAY FOLD (cross_stock_matches) ─────
     # Photos sold ONLY on Envato/Freepik/Deposit (no Adobe/SS/iStock counterpart in
     # asset_meta) can't link to their MS+ shoot via Pass A (pHash between sales
@@ -471,16 +497,7 @@ def api_rebuild_matches(force=False):
         _sync_log(f"⚠️ Pass F (MS+ visual) error: {_exF}")
         ms_added = 0
 
-    # ── Pass G: dedup ────────────────────────────────────────────────────
-    for gname in list(groups.keys()):
-        seen: set = set()
-        deduped = []
-        for aid in groups[gname]:
-            if aid not in seen:
-                seen.add(aid)
-                deduped.append(aid)
-        groups[gname] = deduped
-    save_groups(groups)
+    # (Pass G moved BEFORE Pass F — groups already deduped + saved above.)
 
     # ── Pass H: apply manual overrides ───────────────────────────────────
     matches, override_changes = _apply_manual_overrides(matches, overrides)

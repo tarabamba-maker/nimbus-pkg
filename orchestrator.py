@@ -391,22 +391,36 @@ def _sync_all_global():
             # matching works for all stocks (SS/Adobe/iStock/etc. with missing thumbs).
             try:
                 from app_globals import CACHE_DIR
-                from image_utils import load_img_async
+                from image_utils import load_img, load_match_thumb
+                from concurrent.futures import ThreadPoolExecutor, wait as _fwait
                 cached_set = set(f[:-4] for f in os.listdir(CACHE_DIR) if f.endswith('.jpg')) if os.path.isdir(CACHE_DIR) else set()
                 with sqlite3.connect(DB_NAME, timeout=15) as _c:
                     missing = _c.execute(
                         "SELECT DISTINCT asset_id, stock, thumb_url FROM sales "
                         "WHERE thumb_url IS NOT NULL AND thumb_url != '' "
-                        "AND asset_id NOT IN (SELECT asset_id FROM asset_meta)"
+                        "AND asset_id NOT IN (SELECT asset_id FROM asset_meta "
+                        "                     WHERE asset_id IS NOT NULL)"
                     ).fetchall()
-                backfill_count = 0
-                for aid, stock, turl in missing:
-                    if _sync_stop_flag[0]: break
-                    if aid not in cached_set:
-                        load_img_async(aid, turl, None, is_adobe=(stock == 'Adobe Stock'), stock=stock)
-                        backfill_count += 1
-                if backfill_count:
-                    _sync_log(f"🖼️ Backfill: {backfill_count} missing thumbnails queued")
+
+                # Download SYNCHRONOUSLY (own pool + wait) — compute-hashes and
+                # rebuild-matches below must see these files, otherwise the photos
+                # only cluster on the NEXT sync (the "groups one sync late" bug).
+                def _bf_one(aid, stock, turl):
+                    if _sync_stop_flag[0]:
+                        return
+                    if stock == 'Adobe Stock':
+                        load_img(aid, turl)            # display thumb (no meta)
+                        load_match_thumb(aid, turl)    # clean thumb → asset_meta
+                    else:
+                        load_img(aid, turl, stock=stock)
+
+                todo = [(a, s, t) for a, s, t in missing if a not in cached_set]
+                if todo:
+                    _sync_log(f"🖼️ Backfill: {len(todo)} missing thumbnails, downloading…")
+                    with ThreadPoolExecutor(max_workers=10) as _bfp:
+                        futs = [_bfp.submit(_bf_one, a, s, t) for a, s, t in todo]
+                        _fwait(futs, timeout=600)
+                    _sync_log(f"🖼️ Backfill done ({len(todo)})")
             except Exception as _ex:
                 _sync_log(f"⚠️ Thumbnail backfill error: {_ex}")
             # Compute pHash for any cached thumbnails that still lack asset_meta rows.

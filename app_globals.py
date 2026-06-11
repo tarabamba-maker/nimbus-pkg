@@ -48,8 +48,11 @@ def _load_matches() -> dict:
 
 
 def _save_matches(m: dict):
-    with open(MATCHES_FILE, "w") as f:
+    # Atomic write: a crash mid-dump must not leave a truncated matches file.
+    tmp = MATCHES_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(m, f, indent=2)
+    os.replace(tmp, MATCHES_FILE)
 
 
 def _load_overrides() -> dict:
