@@ -131,7 +131,21 @@ final class AppModel {
     }
 
     // Photo-group membership: { groupName: [assetIds] }.
-    var photoGroups: [String: [String]] = [:]
+    // The map is sib_of-EXPANDED by the backend (~65k ids), so naive scans are
+    // O(groups × members) — called per card per render that froze BestSellers'
+    // Ungrouped filter. groupIndex is the O(1) reverse lookup, rebuilt on set.
+    var photoGroups: [String: [String]] = [:] {
+        didSet {
+            var idx: [String: [String]] = [:]
+            idx.reserveCapacity(photoGroups.values.reduce(0) { $0 + $1.count })
+            for (g, ids) in photoGroups {
+                for a in ids { idx[a, default: []].append(g) }
+            }
+            for k in idx.keys { idx[k]?.sort() }
+            groupIndex = idx
+        }
+    }
+    private var groupIndex: [String: [String]] = [:]
 
     func refresh() async {
         async let s = try? await API.stats()
@@ -142,9 +156,9 @@ final class AppModel {
         if let g = await g { photoGroups = g }
     }
 
-    /// Group names that contain a given asset id.
+    /// Group names that contain a given asset id. O(1) via the reverse index.
     func groups(for assetID: String) -> [String] {
-        photoGroups.filter { $0.value.contains(assetID) }.keys.sorted()
+        groupIndex[assetID] ?? []
     }
 
     var allGroupNames: [String] { photoGroups.keys.sorted() }
