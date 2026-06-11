@@ -348,8 +348,18 @@ def _ms_visual_matches(aid_to_group, strict_hamming=4, loose_hamming=8, loose_rg
     # `*_to_anchor`: the MS+ photo's canonical id (its first stockid). This is NOT
     # stockid-based MATCHING (matching is 100% pHash+RGB below) — it's only the join
     # key the visual match folds onto, so each photo lands on the CORRECT card.
+    # ⚠️ MUST mirror routes/matching.py _pick_primary (_PRIMARY_PRIORITY): Pass D
+    # stores THAT primary in photo_groups. If the anchor is a different stockid
+    # (e.g. dict-order first = alamy), Pass F clusters the sale onto an id the
+    # group doesn't contain → the group shows $0 (the "Cooking home" bug).
+    _ANCHOR_PRIORITY = ['adobestock', 'shutterstock', 'istock', 'esp', 'depositphotos']
     def _anchor_of(stockids):
-        vals = [str(v) for v in (stockids or {}).values() if v]
+        sids = stockids or {}
+        for key in _ANCHOR_PRIORITY:
+            v = sids.get(key)
+            if v:
+                return str(v)
+        vals = [str(v) for v in sids.values() if v]
         return vals[0] if vals else ''
     bp_to_group = {}
     fname_to_group = {}  # legacy fallback
