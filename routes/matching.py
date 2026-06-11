@@ -334,10 +334,9 @@ def api_rebuild_matches(force=False):
             _load_matches(), incremental_from_rowid=_last_am_rowid)
 
     # Pass B (ms_library stockids clustering) removed — matching is pHash+RGB only.
+    # Pass C (filename fallback) removed — always returned 0 pairs; Pass A/F cover this.
     ms_added_pairs = 0
-
-    # ── Pass C: filename fallback ────────────────────────────────────────
-    matches, fn_pairs = _filename_fallback_matches(matches, lib)
+    fn_pairs = 0
     _save_matches(matches)
 
     # ── Pass D: sync MS+ groups → photo_groups (DIFF-BASED) ──────────────
