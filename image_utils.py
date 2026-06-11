@@ -137,6 +137,42 @@ def load_groups() -> dict:
         return {}
 
 
+MANUAL_MEMBERS_FILE = os.path.join(RECIPES_DIR, "_manual_group_members.json")
+
+
+def _snapshot_manual_members(groups: dict):
+    """Persist user-added group members (ids that don't exist in ms_library at
+    all) to a separate file. Pass D re-applies them after every rebuild — incl.
+    FORCE rebuilds, which otherwise wipe photo_groups back to ms_library-only
+    and silently lose hand-built group curation. Runs on EVERY save_groups, so
+    UI removals also propagate (removed id disappears from the snapshot too)."""
+    try:
+        ms_ids = set()
+        for e in load_ms_library():
+            for v in (e.get('stockids') or {}).values():
+                if v:
+                    ms_ids.add(str(v))
+        manual = {}
+        for name, ids in groups.items():
+            extra = [str(a) for a in ids if str(a) not in ms_ids]
+            if extra:
+                manual[name] = extra
+        tmp = MANUAL_MEMBERS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(manual, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, MANUAL_MEMBERS_FILE)
+    except Exception:
+        pass
+
+
+def load_manual_members() -> dict:
+    try:
+        with open(MANUAL_MEMBERS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def save_groups(groups: dict):
     # Deduplicate: remove duplicate IDs within each group
     clean = {name: list(dict.fromkeys(str(a) for a in ids))
@@ -146,6 +182,7 @@ def save_groups(groups: dict):
     with open(tmp, "w") as f:
         json.dump(clean, f, indent=2, ensure_ascii=False)
     os.replace(tmp, GROUPS_FILE)
+    _snapshot_manual_members(clean)
 
 
 _ms_library_cache: list = []

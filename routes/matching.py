@@ -432,6 +432,26 @@ def _rebuild_matches_locked(force=False):
     # ms_library shoot membership only. Same reason Pass F's append is gated.
     auto_added = 0
 
+    # ── Re-apply MANUAL group members (survive force rebuilds) ───────────
+    # _manual_group_members.json is snapshotted by save_groups() on every UI
+    # edit: ids the user added by hand that don't exist in ms_library at all.
+    # A force rebuild starts groups from scratch (ms_library only) — without
+    # this they'd be silently lost. Groups deleted by the user stay deleted
+    # only if their manual ids were removed too (snapshot follows UI saves).
+    try:
+        from image_utils import load_manual_members
+        _manual_restored = 0
+        for _mg, _mids in load_manual_members().items():
+            cur = groups.setdefault(_mg, [])
+            have = set(cur)
+            for _mid in _mids:
+                if _mid not in have:
+                    cur.append(_mid); have.add(_mid); _manual_restored += 1
+        if _manual_restored:
+            _sync_log(f"♻️ Відновлено {_manual_restored} ручних фото у групах")
+    except Exception as _exM:
+        _sync_log(f"⚠️ manual members restore: {_exM}")
+
     # ── Pass G: dedup + SAVE groups (BEFORE the slow Pass F) ─────────────
     # Saving here (not after Pass F) shrinks the lost-update window: a user
     # group edit during the long visual-matching pass would otherwise be
