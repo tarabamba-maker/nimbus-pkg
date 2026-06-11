@@ -226,21 +226,47 @@ def _hash_based_matches(existing_matches, threshold=4, incremental_from_rowid=No
 
         # ⚠️ Multiprocessing DISABLED. A spawn Pool deadlocks inside the app-launched
         # Flask server (workers wedge at 0% CPU forever → the whole rebuild hangs).
-        # The single-core numpy loop below is already vectorised (popcount LUT) and
-        # fast enough (~35s on 35k) — reliability beats the few seconds saved.
-        _sync_log(f"⚙️ pHash matching: {len(rows_to_scan)} рядків…")
+        # Speed comes from LSH bucketing instead (below) — single-core, deterministic.
+        #
+        # LSH / pigeonhole bucketing: split the 64-bit hash into (threshold+1)
+        # disjoint bit-chunks. If hamming(a,b) ≤ threshold, at LEAST one chunk is
+        # bitwise IDENTICAL (pigeonhole) — so the true candidate set is fully
+        # contained in the union of same-chunk buckets. EXACT same verdict as the
+        # full scan, but each row compares against ~hundreds instead of all n.
+        nchunks = threshold + 1
+        cbits = 64 // nchunks
+        chunk_vals = []          # per chunk: int array of that chunk's bits
+        buckets = []             # per chunk: {value: [row indices]}
+        for c in range(nchunks):
+            shift = np.uint64(c * cbits)
+            width = 64 - c * cbits if c == nchunks - 1 else cbits
+            mask = np.uint64((1 << width) - 1)
+            vals = ((H >> shift) & mask).astype(np.int64)
+            chunk_vals.append(vals)
+            d: dict = {}
+            for i, v in enumerate(vals.tolist()):
+                d.setdefault(v, []).append(i)
+            buckets.append(d)
+
+        _sync_log(f"⚙️ pHash matching (LSH): {len(rows_to_scan)} рядків…")
         for i in rows_to_scan:
-            cand = _popcount(H ^ H[i]) <= threshold       # hamming ≤ threshold
-            cand[i] = False
-            cand &= (S != S[i])                            # different stock
-            if AR[i] >= 0:                                 # aspect within 0.05 (if both have it)
-                cand &= ((AR < 0) | (np.abs(AR - AR[i]) <= 0.05))
-            if has_rgb[i]:                                 # RGB L1 ≤ 45 (if both have it)
-                l1 = np.abs(R - R[i]) + np.abs(G - G[i]) + np.abs(B - B[i])
-                cand &= (~has_rgb | (l1 <= 45))
+            cset: set = set()
+            for c in range(nchunks):
+                cset.update(buckets[c].get(int(chunk_vals[c][i]), ()))
+            cset.discard(i)
+            if not cset:
+                continue
+            idx = np.fromiter(cset, dtype=np.int64, count=len(cset))
+            cand = _popcount(H[idx] ^ H[i]) <= threshold   # hamming ≤ threshold
+            cand &= (S[idx] != S[i])                        # different stock
+            if AR[i] >= 0:                                  # aspect within 0.05 (if both have it)
+                cand &= ((AR[idx] < 0) | (np.abs(AR[idx] - AR[i]) <= 0.05))
+            if has_rgb[i]:                                  # RGB L1 ≤ 45 (if both have it)
+                l1 = np.abs(R[idx] - R[i]) + np.abs(G[idx] - G[i]) + np.abs(B[idx] - B[i])
+                cand &= (~has_rgb[idx] | (l1 <= 45))
             if full:
-                cand[:i + 1] = False                       # only j>i: process each pair once
-            for j in np.nonzero(cand)[0]:
+                cand &= (idx > i)                           # only j>i: process each pair once
+            for j in idx[cand]:
                 _merge(aids[i], aids[int(j)])
         return existing_matches, new_pairs, max_rowid
 
@@ -419,7 +445,27 @@ def _ms_visual_matches(aid_to_group, strict_hamming=4, loose_hamming=8, loose_rg
             MNEW[i] = bool(is_new_ms); MGN[i] = gn; MANC[i] = anc
         _POP = np.array([bin(x).count('1') for x in range(256)], dtype=np.uint8)
         def _popc(arr): return _POP[arr.view(np.uint8).reshape(-1, 8)].sum(axis=1)
-        _sync_log(f"⚙️ MS+ visual matching (numpy): {len(sales_rows)}×{m}…")
+
+        # LSH / pigeonhole bucketing over the MS+ hashes (same trick as Pass A):
+        # split 64 bits into (loose_hamming+1) chunks; any MS+ hash within
+        # loose_hamming of the sale hash MUST share at least one exact chunk.
+        # Exact same verdict, but each sale compares vs ~tens instead of all m.
+        nchunks = loose_hamming + 1
+        cbits = 64 // nchunks
+        _chunk_meta = []          # (shift, mask) per chunk
+        ms_buckets = []           # per chunk: {value: np.array(row indices)}
+        for c in range(nchunks):
+            shift = np.uint64(c * cbits)
+            width = 64 - c * cbits if c == nchunks - 1 else cbits
+            mask = np.uint64((1 << width) - 1)
+            vals = ((MH >> shift) & mask).astype(np.int64)
+            d: dict = {}
+            for i, v in enumerate(vals.tolist()):
+                d.setdefault(v, []).append(i)
+            ms_buckets.append(d)
+            _chunk_meta.append((int(c * cbits), int(mask)))
+
+        _sync_log(f"⚙️ MS+ visual matching (numpy+LSH): {len(sales_rows)}×{m}…")
         for stock, aid, ha, ara, ra, ga, ba in sales_rows:
             aid = str(aid)
             if aid in aid_to_group:
@@ -429,28 +475,38 @@ def _ms_visual_matches(aid_to_group, strict_hamming=4, loose_hamming=8, loose_rg
                 ha_int = int(ha, 16)
             except Exception:
                 continue
-            pop = _popc(MH ^ np.uint64(ha_int & 0xFFFFFFFFFFFFFFFF))
+            ha_int &= 0xFFFFFFFFFFFFFFFF
+            cset: set = set()
+            for c in range(nchunks):
+                shift, mask = _chunk_meta[c]
+                cset.update(ms_buckets[c].get((ha_int >> shift) & mask, ()))
+            if not cset:
+                continue
+            idx = np.fromiter(cset, dtype=np.int64, count=len(cset))
+            pop = _popc(MH[idx] ^ np.uint64(ha_int))
             cand = pop <= loose_hamming
             if not is_new_sale:
-                cand &= MNEW                       # incremental: ≥1 side new
+                cand &= MNEW[idx]                  # incremental: ≥1 side new
             if ara:
-                cand &= ((MAR < 0) | (np.abs(MAR - ara) <= 0.15))
+                cand &= ((MAR[idx] < 0) | (np.abs(MAR[idx] - ara) <= 0.15))
             if isinstance(ra, int) and isinstance(ga, int) and isinstance(ba, int):
-                rgb = np.abs(MR - ra) + np.abs(MG - ga) + np.abs(MB - ba)
-                strict_ok = (pop <= strict_hamming) & ((~has_rgb_ms) | (rgb <= 30))
-                loose_ok  = (pop > strict_hamming) & has_rgb_ms & (rgb <= loose_rgb_max)
+                rgb = np.abs(MR[idx] - ra) + np.abs(MG[idx] - ga) + np.abs(MB[idx] - ba)
+                strict_ok = (pop <= strict_hamming) & ((~has_rgb_ms[idx]) | (rgb <= 30))
+                loose_ok  = (pop > strict_hamming) & has_rgb_ms[idx] & (rgb <= loose_rgb_max)
             else:
-                strict_ok = (pop <= strict_hamming)   # no sale RGB → strict on hamming only
-                loose_ok  = np.zeros(m, bool)          # loose needs RGB → reject
+                strict_ok = (pop <= strict_hamming)    # no sale RGB → strict on hamming only
+                loose_ok  = np.zeros(len(idx), bool)   # loose needs RGB → reject
             cand &= (strict_ok | loose_ok)
             if not cand.any():
                 continue
-            idxs = np.nonzero(cand)[0]
-            j = int(idxs[np.argmin(pop[idxs])])        # best = min hamming (first on tie)
-            additions.setdefault(MGN[j], []).append(aid)
-            aid_to_group[aid] = MGN[j]
-            if MANC[j]:
-                aid_to_anchor[aid] = MANC[j]
+            sub = np.nonzero(cand)[0]
+            # best = min hamming; tie-break on ORIGINAL row order (j) so the verdict
+            # is identical to the pre-LSH full scan (np.argmin took the first row).
+            jbest = min((int(pop[s]), int(idx[s])) for s in sub)[1]
+            additions.setdefault(MGN[jbest], []).append(aid)
+            aid_to_group[aid] = MGN[jbest]
+            if MANC[jbest]:
+                aid_to_anchor[aid] = MANC[jbest]
         return additions, aid_to_anchor
 
     # ── pure-Python fallback (numpy unavailable) ──
