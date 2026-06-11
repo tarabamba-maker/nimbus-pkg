@@ -341,16 +341,30 @@ Adobe dashboard (the 6564 vs 1108 proof).
    **pHash+RGB only** (Pass A + Pass F). `api_photo_groups_get` no longer reads ms_library
    stockids at all.
 
-4. **Freepik: 2615 assets had no thumbnail in `img_cache/`** → no pHash → not matchable.
-   Fixed: Freepik collector now backfills missing thumbnails on every sync (step 4 in
-   `_freepik_collect`). After next sync + Rebuild Matches → all Freepik photos get pHash
-   and will appear in correct groups.
+4. **Missing thumbnails → pHash gap (ALL stocks, 2026-06-11 fix).** Any photo without
+   a thumbnail in `img_cache/` has no `asset_meta` → Pass F never sees it → its cluster
+   is never merged with sibling stocks. Concrete example: SS `2701807961` (Churchill
+   recolour B94A5199) had no thumbnail → separate cluster from Adobe `1792588265` →
+   user had to link manually. Fix in two places:
+   - `collectors/freepik.py` step 4: backfills 2615 Freepik photos with `thumb_url` in DB
+     but no img_cache file on every sync.
+   - `orchestrator.py` post-sync backfill: after all collectors finish, queries ALL sales
+     with `thumb_url` but no `asset_meta`, queues `load_img_async` for each. Catches SS
+     (53 missing), Adobe (202 missing), iStock (1), etc. Runs before rebuild-matches.
 
 5. **BestSellers multi-select** — added Cmd/Shift+click + "Add to group" action bar
    (identical to Downloads). `TopPhotoCard` now accepts `isSelected` param with accent
    border + scale highlight.
 
 **After restart + sync + Rebuild Matches** all stocks should show group badges.
+
+### ⚠️ pHash matching gap — root cause to remember
+When two sales photos from different stocks represent the SAME physical photo but neither
+has a thumbnail yet, Pass F can't merge their clusters. The only cure is: download ALL
+missing thumbnails BEFORE rebuild-matches. The orchestrator backfill (added 2026-06-11)
+does this automatically. If groups still split after a sync, check for photos without
+`asset_meta` first: `SELECT DISTINCT asset_id, stock FROM sales WHERE asset_id NOT IN
+(SELECT asset_id FROM asset_meta) AND thumb_url IS NOT NULL LIMIT 20;`
 
 ### 4. FIXED (2026-06-09) — "Sync All: not logged in" false negatives
 After login to all windows, Sync All reported the 4 marker stocks (Getty, Envato,
