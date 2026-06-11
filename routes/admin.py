@@ -25,10 +25,8 @@ from app_globals import (
 from config import STOCK_URLS
 from cookies import (
     _STOCK_COOKIE_DOMAINS,
-    _chrome_cookies_path, _detect_default_browser,
-    _import_cookies_for_stock, _inject_cookies_via_playwright,
-    _is_chrome_running, _is_safari_running,
-    _parse_safari_binarycookies, _windows_browser_login,
+    _inject_cookies_via_playwright,
+    _windows_browser_login,
     _stock_has_valid_session,
 )
 from db import init_db
@@ -159,82 +157,7 @@ def api_import_chrome_cookies():
                         'total_imported': total, 'per_stock': results,
                         'already_logged_in': already})
 
-    safari_cookies_path = (
-        os.path.expanduser("~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
-        if IS_MAC else ''
-    )
-    chrome_cookies_path = _chrome_cookies_path()
-
-    if requested in ('safari', 'chrome'):
-        source = requested
-        if source == 'safari' and not IS_MAC:
-            return jsonify({'status': 'error',
-                            'msg': 'Safari is only available on macOS. Use Chrome on Windows.'}), 400
-    else:
-        if IS_WIN:
-            source = 'chrome' if chrome_cookies_path else 'none'
-        else:
-            detected = _detect_default_browser()
-            if detected == 'safari' and os.path.exists(safari_cookies_path):
-                source = 'safari'
-            elif detected == 'chrome' and os.path.exists(chrome_cookies_path):
-                source = 'chrome'
-            elif detected in (None, 'edge', 'firefox', 'arc') and os.path.exists(safari_cookies_path):
-                source = 'safari'
-            elif os.path.exists(chrome_cookies_path):
-                source = 'chrome'
-            else:
-                return jsonify({'status': 'error',
-                                'msg': f'Default browser ({detected or "unknown"}) not supported. Only Safari/Chrome.'}), 404
-        if source == 'none':
-            return jsonify({'status': 'error',
-                            'msg': 'Chrome cookies not found. Install Chrome and log in to a stock site first.'}), 404
-
-    if source == 'safari':
-        if _is_safari_running():
-            return jsonify({'status': 'error',
-                            'msg': 'Safari запущений — закрий повністю (Cmd+Q) і спробуй знову'}), 409
-        if not os.path.exists(safari_cookies_path):
-            return jsonify({'status': 'error',
-                            'msg': f'Safari cookies not found at {safari_cookies_path}'}), 404
-        try:
-            all_cookies = _parse_safari_binarycookies(safari_cookies_path)
-        except PermissionError:
-            return jsonify({'status': 'error',
-                'msg': 'macOS блокує доступ до Safari cookies. '
-                       'Надай Full Disk Access застосунку:\n'
-                       '1. System Settings → Privacy & Security → Full Disk Access\n'
-                       '2. Натисни "+" і додай /Applications/Stock Automation.app\n'
-                       '3. Перезапусти Stock Automation і спробуй знову'}), 403
-        except Exception as e:
-            if 'Operation not permitted' in str(e) or 'Errno 1' in str(e):
-                return jsonify({'status': 'error',
-                    'msg': 'macOS блокує доступ до Safari cookies. '
-                           'System Settings → Privacy & Security → Full Disk Access → '
-                           'додай Stock Automation.app → перезапусти застосунок.'}), 403
-            return jsonify({'status': 'error', 'msg': f'Safari parse: {e}'}), 500
-
-        results = []
-        for stock in stocks:
-            patterns = _STOCK_COOKIE_DOMAINS.get(stock, [])
-            filt = [c for c in all_cookies
-                    if any(p in c.get('domain', '') for p in patterns)]
-            n = _inject_cookies_via_playwright(stock, filt)
-            results.append({'stock': stock, 'imported': n,
-                           'msg': f'matched {len(filt)} from Safari'})
-        total = sum(r.get('imported', 0) for r in results)
-        return jsonify({'status': 'ok', 'source': 'safari',
-                        'total_imported': total, 'per_stock': results})
-
-    if _is_chrome_running():
-        return jsonify({'status': 'error',
-                        'msg': 'Google Chrome запущений — закрий повністю (Cmd+Q) і спробуй знову'}), 409
-    results = []
-    for s in stocks:
-        results.append(_import_cookies_for_stock(s, chrome_cookies_path))
-    total = sum(r.get('imported', 0) for r in results)
-    return jsonify({'status': 'ok', 'source': 'chrome',
-                    'total_imported': total, 'per_stock': results})
+    return jsonify({'status': 'error', 'msg': 'Platform not supported'}), 400
 
 
 # ── Reset / Rebuild ───────────────────────────────────────────────────────────

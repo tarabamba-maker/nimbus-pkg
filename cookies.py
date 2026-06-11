@@ -1,16 +1,19 @@
 """
-cookies.py — Browser cookie helpers (macOS Safari + Windows Chrome).
+cookies.py — Browser cookie helpers.
 
-Moved here from main.py (logic unchanged — only location changed):
+Primary cookie source: recipes/_pw_cookies.json — captured directly from
+the in-app Playwright context (decrypted, httpOnly included) during login.
+_load_browser_cookies() reads this first on macOS; Windows uses app Chrome profiles.
+
+Functions:
+  - _save_pw_cookie_cache, _load_pw_cookie_cache, _capture_pw_cookies, _wait_close_capturing
   - _is_chrome_running, _chrome_cookies_path
   - _decrypt_chrome_cookie_db, _load_chrome_cookies_windows
   - _load_appprofile_cookies_windows, _load_browser_cookies
-  - _parse_safari_binarycookies
   - _inject_cookies_via_playwright
   - _STOCK_COOKIE_DOMAINS, _import_cookies_for_stock
-  - _is_safari_running, _detect_default_browser
   - _STOCK_LOGIN_URLS, _stock_profile_dir, _clear_profile_locks
-  - _windows_browser_login
+  - _windows_browser_login, _stock_has_valid_session
 """
 
 import os
@@ -472,60 +475,6 @@ def _load_browser_cookies():
     return []
 
 
-def _parse_safari_binarycookies(filepath):
-    """Parse Apple's binarycookies format. Returns list of cookie dicts."""
-    import struct
-    with open(filepath, 'rb') as f:
-        data = f.read()
-    if data[:4] != b'cook':
-        raise ValueError('Not a Safari Cookies.binarycookies file')
-
-    num_pages = struct.unpack('>I', data[4:8])[0]
-    page_sizes = []
-    off = 8
-    for _ in range(num_pages):
-        page_sizes.append(struct.unpack('>I', data[off:off+4])[0])
-        off += 4
-    # Skip checksum (uint32 BE) + footer (uint64 BE)
-    cookies = []
-    page_start = off + 4  # there's also a checksum block but offset may differ
-    # The robust way: just find each page by its magic 0x00000100 starting from off
-    cur = off
-    for page_size in page_sizes:
-        page = data[cur:cur+page_size]
-        cur += page_size
-        # Page magic is exactly 4 bytes 00 00 01 00 (NOT a number — endianness-agnostic byte sequence)
-        if len(page) < 4 or page[:4] != b'\x00\x00\x01\x00':
-            continue
-        n_cookies = struct.unpack('<I', page[4:8])[0]
-        offsets = [struct.unpack('<I', page[8+i*4:12+i*4])[0] for i in range(n_cookies)]
-        for co in offsets:
-            try:
-                csize = struct.unpack('<I', page[co:co+4])[0]
-                cd = page[co:co+csize]
-                flags = struct.unpack('<I', cd[8:12])[0]
-                url_off  = struct.unpack('<I', cd[16:20])[0]
-                name_off = struct.unpack('<I', cd[20:24])[0]
-                path_off = struct.unpack('<I', cd[24:28])[0]
-                val_off  = struct.unpack('<I', cd[28:32])[0]
-                expiration = struct.unpack('<d', cd[40:48])[0]
-                def _rs(o):
-                    end = cd.index(b'\x00', o)
-                    return cd[o:end].decode('utf-8', errors='replace')
-                cookies.append({
-                    'domain': _rs(url_off),
-                    'name':   _rs(name_off),
-                    'value':  _rs(val_off),
-                    'path':   _rs(path_off) or '/',
-                    'expires': (expiration + 978307200) if expiration > 0 else -1,
-                    'secure':   bool(flags & 1),
-                    'httpOnly': bool(flags & 4),
-                })
-            except Exception:
-                continue
-    return cookies
-
-
 def _inject_cookies_via_playwright(stock_name, cookies):
     """Open a brief headless Playwright context with the stock profile and
     inject given cookies via the standard API. Cookies persist in profile."""
@@ -635,44 +584,6 @@ def _import_cookies_for_stock(stock_name, source_cookies_db):
         return {'stock': stock_name, 'imported': 0, 'error': f'write dest: {e}'}
 
     return {'stock': stock_name, 'imported': len(rows)}
-
-
-def _is_safari_running():
-    """Returns True if Safari is currently running."""
-    import subprocess
-    try:
-        r = subprocess.run(['pgrep', '-x', 'Safari'], capture_output=True, timeout=5)
-        return r.returncode == 0
-    except Exception:
-        return False
-
-
-def _detect_default_browser():
-    """Detects macOS default browser via LaunchServices plist. Returns one of
-    'safari', 'chrome', 'edge', or None."""
-    import plistlib
-    plist_path = os.path.expanduser(
-        '~/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist')
-    if not os.path.exists(plist_path):
-        return None
-    try:
-        with open(plist_path, 'rb') as f:
-            data = plistlib.load(f)
-    except Exception:
-        return None
-    bundle = None
-    for h in data.get('LSHandlers', []):
-        if h.get('LSHandlerURLScheme') == 'http':
-            bundle = (h.get('LSHandlerRoleAll') or '').lower()
-            break
-    if not bundle:
-        return None
-    if 'safari' in bundle:        return 'safari'
-    if 'chrome' in bundle:        return 'chrome'
-    if 'edgemac' in bundle:       return 'edge'
-    if 'firefox' in bundle:       return 'firefox'
-    if 'thebrowser' in bundle:    return 'arc'
-    return None
 
 
 # Login landing pages per stock — same URLs the sync login flow uses.

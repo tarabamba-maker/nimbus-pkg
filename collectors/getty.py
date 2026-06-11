@@ -30,10 +30,9 @@ RECIPES_DIR = os.path.join(_BASE_DIR, "recipes")
 
 
 def _getty_collect_direct():
-    """Getty/iStock via direct requests + Safari cookies.
-    NO Playwright. NO login dance for accountmanagement.
-    Reads ccw + accountmanagement cookies from Safari, fetches CSRF token from
-    /Reports/Export HTML, then POSTs to /Reports/Export per month period
+    """Getty/iStock via direct requests + in-app browser cookies. NO Playwright.
+    Reads ccw + accountmanagement cookies from _pw_cookies.json, fetches CSRF
+    token from /Reports/Export HTML, then POSTs to /Reports/Export per month
     to download TSV statements. Returns True on success."""
     from image_utils import load_img_async
 
@@ -67,13 +66,13 @@ def _getty_collect_direct():
         _sync_log(f"⚠️ Getty direct: cookies read failed: {e} — fallback")
         return False
     if not all_cookies:
-        _sync_log("⚠️ Getty direct: no browser cookies — log in to ESP in Safari (mac) / Chrome (win)")
+        _sync_log("⚠️ Getty direct: no browser cookies — log in via the app browser")
         return False
 
     g_cookies = {c['name']: c['value'] for c in all_cookies
                  if 'gettyimages' in c.get('domain', '').lower()}
     if 'ccw' not in g_cookies:
-        _sync_log("⚠️ Getty direct: no ccw cookie — login потрібен у Safari, fallback")
+        _sync_log("⚠️ Getty direct: no ccw cookie — log in via the app browser, fallback")
         return False
 
     import urllib.parse as _up
@@ -96,7 +95,7 @@ def _getty_collect_direct():
         return False
     if r.status_code != 200:
         _sync_log(f"⚠️ Getty direct: accountmanagement not logged in (HTTP {r.status_code}). "
-                  f"Залогінься в Safari на https://accountmanagement.gettyimages.com → fallback")
+                  f"Log in via the app browser → https://accountmanagement.gettyimages.com → fallback")
         return False
     csrf_match = re.search(r'name="__RequestVerificationToken"[^>]+value="([^"]+)"', r.text)
     if not csrf_match:

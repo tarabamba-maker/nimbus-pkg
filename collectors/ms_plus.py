@@ -27,11 +27,10 @@ os.makedirs(MS_CACHE_DIR, exist_ok=True)
 
 
 def _ms_plus_collect_direct():
-    """MS+ via direct requests + Safari cookies — bypasses Playwright cookie sync
-    issues. Returns True on success (caller skips Playwright fallback).
+    """MS+ via direct requests + in-app browser cookies. NO Playwright.
+    Returns True on success (caller skips Playwright fallback).
 
-    ⚠️ DO NOT TOUCH — works reliably when Safari MS+ session is valid.
-    Tested: 163 folders + paginated photos returned in <1 minute."""
+    ⚠️ DO NOT TOUCH — works reliably. Tested: 163 folders + paginated photos in <1 min."""
     from image_utils import load_ms_library, save_ms_library
 
     _sync_log("🚀 Microstock+ direct: старт...")
@@ -42,7 +41,7 @@ def _ms_plus_collect_direct():
         _sync_log(f"⚠️ MS+ direct: cookies read failed: {e} — fallback")
         return False
     if not all_cookies:
-        _sync_log("⚠️ MS+ direct: no browser cookies — log in to microstock.plus in Safari (mac) / Chrome (win)")
+        _sync_log("⚠️ MS+ direct: no browser cookies — log in via the app browser")
         return False
 
     ms_cookies = {c['name']: c['value'] for c in all_cookies
@@ -73,7 +72,7 @@ def _ms_plus_collect_direct():
     if not dirs_resp.get("isOk"):
         msg = dirs_resp.get("message", "unknown")
         if "сессия" in msg.lower() or "session" in msg.lower():
-            _sync_log("⚠️ MS+ direct: session expired in Safari — залогінься на microstock.plus у Safari, перезапусти sync")
+            _sync_log("⚠️ MS+ direct: session expired — залогінься на microstock.plus у in-app browser, перезапусти sync")
         else:
             _sync_log(f"⚠️ MS+ direct: getfulllist failed: {msg} — fallback")
         return False

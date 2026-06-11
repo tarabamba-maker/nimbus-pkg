@@ -27,27 +27,18 @@ RECIPES_DIR = os.path.join(_BASE_DIR, "recipes")
 
 def _shutterstock_api_collect_direct():
     """Pure-requests Shutterstock collector. NO Playwright.
-    Uses datadome trust cookie from Safari → bypasses anti-bot at full speed.
-    Returns True on success (caller skips Playwright fallback).
+    Uses datadome trust cookie from the in-app browser login cache → bypasses
+    anti-bot at full speed. Returns True on success.
 
     ⚠️ DO NOT TOUCH WITHOUT TESTING ON REAL SS ACCOUNT
-    History: SS via Playwright + page.evaluate() got DataDome-blocked because
-    browser fingerprinting + JS challenges. Direct API call with the user's
-    own session cookies (extracted from Safari binarycookies) works at 100/sec
-    without any rate limits, because the datadome cookie carries the trust
-    earned by the user's daily browsing.
-
-    Hard requirements that look removable but ARE required:
+    Hard requirements:
     1. session.cookies.update(ss_cookies) — passing cookies as kwarg per-request
        doesn't carry datadome properly across redirects.
-    2. User-Agent must look like real Safari (matches the browser that minted
-       the datadome cookie). Generic UA → 403.
-    3. x-end-app-name: contributor-web header — without it server returns HTML
-       login redirect instead of JSON.
-    4. consec_403 fallback — if datadome cookie expires mid-sync, we fall back
-       to Playwright so user can re-login and import cookies again.
-    5. The 'accts_contributor' cookie check (not just 'datadome') ensures the
-       user is actually logged in, not just has a trust token.
+    2. User-Agent must match what minted the datadome cookie. Generic UA → 403.
+    3. x-end-app-name: contributor-web header — without it server returns HTML.
+    4. consec_403 fallback — if datadome cookie expires mid-sync, fall back to
+       Playwright so user can re-login.
+    5. The 'accts_contributor' cookie check ensures the user is logged in.
     """
     from image_utils import load_img_async
 
@@ -62,7 +53,7 @@ def _shutterstock_api_collect_direct():
         _sync_log(f"⚠️ Shutterstock direct: cookies read failed: {e} — fallback")
         return False
     if not all_cookies:
-        _sync_log("⚠️ Shutterstock direct: no browser cookies — log in in Safari (mac) / Chrome (win)")
+        _sync_log("⚠️ Shutterstock direct: no browser cookies — log in via the app browser")
         return False
 
     ss_cookies = {c['name']: c['value'] for c in all_cookies

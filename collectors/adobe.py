@@ -24,9 +24,9 @@ RECIPES_DIR = os.path.join(_BASE_DIR, "recipes")
 
 
 def _adobe_collect_direct():
-    """Adobe Stock via direct requests + Safari cookies. NO Playwright.
-    Calls contributor.stock.adobe.com/en/insights/sales-earnings with Adobe
-    session cookies extracted from Safari. Returns True on success.
+    """Adobe Stock via direct requests + in-app browser cookies. NO Playwright.
+    Calls contributor.stock.adobe.com/en/insights/sales-earnings.
+    Returns True on success.
 
     ⚠️ DO NOT TOUCH — works at 100x speed. Headers `accept: application/json` +
     `x-requested-with: XMLHttpRequest` are mandatory (without them server
@@ -34,14 +34,13 @@ def _adobe_collect_direct():
     from image_utils import load_img_async
     _sync_log("🚀 Adobe direct: старт...")
 
-    # Cross-platform: Safari on mac / Chrome on Windows. See _load_browser_cookies.
     try:
         all_cookies = _load_browser_cookies()
     except Exception as e:
         _sync_log(f"⚠️ Adobe direct: cookies read failed: {e} — fallback")
         return False
     if not all_cookies:
-        _sync_log("⚠️ Adobe direct: no browser cookies — log in to Adobe in Safari (mac) / Chrome (win)")
+        _sync_log("⚠️ Adobe direct: no browser cookies — log in to Adobe in the app browser")
         return False
 
     adobe_cookies = {c['name']: c['value'] for c in all_cookies
@@ -105,7 +104,7 @@ def _adobe_collect_direct():
     page1 = _get_page(_p1_url)
     if "error" in page1:
         if page1.get('needs_login'):
-            _sync_log("⚠️ Adobe direct: сесія expired в Safari — fallback to Playwright")
+            _sync_log("⚠️ Adobe direct: сесія expired — потрібен логін, fallback to Playwright")
         else:
             _sync_log(f"⚠️ Adobe direct: page 1 error {page1.get('error')} — fallback")
         return False
