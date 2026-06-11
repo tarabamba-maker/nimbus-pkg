@@ -50,6 +50,7 @@ final class BestStore {
 
     private var key: String { "\(period.rawValue)|\(sort)|\(stock)|\(query)" }
     var items: [TopPhoto] { caches[key]?.items ?? [] }
+    var ended: Bool { caches[key]?.end ?? false }
 
     func ensure() async {
         if caches[key] == nil { await loadPage() }

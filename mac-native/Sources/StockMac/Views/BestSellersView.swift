@@ -45,14 +45,15 @@ struct BestSellersView: View {
                             }
                         }
                         .onAppear {
-                            if p.id == visible.last?.id { Task { await store.loadPage() } }
+                            if p.id == visible.last?.id { Task { await fillVisible() } }
                         }
                 }
             }
             if store.loading { ProgressView().padding() }
         }
-        .task(id: model.period) { store.period = model.period; await store.ensure() }
+        .task(id: model.period) { store.period = model.period; await store.ensure(); await fillVisible() }
         .onChange(of: model.syncTick) { _, _ in Task { await store.reloadCurrent() } }
+        .onChange(of: ungrouped) { _, _ in Task { await fillVisible() } }
         // Multi-select action bar
         .overlay(alignment: .bottom) {
             if !selected.isEmpty {
@@ -77,6 +78,18 @@ struct BestSellersView: View {
         }
         .popupHost(item: $multiAssign) { _ in
             MultiAssignPopup(assetIDs: Array(selected), onDone: { selected = []; multiAssign = nil }).environment(model)
+        }
+    }
+
+    /// Pages until the (possibly filtered) grid has enough cards or data runs out.
+    /// With Ungrouped on, a loaded page can be 100% grouped → `visible` doesn't
+    /// change → no new onAppear → infinite scroll stalls. So loop, don't load once.
+    private func fillVisible() async {
+        let target = visible.count + 60
+        while !store.ended && visible.count < target {
+            let before = store.items.count
+            await store.loadPage()
+            if store.items.count == before { break }   // no progress (error/guard)
         }
     }
 
