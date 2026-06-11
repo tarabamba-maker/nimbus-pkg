@@ -403,6 +403,28 @@ def _sync_all_global():
 
         if not _sync_stop_flag[0]:
             _sync_log("✅ All stocks collected")
+            # Backfill thumbnails for any sales photo missing from img_cache so pHash
+            # matching works for all stocks (SS/Adobe/iStock/etc. with missing thumbs).
+            try:
+                from app_globals import CACHE_DIR
+                from image_utils import load_img_async
+                cached_set = set(f[:-4] for f in os.listdir(CACHE_DIR) if f.endswith('.jpg')) if os.path.isdir(CACHE_DIR) else set()
+                with sqlite3.connect(DB_NAME, timeout=15) as _c:
+                    missing = _c.execute(
+                        "SELECT DISTINCT asset_id, stock, thumb_url FROM sales "
+                        "WHERE thumb_url IS NOT NULL AND thumb_url != '' "
+                        "AND asset_id NOT IN (SELECT asset_id FROM asset_meta)"
+                    ).fetchall()
+                backfill_count = 0
+                for aid, stock, turl in missing:
+                    if _sync_stop_flag[0]: break
+                    if aid not in cached_set:
+                        load_img_async(aid, turl, None, is_adobe=(stock == 'Adobe Stock'), stock=stock)
+                        backfill_count += 1
+                if backfill_count:
+                    _sync_log(f"🖼️ Backfill: {backfill_count} missing thumbnails queued")
+            except Exception as _ex:
+                _sync_log(f"⚠️ Thumbnail backfill error: {_ex}")
             try:
                 _sync_log("🔗 Auto: rebuilding cross-stock matches...")
                 from main import flask_app
