@@ -425,6 +425,17 @@ def _sync_all_global():
                     _sync_log(f"🖼️ Backfill: {backfill_count} missing thumbnails queued")
             except Exception as _ex:
                 _sync_log(f"⚠️ Thumbnail backfill error: {_ex}")
+            # Compute pHash for any cached thumbnails that still lack asset_meta rows.
+            try:
+                from main import flask_app
+                from routes.matching import api_compute_hashes
+                with flask_app.app_context():
+                    r = api_compute_hashes()
+                    computed = r.get_json().get('computed', 0)
+                    if computed:
+                        _sync_log(f"🔢 Computed pHash for {computed} cached thumbnails")
+            except Exception as _ex:
+                _sync_log(f"⚠️ compute-hashes error: {_ex}")
             try:
                 _sync_log("🔗 Auto: rebuilding cross-stock matches...")
                 from main import flask_app
