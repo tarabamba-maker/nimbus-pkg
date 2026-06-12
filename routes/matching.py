@@ -355,10 +355,19 @@ def _rebuild_matches_locked(force=False):
     # aren't ms_authoritative primaries) is fully discarded — the incremental purge
     # below only removes ms_library primaries+siblings, not unrelated garbage.
     groups = {} if _force else load_groups()
+    # Group aliases: the SAME shoot can carry two names in ms_library (old YYMMDD
+    # vs new YY-MM-DD date format), which a force rebuild would re-create as two
+    # groups. _group_aliases.json maps any alias → canonical name so they always
+    # collapse into one. User-extendable; merge endpoint writes here too.
+    try:
+        _aliases = json.load(open(os.path.join(RECIPES_DIR, '_group_aliases.json')))
+    except Exception:
+        _aliases = {}
     ms_authoritative = {}
     for photo in lib:
         gname = (photo.get('group') or '').strip()
         if not gname: continue
+        gname = _aliases.get(gname, gname)
         stockids = photo.get('stockids') or {}
         primary = _pick_primary(stockids)
         if not primary: continue
