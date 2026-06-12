@@ -6,6 +6,8 @@ struct StatBlock: Codable, Equatable {
     var total: Double = 0
     var count: Int = 0
     var delta: Double? = 0
+    var new_total: Double? = nil   // today only: money added this sync (green badge)
+    var new_count: Int? = nil
     var by_stock: [String: SaleStockStat]? = nil
 }
 

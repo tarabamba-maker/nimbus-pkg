@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from flask import Blueprint, jsonify, request
 
 from app_globals import DB_NAME, RECIPES_DIR, _load_matches
-from sync_state import _save_record
+from sync_state import _save_record, _session_new_keys, _session_new_keys_lock
 
 feed_bp = Blueprint('feed', __name__)
 
@@ -282,6 +282,27 @@ def api_stats():
                 "delta": round(cur_t - prv_t, 2),
                 "by_stock": ps,
             }
+
+        # Today's green badge = money just added THIS sync dated today (not the
+        # partial-today-vs-full-yesterday delta, which is almost always negative
+        # and made the day card look unresponsive). Key = id|YYYY-MM-DD|stock|price.
+        _today_str = today_d.strftime('%Y-%m-%d')
+        with _session_new_keys_lock:
+            _keys = list(_session_new_keys)
+        _new_today = 0.0
+        _new_today_n = 0
+        for _k in _keys:
+            _parts = _k.split('|')
+            if len(_parts) < 4 or _parts[1] != _today_str:
+                continue
+            if stock_filter and stock_filter != 'All' and _parts[2] != stock_filter:
+                continue
+            try:
+                _new_today += float(_parts[3]); _new_today_n += 1
+            except Exception:
+                pass
+        result['today']['new_total'] = round(_new_today, 2)
+        result['today']['new_count'] = _new_today_n
 
         row = conn.execute(
             f"SELECT SUM(price), COUNT(*) FROM sales WHERE {base_where}", base_params).fetchone()

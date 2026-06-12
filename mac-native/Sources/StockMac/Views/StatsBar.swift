@@ -28,6 +28,11 @@ struct StatCard: View {
     let active: Bool
     @Environment(AppModel.self) private var model
 
+    /// Today → "new this sync" money; all other periods → delta vs prior period.
+    private var greenBadge: Double? {
+        period == .today ? block.new_total : block.delta
+    }
+
     var body: some View {
         let s = model.surfaces
         VStack(alignment: .leading, spacing: 4) {
@@ -41,12 +46,14 @@ struct StatCard: View {
                     .foregroundStyle(.primary)
                     .contentTransition(.numericText())        // rolling digits on change
                     .animation(.snappy, value: block.total)
-                if let d = block.delta, d > 0.005 {
-                    Text("+\(d.money)")
+                // Today shows money added THIS sync (always ≥0, reacts to new
+                // sales); other periods show the elapsed-matched delta vs prior.
+                if let badge = greenBadge, badge > 0.005 {
+                    Text("+\(badge.money)")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(Theme.green)
                         .contentTransition(.numericText())
-                        .animation(.snappy, value: d)
+                        .animation(.snappy, value: badge)
                 }
             }
             Text("↓\(block.count.formatted())")
