@@ -6,6 +6,7 @@ Routes: /api/groups, /api/group-photos, /api/photo-groups/*, /api/groups/match-*
         /api/photo-groups/merge, /api/ms-library/remove-from-group, /api/group-names
 """
 
+import os
 import re
 import sqlite3
 
@@ -441,6 +442,24 @@ def api_photo_groups_rename():
         return jsonify({"status": "error", "msg": "name taken"}), 409
     groups[new] = groups.pop(old)
     save_groups(groups)
+
+    # Persist the rename as a group alias so a rebuild doesn't re-create the old
+    # name from ms_library (whose `group` field still says `old`). Maps any
+    # ms_library group name → canonical. Re-points existing alias chains too.
+    import json as _json
+    _af = os.path.join(RECIPES_DIR, '_group_aliases.json')
+    try:
+        with open(_af) as _f: _aliases = _json.load(_f)
+    except Exception:
+        _aliases = {}
+    _aliases[old] = new
+    for _k, _v in list(_aliases.items()):
+        if _v == old:
+            _aliases[_k] = new          # follow the chain to the newest name
+    _tmp = _af + '.tmp'
+    with open(_tmp, 'w') as _f:
+        _json.dump(_aliases, _f, indent=2, ensure_ascii=False)
+    os.replace(_tmp, _af)
     return jsonify({"status": "ok"})
 
 
