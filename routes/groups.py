@@ -379,23 +379,31 @@ def api_photo_groups_post():
         for _x in {str(_prim)} | {str(m) for m in _members}:
             cluster_key[_x] = str(_prim)
 
-    # Prefer the id that's ALREADY stored on disk for that group, so the
-    # authoritative primary doesn't drift to an arbitrary cluster member.
+    # Ids already stored on disk for that group are NEVER dropped — a shoot can
+    # legitimately hold several near-identical frames whose hashes cluster
+    # together (burst shots / recolours); only NEW ids whose cluster is already
+    # represented are treated as GET-expansion echo-back and skipped.
     disk = load_groups()
     clean: dict = {}
     for gname, aids in (data or {}).items():
         on_disk = {str(a) for a in disk.get(gname, [])}
-        by_cluster: dict = {}
-        order: list = []
-        for a in (aids or []):
+        kept: list = []
+        seen_ids: set = set()
+        seen_clusters: set = set()
+        for a in (aids or []):           # pass 1: disk-resident ids keep their spot
             a = str(a)
+            if a in on_disk and a not in seen_ids:
+                kept.append(a); seen_ids.add(a)
+                seen_clusters.add(cluster_key.get(a, a))
+        for a in (aids or []):           # pass 2: new ids — one per unseen cluster
+            a = str(a)
+            if a in seen_ids:
+                continue
             ck = cluster_key.get(a, a)   # singleton = its own cluster
-            if ck not in by_cluster:
-                by_cluster[ck] = a
-                order.append(ck)
-            elif a in on_disk and by_cluster[ck] not in on_disk:
-                by_cluster[ck] = a
-        clean[gname] = [by_cluster[ck] for ck in order]
+            if ck in seen_clusters:
+                continue
+            kept.append(a); seen_ids.add(a); seen_clusters.add(ck)
+        clean[gname] = kept
 
     save_groups(clean)
     return jsonify({"status": "ok"})
