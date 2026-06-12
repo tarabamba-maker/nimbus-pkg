@@ -639,14 +639,55 @@ Pass ordering and incremental contracts (v0.9.37):
 - **SQLite 999 variable limit** → batch queries in chunks of 800 via `_query_earnings_batch()`
 - **IntersectionObserver in Svelte 5**: use `$effect` (not `onMount`) to attach the observer, so it re-runs when the sentinel element is recreated by reactive blocks
 
-## How to add a new stock
+## How to add a new stock — CANONICAL CHECKLIST (updated 2026-06-12, Freepik/Envato pattern)
 
-1. Log in to the stock's contributor page in the dedicated `chrome_profile_StockName/` browser
-2. Open DevTools → Network → find API endpoints returning JSON sales data
-3. Note the endpoint, required headers, response format
-4. Write `_stockname_api_collect(pw_page)` following the pattern above
-5. Wire into `_sync_all_thread`: add stock name to the loop and call the collector
-6. Add stock name to `STOCK_LIST` in Flask for the stock-list API
+This is THE process. Every existing stock follows it; the next one must too.
+
+### Phase 1 — research (Inspector, not DevTools-by-hand)
+1. User runs the in-app **Inspector** (Browser tab) → logs into the stock → browses
+   earnings + portfolio pages. YOU then grep `inspector_logs/` for the endpoints
+   (full curl + response bodies are recorded — see "🔍 Inspector" section).
+2. Identify: (a) **earnings endpoint** (per-sale or per-month JSON), (b) **portfolio/
+   thumbnails endpoint** (clean, watermark-free thumb URL per asset id), (c) auth
+   mechanism (cookie session / CSRF / bearer token from a cookie).
+
+### Phase 2 — collector (`collectors/<stock>.py`)
+3. Write `_<stock>_collect_direct()` — **direct `requests`, NO Playwright page**.
+   Cookies come from `_load_browser_cookies()` (reads `recipes/_pw_cookies.json`,
+   captured by the in-app login window). Test it standalone before wiring anywhere.
+4. Save sales ONLY via `_save_record(rec)` (dedup + new-keys + date normalization).
+   Per-month state file in `recipes/` if the stock publishes monthly (see
+   `_freepik_months.json` / `_envato_months.json` / Getty statement gate).
+5. **Thumbnails are NOT optional** — without a thumb there's no pHash and the photo
+   never folds into groups (see "pHash matching gap"). Download via
+   `load_img(aid, url, stock="<Stock>")` → writes `asset_meta` (hash+RGB+aspect)
+   automatically. Backfill any DB rows missing img_cache files at the end of the
+   collector (Freepik step-4 pattern); the orchestrator backfill is the safety net.
+
+### Phase 3 — wiring
+6. `config.py` → `STOCK_URLS` (sync landing URL).
+7. `orchestrator.py` → add to `SALES_STOCKS` in `_sync_all_global`.
+8. `cookies.py` → `_STOCK_LOGIN_URLS` (login window URL — pick the page that mints
+   the auth cookie the collector needs! Getty lesson: ccw lives on esp.*, not
+   accountmanagement.*) + `_STOCK_COOKIE_DOMAINS`; optional fast-positive marker in
+   `_STOCK_AUTH_COOKIE`.
+9. UI: `Browser.svelte` → `INSPECTOR_STOCKS` + `STOCKS`; stock color in
+   `recipes/stock_colors.json`. Mac app picks up stock list from the API.
+10. Tauri bundling: nothing new needed if the collector lives in `collectors/`
+    (the directory is already bundled). New top-level .py files MUST be added to
+    both tauri conf files.
+
+### Phase 4 — grouping (automatic if you did Phase 2.5 right)
+11. **DO NOT write any grouping code.** The layered model does it: clean thumbs →
+    `asset_meta` → Pass A clusters cross-stock → Pass F links to MS+ groups via
+    pHash (anchor = `_pick_primary` priority). NEVER write the new stock's ids into
+    `photo_groups.json` (layer-2 violation — the Freepik regression).
+12. After first sync: `POST /api/rebuild-matches` (post-sync auto-rebuild does it).
+    Verify group badges appear for the new stock in BestSellers/Downloads.
+
+### Phase 5 — test protocol
+13. `ast.parse` new files; `python3 test_api.py` (16/16); test on the INSTALLED app
+    (`~/Library/Application Support/StockAutomation/app.log` / `mac_python.log`).
 
 ## Svelte UI — what's implemented vs what's missing from Flet
 

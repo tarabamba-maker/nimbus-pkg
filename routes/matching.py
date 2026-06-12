@@ -21,13 +21,12 @@ from flask import Blueprint, jsonify, request
 
 from app_globals import (
     CACHE_DIR, DB_NAME, MS_CACHE_DIR, RECIPES_DIR,
-    _RELEVANT_STOCKS,
     _load_matches, _save_matches, _load_overrides, _save_overrides,
 )
 from cookies import _load_browser_cookies
 from image_utils import load_groups, save_groups, load_ms_library, load_img
 from matching_engine import (
-    _hash_based_matches, _filename_fallback_matches,
+    _hash_based_matches,
     _ms_visual_matches, _apply_manual_overrides,
 )
 from sync_state import _sync_state, _sync_stop_flag, _sync_log

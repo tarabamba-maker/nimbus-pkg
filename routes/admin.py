@@ -20,12 +20,10 @@ from flask import Blueprint, jsonify, request, send_file
 from app_globals import (
     _BASE_DIR, CACHE_DIR, DB_NAME, ICON_CACHE_DIR,
     MATCH_CACHE_DIR, MS_CACHE_DIR, RECIPES_DIR,
-    _load_matches,
 )
 from config import STOCK_URLS
 from cookies import (
     _STOCK_COOKIE_DOMAINS,
-    _inject_cookies_via_playwright,
     _windows_browser_login,
     _stock_has_valid_session,
 )
