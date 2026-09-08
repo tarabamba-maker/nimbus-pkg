@@ -163,7 +163,11 @@ def _native_chrome_login(profile_dir, start_url, stock_label, timeout_s=600):
     # Chrome process still bound to this profile, until it's gone or we time out.
     time.sleep(4)
     deadline = time.time() + timeout_s
+    from sync_state import _sync_stop_flag
     while time.time() < deadline:
+        if _sync_stop_flag[0]:
+            _sync_log(f"[{stock_label}] ⛔ Stop — не чекаю на закриття вікна логіну")
+            break
         r = subprocess.run(["pgrep", "-f", f"user-data-dir={profile_dir}"],
                            capture_output=True, text=True)
         if not r.stdout.strip():

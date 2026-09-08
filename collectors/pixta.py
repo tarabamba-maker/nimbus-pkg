@@ -107,17 +107,24 @@ def _pixta_collect_direct():
         return False
 
     def get_html(path):
+        """text | None (session invalid: login redirect / 401 / 403) |
+        False (transient: other HTTP error or network exception)."""
         try:
             r = sess.get(_BASE + path, timeout=30)
-            if not r.ok or "user_login" in r.url:
+            if "user_login" in r.url or r.status_code in (401, 403):
                 return None
+            if not r.ok:
+                _app_log(f"[PIXTA] direct {path}: HTTP {r.status_code}")
+                return False
             return r.text
         except Exception as ex:
             _app_log(f"[PIXTA] direct {path}: {ex}")
-            return None
+            return False
 
     res = _pixta_run(get_html)
-    return False if res == "needs_login" else True
+    if res == "needs_login":
+        return False
+    return res
 
 
 def _pixta_collect(pw_page):
@@ -144,6 +151,9 @@ def _pixta_run(get_html):
         path = (f"/mypage/earning?earned_from=all&content_type=&year=&month="
                 f"&per_page={_PER_PAGE}&page={page}")
         html = get_html(path)
+        if html is False:        # transport/HTTP error — not an auth problem
+            _sync_log(f"⚠️ PIXTA: стор. {page} недоступна — пропускаю цей синк")
+            return "transient"
         if html is None:
             if page == 1:        # first page failed = no/expired session
                 _sync_log("⚠️ PIXTA: не залогінений — натисни кнопку «PIXTA» щоб увійти")

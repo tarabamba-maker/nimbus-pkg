@@ -342,7 +342,9 @@ def _freepik_collect_direct():
         _sync_log("⚠️ Freepik direct: нема cookies — потрібен нативний логін")
         return False
     res = _freepik_run(_http_get(sess))
-    return False if res == "needs_login" else True
+    if res == "needs_login":
+        return False
+    return res
 
 
 def _freepik_collect(pw_page):
@@ -375,6 +377,7 @@ def _freepik_run(get):
     total_saved = 0
     thumbs_needed = {}
     fetch_errors = 0
+    months_pending = 0   # months skipped this run (report/rate failure) → "transient"
     for ym in _month_iter(_CSV_FLOOR_YM, end_ym):
         if _sync_stop_flag[0]:
             break
@@ -393,6 +396,7 @@ def _freepik_run(get):
             # Transport error, HTTP error, or an HTML page instead of the report:
             # DO NOT record the month as empty — that froze it at $0 forever.
             fetch_errors += 1
+            months_pending += 1
             _sync_log(f"  ⚠️ Freepik {ym}: report not available — will retry next sync")
             if fetch_errors >= 3:
                 _sync_log("⚠️ Freepik: 3 report failures in a row — stopping this sync")
@@ -406,6 +410,7 @@ def _freepik_run(get):
         rate = _eur_usd_rate(ym)
         if rate is None:
             _sync_log(f"  ⚠️ Freepik {ym}: EUR→USD rate unavailable — month skipped, retry next sync")
+            months_pending += 1
             continue
         rec_date = _month_date(ym)
         if recollect:
@@ -471,8 +476,10 @@ def _freepik_run(get):
     if COLLECT_PRE_HISTORY and not _sync_stop_flag[0]:
         _collect_pre_history(get, uid, portfolio, end_ym)
 
+    if months_pending:
+        _sync_log(f"⏸ Freepik: {months_pending} міс не зібрано — повтор наступного синку")
+        return "transient"
     return True
-
 
 def _recent_downloads(get, uid: str, end_ym: str) -> dict:
     """Per-asset downloads in the per-asset (2025+) era, cached in

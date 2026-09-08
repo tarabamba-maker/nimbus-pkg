@@ -155,7 +155,9 @@ def _rf123_collect_direct():
             return {"__error": str(ex)}
 
     res = _rf123_run(get_json)
-    return False if res == "needs_login" else True
+    if res == "needs_login":
+        return False
+    return res
 
 
 def _rf123_collect(pw_page):
@@ -184,7 +186,7 @@ def _rf123_run(get_json):
             _sync_log("⚠️ 123RF: не залогінений — натисни кнопку «123RF» щоб увійти")
             return "needs_login"
         _sync_log(f"⚠️ 123RF: monthly report недоступний ({err}) — пропускаю цей синк")
-        return True
+        return "transient"
     _sync_log("✅ 123RF: сесія активна")
     totals = _month_totals(monthly)
     if not totals:
@@ -202,6 +204,7 @@ def _rf123_run(get_json):
     _sync_log(f"123RF: збираємо {len(todo)} місяців…")
 
     saved = 0
+    pending = 0
     for ym in todo:
         if _sync_stop_flag[0]:
             break
@@ -211,6 +214,7 @@ def _rf123_run(get_json):
             # Do NOT record the month total: the month would be considered done
             # with zero per-sale rows until its total changes again.
             _sync_log(f"  ⚠️ 123RF {ym}: daily report failed — month left pending")
+            pending += 1
             continue
         days = _nonzero_days(daily)
         month_ok = True
@@ -256,5 +260,9 @@ def _rf123_run(get_json):
             state[ym] = totals[ym]
             _save_json(_MONTHS_FILE, state)
             _sync_log(f"123RF: {ym} готово (${totals[ym]:.2f})")
+        else:
+            pending += 1
     _sync_log(f"✅ 123RF: збережено {saved} записів")
+    if pending and not _sync_stop_flag[0]:
+        return "transient"
     return True

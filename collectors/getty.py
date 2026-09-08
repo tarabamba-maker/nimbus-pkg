@@ -81,14 +81,14 @@ def _getty_collect_direct():
         r = session.get(f"{am_base}/Reports/Export", timeout=20, allow_redirects=False)
     except Exception as e:
         _sync_log(f"⚠️ Getty direct: connect failed: {e} — пропускаю цей синк")
-        return True   # transient network failure — not a login problem
+        return "transient"   # network failure — not a login problem, retry next sync
     if r.status_code != 200:
         _sync_log(f"⚠️ Getty direct: accountmanagement not logged in (HTTP {r.status_code}) — потрібен логін")
         return False
     csrf_match = re.search(r'name="__RequestVerificationToken"[^>]+value="([^"]+)"', r.text)
     if not csrf_match:
         _sync_log("⚠️ Getty direct: CSRF token not found in HTML — пропускаю цей синк")
-        return True   # page structure change, not an auth failure
+        return "transient"   # page structure change, not an auth failure
     csrf = csrf_match.group(1)
     # Contract ID lives in HTML too; extract or use stored
     cid_match = re.search(r'(?:contractId|data-contract[\w-]*)["\s=:]+["\']?(\d+:True)', r.text)
@@ -103,7 +103,7 @@ def _getty_collect_direct():
         avail = ar.json()
     except Exception as e:
         _sync_log(f"⚠️ Getty direct: AvailableStatementPeriod failed: {e} — пропускаю цей синк")
-        return True   # step 1 already proved we're logged in — transient
+        return "transient"   # step 1 already proved we're logged in
     _opts = avail.get("Options") or {}
     raw_periods = _opts.get("AvailableStatementPeriods", [])
 
@@ -118,7 +118,7 @@ def _getty_collect_direct():
         contract_id = sel["Value"]
     if not contract_id:
         _sync_log("⚠️ Getty direct: no contract found in AvailableContracts — пропускаю цей синк")
-        return True   # data/structure issue, not auth
+        return "transient"   # data/structure issue, not auth
     _sync_log(f"🔑 Getty direct: contract={contract_id} ({(sel or {}).get('Text','')[:40]})")
 
     periods = []
@@ -327,13 +327,13 @@ def _getty_collect_direct():
     # (or until day-21 statement release if last run was earlier in same month).
     try:
         try:
-            with open(proc_file_gt) as _f: pd = json.load(_f)
+            with open(proc_file) as _f: pd = json.load(_f)
         except Exception:
             pd = {}
         from datetime import date as _date
         pd["Getty_auto_month"] = _date.today().strftime("%Y-%m")
         pd["Getty_last_run"]  = _date.today().strftime("%Y-%m-%d")
-        with open(proc_file_gt, "w") as _f:
+        with open(proc_file, "w") as _f:
             json.dump(pd, _f, indent=2)
     except Exception:
         pass

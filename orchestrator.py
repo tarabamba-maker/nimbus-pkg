@@ -9,6 +9,7 @@ Moved here from main.py (logic unchanged — only location changed):
 
 import json
 import os
+import threading
 import shutil
 import sqlite3
 import time
@@ -33,9 +34,14 @@ from config import STOCK_URLS
 # Stocks collected via the global native-login + direct-HTTPS mechanism (no
 # Playwright). "stock name": "module:function" of its *_collect_direct(). Migrating
 # a stock here = it stops opening any browser to collect. See _collect_one_stock_global.
-# Contract: *_collect_direct() returns True on success OR transient failure
-# (network/API hiccup — just skip this sync), and False ONLY when the session is
-# invalid/missing (→ caller opens a native Chrome login window and retries once).
+# Contract (tri-state):
+#   True         — collected successfully → month-gated stocks are marked synced;
+#   "transient"  — network/API hiccup, nothing (or only part) collected → skip
+#                  this sync, do NOT mark synced, retry next sync, no login window;
+#   False        — the session is invalid/missing → caller opens a native Chrome
+#                  login window and retries once.
+# Returning True on a transient failure used to mark Getty/Freepik/Envato as
+# "collected this cycle" and silently lose a whole month.
 # Only Alamy stays off this list — Playwright is its PRIMARY transport (ASP.NET
 # UpdatePanel pagination, see CLAUDE.md).
 _DIRECT_COLLECTORS = {
@@ -68,6 +74,16 @@ _MONTHLY_GATES = {
     "Freepik":      (11, ("Freepik",),              "Freepik_last_sync"),
     "Envato":       (11, ("Envato",),               "Envato_last_sync"),
 }
+# Days after a cycle opens during which the stock keeps re-syncing even if it
+# already ran this cycle. Getty statement periods keep gaining rows for several
+# days after the ~21st (measured 2026-06-23), so a single early run must not
+# lock the cycle. 0 = classic once-per-cycle.
+_MONTHLY_SETTLE_DAYS = {"Getty Images": 7}
+
+# Only ONE native Chrome login window at a time. Sync All runs 4 collectors in
+# parallel; without this a network outage that made several collectors report
+# "needs login" opened up to 4 Chrome windows simultaneously.
+_login_lock = threading.Lock()
 
 
 def _load_processed_dates():
@@ -112,6 +128,9 @@ def _monthly_gate_skip(name):
     else:
         py, pm = (today.year - 1, 12) if today.month == 1 else (today.year, today.month - 1)
         cycle_start = _date(py, pm, min_day)
+    settle = _MONTHLY_SETTLE_DAYS.get(name, 0)
+    if settle and (today - cycle_start).days < settle:
+        return False   # inside the settling window → always re-sync
     if last >= cycle_start:
         nm = cycle_start.month % 12 + 1
         ny = cycle_start.year + (1 if cycle_start.month == 12 else 0)
@@ -232,24 +251,35 @@ def _collect_one_stock_global(name, url, allow_login=False):
         mod, fn = _DIRECT_COLLECTORS[name].rsplit(":", 1)
         direct_fn = getattr(importlib.import_module(mod), fn)
         try:
-            if direct_fn():
-                _mark_monthly_synced(name)
-                return
+            res = direct_fn()
         except Exception as ex:
             _sync_log(f"[{name}] direct exception: {ex}")
             return   # transient/unknown failure — don't pop a login window
+        if res == "transient":
+            _sync_log(f"[{name}] ⏸ тимчасова помилка — повтор наступного синку")
+            return
+        if res:
+            _mark_monthly_synced(name)
+            return
         if not allow_login:
             _sync_log(f"[{name}] 🔒 потрібен логін — натисни кнопку «{name}»")
+            return
+        if _sync_stop_flag[0]:
             return
         from cookies import _native_chrome_login
         prof = os.path.join(_BASE_DIR, f"chrome_profile_native_{name.replace(' ', '_')}")
         login_url = _DIRECT_LOGIN_URLS.get(name, url)
-        _native_chrome_login(prof, login_url, name)
+        with _login_lock:          # one login window at a time (parallel Sync All)
+            if _sync_stop_flag[0]:
+                return
+            _native_chrome_login(prof, login_url, name)
         try:
-            if direct_fn():
-                _mark_monthly_synced(name)
+            res = direct_fn()
         except Exception as ex:
             _sync_log(f"[{name}] direct retry exception: {ex}")
+            return
+        if res is True or (res and res != "transient"):
+            _mark_monthly_synced(name)
         return   # never fall through to Playwright for native-direct stocks
 
     # ── Playwright path — ONLY Alamy (ASP.NET UpdatePanel pagination) ─────────

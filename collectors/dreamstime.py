@@ -73,8 +73,8 @@ def _dreamstime_collect_direct():
         try:
             r = sess.get(_BASE + path, timeout=30)
         except Exception as ex:
-            _sync_log(f"⚠️ Dreamstime direct: {ex}")
-            return saved > 0
+            _sync_log(f"⚠️ Dreamstime direct: {ex} — пропускаю цей синк")
+            return "transient"
         if r.status_code in (401, 403) or _is_login_url(r.url):
             if page == 1:
                 _sync_log(f"⚠️ Dreamstime direct: HTTP {r.status_code} — сесія недійсна/блок")

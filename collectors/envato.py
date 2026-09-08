@@ -255,8 +255,12 @@ def _envato_run(getj, fetch_thumbs):
     detail = getj(
         "/reports/api/v1/earnings/detail?view=monthly&start_date=2018-01-01&end_date=2030-12-31")
     if "__error" in detail:
-        _sync_log(f"⚠️ Envato: earnings/detail помилка: {detail['__error']}")
-        return False
+        err = detail["__error"]
+        if err in (401, 403, "401", "403"):
+            _sync_log(f"⚠️ Envato: earnings/detail HTTP {err} — сесія недійсна, потрібен логін")
+            return False
+        _sync_log(f"⚠️ Envato: earnings/detail помилка: {err} — пропускаю цей синк")
+        return "transient"
     rows = detail.get("data", [])
     if not rows:
         _sync_log("ℹ️ Envato: earnings/detail порожній")
