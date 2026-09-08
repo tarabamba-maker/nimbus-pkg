@@ -138,7 +138,10 @@ def _invoice_fx_date(ym: str) -> str:
     return d.strftime("%Y-%m-%d")
 
 
-def _eur_usd_rate(ym: str, _fetch=None) -> float:
+_FX_FALLBACK_LEGACY = 1.08   # old hard-coded fallback; months stored with it are re-collected
+
+
+def _eur_usd_rate(ym: str, _fetch=None):
     """EUR→USD for month `ym`, cached in _fx_eur_usd.json. `_fetch(date)->rate`
     is injectable for tests; defaults to frankfurter.app (ECB reference rates)."""
     cache = _load_json(_FX_FILE)
@@ -157,15 +160,26 @@ def _eur_usd_rate(ym: str, _fetch=None) -> float:
     except Exception as ex:
         _app_log(f"[Freepik] FX fetch {ym} failed: {ex}")
     if not rate:
-        # last-resort fallback so a sync never crashes on a transient FX outage;
-        # NOT cached, so a real rate is fetched next run.
-        return 1.08
+        # No rate → the caller must SKIP this month and retry next sync. The old
+        # 1.08 fallback was "not cached" but the month was still marked collected
+        # with that rate baked into every record (July 2026 was under-reported ~7%).
+        return None
     cache[ym] = {"rate": round(rate, 6), "date": fxdate, "source": "frankfurter/ECB"}
     _save_json(_FX_FILE, cache)
     return rate
 
 
 # ── CSV parsing (pure, unit-testable) ────────────────────────────────────────
+
+_CSV_HEADER_MARK = "Freepik Asset ID"
+
+
+def _looks_like_report_csv(text) -> bool:
+    """True only for a real report body (has the CSV header). A login/HTML page
+    served with HTTP 200, or an empty body, is NOT a report and must not be
+    mistaken for "no sales this month"."""
+    return bool(text) and _CSV_HEADER_MARK in text[:2000]
+
 
 def _parse_report_csv(text: str) -> list[dict]:
     """Parse a /xhr/stats/download CSV into rows:
@@ -360,19 +374,49 @@ def _freepik_run(get):
     end_ym = _last_settled_ym()
     total_saved = 0
     thumbs_needed = {}
+    fetch_errors = 0
     for ym in _month_iter(_CSV_FLOOR_YM, end_ym):
         if _sync_stop_flag[0]:
             break
-        if ym in months_state:               # final + already collected → never refetch
+        prev = months_state.get(ym)
+        recollect = False
+        if isinstance(prev, dict) and (prev.get("rate_fallback")
+                                       or prev.get("rate") == _FX_FALLBACK_LEGACY):
+            # Month was stored with the hard-coded fallback rate → USD amounts are
+            # wrong. Re-collect it with a real rate (rows of that month are replaced).
+            recollect = True
+        elif ym in months_state:             # final + already collected → never refetch
             continue
         yyyy, mm = ym[:4], ym[5:7]
         csv_text = _fetch_text(get, f"/xhr/stats/download?user_id={uid}&month={mm}&year={yyyy}")
-        rows = _parse_report_csv(csv_text or "")
+        if not _looks_like_report_csv(csv_text):
+            # Transport error, HTTP error, or an HTML page instead of the report:
+            # DO NOT record the month as empty — that froze it at $0 forever.
+            fetch_errors += 1
+            _sync_log(f"  ⚠️ Freepik {ym}: report not available — will retry next sync")
+            if fetch_errors >= 3:
+                _sync_log("⚠️ Freepik: 3 report failures in a row — stopping this sync")
+                break
+            continue
+        fetch_errors = 0
+        rows = _parse_report_csv(csv_text)
         if not rows:
             months_state[ym] = {"total_eur": 0.0, "rows": 0}
             continue
         rate = _eur_usd_rate(ym)
+        if rate is None:
+            _sync_log(f"  ⚠️ Freepik {ym}: EUR→USD rate unavailable — month skipped, retry next sync")
+            continue
         rec_date = _month_date(ym)
+        if recollect:
+            try:
+                with sqlite3.connect(DB_NAME, timeout=15) as c:
+                    n = c.execute("DELETE FROM sales WHERE stock='Freepik' AND substr(date,1,10)=?",
+                                  (rec_date,)).rowcount
+                _sync_log(f"  ♻️ Freepik {ym}: re-collecting with real rate {rate:.4f} (replaced {n} rows @ {_FX_FALLBACK_LEGACY})")
+            except Exception as ex:
+                _sync_log(f"  ⚠️ Freepik {ym}: could not replace fallback-rate rows: {ex}")
+                continue
         month_eur = 0.0
         for r in rows:
             eur = r["earnings_eur"]
