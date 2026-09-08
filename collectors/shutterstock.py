@@ -111,6 +111,30 @@ def _shutterstock_api_collect_direct():
         _ss_from = _date.fromisoformat(_ss_max) - timedelta(days=1) if _ss_max else today - timedelta(days=45)
     except Exception:
         _ss_from = today - timedelta(days=45)
+    # If a previous recent scan failed part-way, days between the failure and the
+    # old MAX(date) were never scanned while MAX(date) already moved past them.
+    # `Shutterstock_recent_gap_from` remembers the floor of that unfinished scan
+    # so we extend the window back to it; it is cleared when a scan completes.
+    proc_file = os.path.join(RECIPES_DIR, "_processed_dates.json")
+    try:
+        with open(proc_file) as f: _ss_proc = json.load(f)
+    except Exception:
+        _ss_proc = {}
+
+    def _save_proc():
+        try:
+            with open(proc_file, "w") as f: json.dump(_ss_proc, f, indent=2)
+        except Exception: pass
+
+    _gap = _ss_proc.get("Shutterstock_recent_gap_from")
+    if _gap:
+        try:
+            _gap_d = _date.fromisoformat(_gap)
+            if _gap_d < _ss_from:
+                _sync_log(f"↩️ Shutterstock: re-scanning unfinished window from {_gap_d}")
+                _ss_from = _gap_d
+        except Exception:
+            pass
     scan_days = []
     d = today
     while d >= _ss_from:
@@ -124,11 +148,17 @@ def _shutterstock_api_collect_direct():
 
     agg_cache = {}
     def _day_cats(day):
+        """Active categories for `day`, or None if the month aggregate could not
+        be fetched. A failed aggregate is NOT cached as empty: doing so made every
+        day of that month look sale-free, the backfill cursor walked past it and
+        the whole month was lost for good (cursor only moves down, done is final)."""
         ym = (day.year, day.month)
         if ym not in agg_cache:
             agg = _get(f"/api/next/v2/earnings/aggregate?aggregation_period=day&year={ym[0]}&month={ym[1]}")
-            agg_cache[ym] = {} if "error" in agg else \
-                {d.get("date","")[:10]: d for d in agg.get("days", [])}
+            if "error" in agg:
+                _sync_log(f"  ⚠️ SS aggregate {ym[0]}-{ym[1]:02d}: {agg['error']} — month NOT scanned")
+                return None
+            agg_cache[ym] = {d.get("date","")[:10]: d for d in agg.get("days", [])}
         info = agg_cache[ym].get(day.isoformat(), {})
         # DYNAMIC category discovery: collect EVERY key that's a per-category dict
         # with earnings>0 — not just a hardcoded whitelist. The old whitelist silently
@@ -144,21 +174,23 @@ def _shutterstock_api_collect_direct():
         return cats
 
     # Per-day scanner shared by the recent scan AND the historical backfill.
-    # Returns (day_new, day_already, hit_403_streak). On a 3× consecutive 403 the
-    # caller must stop (DataDome blocked us) — but progress is already persisted by
-    # the backfill cursor, so the next sync resumes where we left off.
+    # Returns (day_new, day_already, hit_403_streak, ok). `ok` is False when ANY
+    # category/page of the day failed — such a day is INCOMPLETE and must not be
+    # treated as scanned (cursor must not move past it). On a 3× consecutive 403
+    # the caller must stop (DataDome blocked us).
     def _collect_day(date_str, active_cats, counter):
-        day_new = 0; day_already = 0
+        day_new = 0; day_already = 0; ok = True
         for cat in active_cats:
             page_n = 1
             while True:
                 data = _get(f"/api/next/v2/earnings/media_stats/day"
                            f"?display_column={cat}&date={date_str}&page={page_n}&per_page=100")
                 if "error" in data:
+                    ok = False
                     if data['error'] == 403:
                         counter[0] += 1
                         if counter[0] >= 3:
-                            return day_new, day_already, True
+                            return day_new, day_already, True, False
                     else:
                         _sync_log(f"  ⚠️ {date_str}/{cat} p{page_n}: {data['error']}")
                     break
@@ -184,28 +216,44 @@ def _shutterstock_api_collect_direct():
                 if page_n >= data.get("pages", 1): break
                 page_n += 1
                 time.sleep(0.1)   # gentle throttle, well below trigger
-        return day_new, day_already, False
+        return day_new, day_already, False, ok
 
     total_saved = 0
     stop_early = False
     consec = [0]
+    scan_complete = True     # False → remember the window floor for next sync
     for scan_day in scan_days:
-        if stop_early or _sync_stop_flag[0]:
+        if _sync_stop_flag[0]:
+            scan_complete = False; break
+        if stop_early:
             break
         date_str = scan_day.isoformat()
         active_cats = _day_cats(scan_day)
+        if active_cats is None:          # month aggregate failed → transient
+            scan_complete = False; break
         if not active_cats:
             continue
-        day_new, day_already, blocked = _collect_day(date_str, active_cats, consec)
+        day_new, day_already, blocked, day_ok = _collect_day(date_str, active_cats, consec)
         total_saved += day_new
         if blocked:
+            _ss_proc["Shutterstock_recent_gap_from"] = _ss_from.isoformat(); _save_proc()
             _sync_log("🛑 Shutterstock direct: 3× HTTP 403 — datadome cookie expired, потрібен логін")
             return False
+        if not day_ok:
+            scan_complete = False
+            _sync_log(f"  ⚠️ {date_str}: incomplete — will re-scan next sync")
+            break
         if day_new > 0 and total_saved % 200 < day_new:
             _sync_log(f"  📆 {date_str}: +{day_new} (total {total_saved})")
         if _ss_count > 0 and day_new == 0 and day_already > 0:
             _sync_log(f"  ✅ {date_str}: caught up — stop")
             stop_early = True
+
+    if scan_complete:
+        if _ss_proc.pop("Shutterstock_recent_gap_from", None):
+            _save_proc()
+    else:
+        _ss_proc["Shutterstock_recent_gap_from"] = _ss_from.isoformat(); _save_proc()
 
     _sync_log(f"✅ Shutterstock direct API recent: {total_saved} нових записів")
 
@@ -216,17 +264,9 @@ def _shutterstock_api_collect_direct():
     # the floor is reached. Without this, an interrupted cold-start left SS recent-only
     # forever (the 3809-vs-36847 gap) because incremental mode only scans FORWARD.
     SS_FLOOR = _date(2015, 1, 1)
-    proc_file = os.path.join(RECIPES_DIR, "_processed_dates.json")
-    try:
-        with open(proc_file) as f: _ss_proc = json.load(f)
-    except Exception:
-        _ss_proc = {}
-
-    def _save_proc():
-        try:
-            with open(proc_file, "w") as f: json.dump(_ss_proc, f, indent=2)
-        except Exception: pass
-
+    # Cursor contract: `Shutterstock_backfill_cursor` = the last day that was
+    # scanned COMPLETELY; the next run resumes at cursor - 1. It is therefore
+    # only advanced after a fully-ok day, never on a failed/blocked one.
     if not _ss_proc.get("Shutterstock_backfill_done"):
         cur = _ss_proc.get("Shutterstock_backfill_cursor")
         if cur:
@@ -249,20 +289,28 @@ def _shutterstock_api_collect_direct():
                 reached_floor = False; break
             date_str = bday.isoformat()
             active_cats = _day_cats(bday)
+            if active_cats is None:
+                # Month aggregate unavailable → cannot know which categories to
+                # query. Leave the cursor on the last completed day and retry later.
+                reached_floor = False
+                _sync_log(f"⏸ SS backfill: paused at {date_str} (aggregate failed), resume next sync")
+                break
             if active_cats:
-                day_new, _da, blocked = _collect_day(date_str, active_cats, consec)
+                day_new, _da, blocked, day_ok = _collect_day(date_str, active_cats, consec)
                 bf_saved += day_new
                 if day_new > 0 and bf_saved % 200 < day_new:
                     _sync_log(f"  ⏬ {date_str}: +{day_new} (backfill {bf_saved})")
                 if blocked:
-                    # Persist progress and bail — resume here next sync.
-                    _ss_proc["Shutterstock_backfill_cursor"] = bday.isoformat()
-                    _save_proc()
+                    # Cursor already points at the last COMPLETED day (bday + 1).
                     _sync_log(f"🛑 SS backfill: 403 — paused at {date_str}, resume next sync (+{bf_saved})")
                     return True
-            # Persist the cursor EVERY day so closing the app mid-walk loses nothing
-            # — on restart we resume from exactly here and never re-collect below it.
-            # (tiny <1KB file; writes are spread across the per-day throttle sleep.)
+                if not day_ok:
+                    reached_floor = False
+                    _sync_log(f"⏸ SS backfill: {date_str} incomplete — resume here next sync")
+                    break
+            # Persist the cursor after EVERY fully-scanned day so closing the app
+            # mid-walk loses nothing — on restart we resume from exactly here and
+            # never re-collect below it. (tiny <1KB file.)
             _ss_proc["Shutterstock_backfill_cursor"] = bday.isoformat()
             _save_proc()
             bday -= timedelta(days=1)
