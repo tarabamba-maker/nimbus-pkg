@@ -125,8 +125,8 @@ def _nonzero_days(daily_resp: dict) -> list[str]:
 
 def _norm_dt(iso: str, day: str) -> str:
     """'2026-06-05T03:02:47-04:00' → '2026-06-05T03:02:47' (stock-local naive).
-    Keep the 'T' — _save_record only parses ISO-T formats; a space-separated
-    datetime falls through to now() and corrupts the sale date."""
+    Any timestamped form is fine for _save_record (it parses ISO-T and the app's
+    own 'YYYY-MM-DD HH:MM:SS', and drops — never stamps 'now' on — unparsable dates)."""
     if iso and len(iso) >= 19:
         return iso[:19]
     return day + "T00:00:00"
@@ -177,8 +177,14 @@ def _rf123_run(get_json):
             break
         _t.sleep(4)
     if not isinstance(monthly, dict) or "__error" in monthly:
-        _sync_log("⚠️ 123RF: не залогінений — натисни кнопку «123RF» щоб увійти")
-        return "needs_login"
+        err = monthly.get("__error") if isinstance(monthly, dict) else monthly
+        # Only an auth-class status means the session is gone. A 5xx/timeout is
+        # transient: report it and skip this sync instead of popping a login window.
+        if err in (401, 403, "401", "403"):
+            _sync_log("⚠️ 123RF: не залогінений — натисни кнопку «123RF» щоб увійти")
+            return "needs_login"
+        _sync_log(f"⚠️ 123RF: monthly report недоступний ({err}) — пропускаю цей синк")
+        return True
     _sync_log("✅ 123RF: сесія активна")
     totals = _month_totals(monthly)
     if not totals:
@@ -200,8 +206,19 @@ def _rf123_run(get_json):
         if _sync_stop_flag[0]:
             break
         daily = get_json(f"/earnings/report/daily?file_type=all&date={ym}")
+        if not isinstance(daily, dict) or "__error" in daily:
+            # The daily report failed → we cannot know which days to fetch.
+            # Do NOT record the month total: the month would be considered done
+            # with zero per-sale rows until its total changes again.
+            _sync_log(f"  ⚠️ 123RF {ym}: daily report failed — month left pending")
+            continue
         days = _nonzero_days(daily)
         month_ok = True
+        if not days and totals.get(ym, 0) > 0:
+            # Report parsed but no day rows although the month has earnings:
+            # shape drift or partial response — don't mark it done.
+            _sync_log(f"  ⚠️ 123RF {ym}: total ${totals[ym]:.2f} but no day rows — month left pending")
+            month_ok = False
         for day in days:
             if _sync_stop_flag[0]:
                 month_ok = False
@@ -224,12 +241,12 @@ def _rf123_run(get_json):
                         continue
                     turl = (rec.get("thumbnails") or {}).get("nonWatermarkedUs450") or ""
                     _save_record({
-                        "stock":     _STOCK,
-                        "asset_id":  aid,
-                        "price":     round(net, 3),
-                        "date":      _norm_dt(rec.get("iso8601DateTime") or "", day),
-                        "title":     rec.get("fileName") or "",
-                        "thumb_url": turl,
+                        "stock":      _STOCK,
+                        "asset_id":   aid,
+                        "price":      round(net, 3),
+                        "date":       _norm_dt(rec.get("iso8601DateTime") or "", day),
+                        "photo_name": rec.get("fileName") or "",
+                        "thumb_url":  turl,
                     })
                     saved += 1
                     if turl:

@@ -118,6 +118,12 @@ def _ms_plus_collect_direct():
 
     library = {}
     total_files = 0
+    # Dirs whose contentlist pagination completed cleanly. ONLY these get their
+    # new filestotal persisted below; a dir that errored/was stopped mid-way keeps
+    # its OLD value so it is re-fetched next sync. (Previously every dir was
+    # written with its new count regardless → partially fetched dirs were never
+    # revisited until MS+'s count changed again.)
+    ok_dirs = set()
     for dir_idx, dr in enumerate(changed_dirs, 1):
         if _sync_stop_flag[0]:
             _sync_log("⛔ MS+ direct: зупинено")
@@ -127,6 +133,7 @@ def _ms_plus_collect_direct():
             continue
         path_enc = _up.quote(path, safe='')
         skip = 0
+        dir_ok = True
         while True:
             body = (f"skip={skip}&limit=250&directory={path_enc}"
                     f"&{agencies_param}&searchtext=&archive=0")
@@ -136,9 +143,14 @@ def _ms_plus_collect_direct():
                 resp = r.json()
             except Exception as ex:
                 _sync_log(f"  ⚠️ {path} skip={skip}: {ex}")
+                dir_ok = False
                 break
             if not resp.get("isOk"):
                 _sync_log(f"  ⚠️ {path} skip={skip}: {resp.get('message','?')}")
+                dir_ok = False
+                break
+            if _sync_stop_flag[0]:
+                dir_ok = False
                 break
             items = resp.get("list", [])
             if not items:
@@ -173,6 +185,8 @@ def _ms_plus_collect_direct():
                 break
             skip += 250
             time.sleep(0.1)
+        if dir_ok:
+            ok_dirs.add(path)
         if dir_idx % 20 == 0 or dir_idx == len(changed_dirs):
             _sync_log(f"  📦 {dir_idx}/{len(changed_dirs)} папок, всього {total_files} фото")
 
@@ -250,10 +264,23 @@ def _ms_plus_collect_direct():
         except Exception as ex:
             _sync_log(f"⚠️ ms_meta compute failed: {ex}")
 
-    # Persist filestotal-per-dir cursor for next incremental sync.
+    # Persist filestotal-per-dir cursor for next incremental sync — but only
+    # advance dirs that were fetched completely; incomplete ones keep their old
+    # value (or stay absent) so they are re-fetched next time.
+    new_state = {}
+    for d_path, cur_total in _cur_filestotal.items():
+        if d_path in ok_dirs:
+            new_state[d_path] = cur_total
+        elif d_path in _prev_filestotal:
+            new_state[d_path] = _prev_filestotal[d_path]
+    n_pending = len([d for d in changed_dirs if d.get("path") and d.get("path") not in ok_dirs])
+    if n_pending:
+        _sync_log(f"⏸ MS+ direct: {n_pending} папок не дочитано — повторяться наступного синку")
     try:
-        with open(_ms_state_file, 'w') as _f:
-            json.dump(_cur_filestotal, _f)
+        tmp = _ms_state_file + ".tmp"
+        with open(tmp, 'w') as _f:
+            json.dump(new_state, _f)
+        os.replace(tmp, _ms_state_file)
     except Exception:
         pass
     return True
