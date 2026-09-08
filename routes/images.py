@@ -29,9 +29,19 @@ _STOCK_FAVICON_URLS = {
 }
 
 
+def _safe_name(name: str) -> str:
+    """Reject ids/filenames that could escape the cache directory. Flask's default
+    converter only blocks '/', so on Windows '..\\..\\x' would still traverse."""
+    if (not name or name in ('.', '..') or '/' in name or '\\' in name
+            or '..' in name or name.startswith('.') or '\x00' in name):
+        abort(400)
+    return name
+
+
 @images_bp.route('/img/cache/<aid>')
 def img_cache_serve(aid):
     """Serve img_cache/aid.jpg, or try to fetch and cache on-demand if missing."""
+    aid = _safe_name(aid)
     p = os.path.join(CACHE_DIR, f"{aid}.jpg")
     if os.path.exists(p):
         return send_file(p, mimetype='image/jpeg')
@@ -62,6 +72,7 @@ def img_cache_upload(aid):
     cards that have no auto thumbnail (e.g. synthetic 'adobe-missions', or photos whose
     stock thumb never downloaded). Also refreshes asset_meta dHash so the manual image
     participates in matching."""
+    aid = _safe_name(aid)
     data = request.get_data() or b''
     if len(data) < 64:
         return jsonify({'status': 'error', 'msg': 'empty image body'}), 400
@@ -104,6 +115,7 @@ def img_placeholder():
 @images_bp.route('/img/ms/<fname>')
 def img_ms_serve(fname):
     """Serve img_cache_ms/fname.jpg для Svelte UI."""
+    fname = _safe_name(fname)
     p = os.path.join(MS_CACHE_DIR, f"{fname}.jpg")
     if not os.path.exists(p):
         abort(404)

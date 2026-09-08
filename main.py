@@ -4,6 +4,7 @@ All routes live in routes/. All business logic lives in their respective modules
 """
 
 import os
+import re
 import ssl
 import sys
 
@@ -131,10 +132,35 @@ from flask import Flask
 from flask_cors import CORS
 
 from db import init_db
+from sync_state import _app_log
 
 flask_app = Flask(__name__)
 flask_app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500 MB
-CORS(flask_app)
+
+# ── Local-only access policy ──────────────────────────────────────────────────
+# The backend is a private local service for the Tauri and native-Mac shells.
+# It exposes destructive routes (/api/full-reset, /api/import-raw, ...), so:
+#  1. bind 127.0.0.1 only (see the entry point) — nothing on the LAN can reach it;
+#  2. CORS is limited to the app shells' origins (Tauri mac / Tauri Windows / Vite dev);
+#  3. any state-changing request that carries a browser `Origin` header outside
+#     that allow-list is rejected — this also blocks "simple" cross-site POSTs that
+#     never trigger a CORS preflight (e.g. a web page calling /api/deduplicate).
+# Native clients (Swift URLSession, curl, test_api.py) send no Origin → allowed.
+_ALLOWED_ORIGINS = re.compile(
+    r"^(tauri://localhost|https?://tauri\.localhost|https?://(localhost|127\.0\.0\.1)(:\d+)?)$"
+)
+CORS(flask_app, origins=_ALLOWED_ORIGINS)
+
+from flask import request as _request, abort as _abort
+
+@flask_app.before_request
+def _reject_foreign_origins():
+    if _request.method in ("GET", "HEAD", "OPTIONS"):
+        return
+    origin = _request.headers.get("Origin")
+    if origin and origin != "null" and not _ALLOWED_ORIGINS.match(origin):
+        _app_log(f"[security] rejected {_request.method} {_request.path} from origin {origin}")
+        _abort(403)
 
 # ── Blueprint registration ────────────────────────────────────────────────────
 from routes.images  import images_bp
@@ -155,4 +181,6 @@ flask_app.register_blueprint(admin_bp)
 if __name__ == "__main__":
     init_db()
     print(f"🚀 Flask запущено на http://127.0.0.1:{FLASK_PORT}")
-    flask_app.run(host='0.0.0.0', port=FLASK_PORT, use_reloader=False, threaded=True)
+    # 127.0.0.1 only: never expose the admin routes to the LAN. If remote access
+    # is ever wanted, put a tunnel (cloudflared) in front of localhost explicitly.
+    flask_app.run(host='127.0.0.1', port=FLASK_PORT, use_reloader=False, threaded=True)

@@ -209,6 +209,10 @@ def _adobe_collect_direct():
     chunk_end = now - timedelta(days=1)
     cutoff    = now - timedelta(days=365 * 10)
     hist_saved = 0
+    # True if ANY chunk or page in this walk failed. A walk with failures must
+    # never arm `_adobe_full_walk` (MIN(date) would not be the true first sale)
+    # and a chunk with a failed page must never mark its months done.
+    walk_had_errors = False
     while chunk_end > cutoff:
         if _sync_stop_flag[0]: break
         chunk_start = max(chunk_end - timedelta(days=359), cutoff)
@@ -237,7 +241,8 @@ def _adobe_collect_direct():
                       f"?end_date={e_str}&start_date={s_str}"
                       f"&time_range=day&limit=1000&page=1")
         if "error" in d0:
-            _sync_log(f"  ⚠️ {d0['error']} — skip chunk")
+            _sync_log(f"  ⚠️ {d0['error']} — skip chunk (will retry next sync)")
+            walk_had_errors = True
             chunk_end = chunk_start - timedelta(days=1); continue
 
         range_pages = d0.get("view", {}).get("pagination", {}).get("pages", 1)
@@ -245,14 +250,18 @@ def _adobe_collect_direct():
         _sync_log(f"   → {range_total} records, {range_pages} pages")
 
         chunk_new = 0
+        chunk_ok  = True          # every page fetched, not interrupted
         for pg in range(1, range_pages + 1):
-            if _sync_stop_flag[0]: break
+            if _sync_stop_flag[0]:
+                chunk_ok = False; break
             d = d0 if pg == 1 else _get_page(
                 f"/en/insights/sales-earnings"
                 f"?end_date={e_str}&start_date={s_str}"
                 f"&time_range=day&limit=1000&page={pg}")
             if "error" in d:
-                _sync_log(f"  ⚠️ page={pg}: {d['error']}"); continue
+                _sync_log(f"  ⚠️ page={pg}: {d['error']}")
+                chunk_ok = False; walk_had_errors = True
+                continue
             for item in d.get("sales", {}).get("history", []):
                 asset_id = str(item.get("id", ""))
                 price    = float(item.get("commissionAmount", 0))
@@ -274,9 +283,11 @@ def _adobe_collect_direct():
         if chunk_new > 0:
             _sync_log(f"   ✚ {chunk_new} new")
         # Only mark months as "done" if Adobe actually returned records for this
-        # chunk. Empty responses might be a temporary API breakage (history: 2021-2023
-        # was lost this way once). Re-checking an empty chunk next sync costs 1 request.
-        if range_total > 0:
+        # chunk AND every page of it was fetched (no page error, no Stop). Empty
+        # responses might be a temporary API breakage (history: 2021-2023 was lost
+        # this way once). Re-checking an empty chunk next sync costs 1 request.
+        # A partially-fetched chunk marked done would lose the missing pages forever.
+        if range_total > 0 and chunk_ok:
             adobe_done.update(months)
             all_proc["Adobe Stock"] = sorted(adobe_done)
             try:
@@ -284,15 +295,20 @@ def _adobe_collect_direct():
             except Exception: pass
         chunk_end = chunk_start - timedelta(days=1)
 
-    # Pass 2 reached the 10-year cutoff WITHOUT being interrupted → the full history
-    # has now been walked once, so MIN(date) is the genuine first sale. Arm the
-    # first-sale guard for subsequent syncs (cheap probes only on real history).
-    if not _sync_stop_flag[0]:
+    # Pass 2 reached the 10-year cutoff WITHOUT being interrupted AND without a
+    # single chunk/page error → the full history has now been walked once, so
+    # MIN(date) is the genuine first sale. Arm the first-sale guard for subsequent
+    # syncs (cheap probes only on real history). With errors, MIN(date) may still
+    # be just the recent window's floor — arming would lock out years of history.
+    if not _sync_stop_flag[0] and not walk_had_errors and not all_proc.get("_adobe_full_walk"):
+        _sync_log("✅ Adobe: full 10-year walk completed cleanly — arming first-sale guard")
         all_proc["_adobe_full_walk"] = True
         try:
             with open(proc_file, "w") as f: json.dump(all_proc, f, indent=2)
         except Exception: pass
         time.sleep(0.2)
+    elif walk_had_errors:
+        _sync_log("⚠️ Adobe: history walk had errors — failed chunks will be retried next sync")
 
     _sync_log(f"✅ Adobe direct ВСЬОГО: {total_saved + hist_saved}")
 

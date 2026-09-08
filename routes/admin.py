@@ -9,6 +9,7 @@ Routes: /api/export, /api/import-raw, /api/import-chrome-cookies,
 
 import glob
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -116,7 +117,9 @@ def _do_import(zip_path):
             if 'sales.db' not in names:
                 return jsonify({'ok': False, 'msg': 'ZIP does not contain sales.db'}), 400
             for member in names:
-                if member.startswith('/') or '..' in member.replace('\\', '/'):
+                norm = member.replace('\\', '/')
+                if (norm.startswith('/') or '..' in norm.split('/')
+                        or re.match(r'^[A-Za-z]:', norm)):
                     return jsonify({'ok': False, 'msg': f'Unsafe path in ZIP: {member}'}), 400
             zf.extractall(_BASE_DIR)
         _app_log(f"[import] restored {len(names)} files to {_BASE_DIR}")
