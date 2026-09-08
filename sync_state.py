@@ -111,25 +111,45 @@ def _save_record(d: dict):
     blue-highlight diff (client reads via /api/sync/recent-keys). The dedup
     guard before insert prevents already-known sales from polluting that list."""
     if not d: return
-    raw_date = d.get('date'); dt = datetime.now()
+    raw_date = str(d.get('date') or '').strip()
+    # Parse the collector's date. Accepted: ISO-T (with/without offset or Z),
+    # the app's own 19-char "YYYY-MM-DD HH:MM:SS", m/d/Y, d/m/Y, YYYY-MM-DD.
+    # NEVER fall back to datetime.now(): an unparsed date silently stamped
+    # "today" corrupts Analytics/period stats. Log loudly and drop instead.
+    dt = None
     if raw_date:
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z",
+        core = raw_date.split('+')[0].split('Z')[0]
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                    "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M",
                     "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d"):
             try:
-                dt = datetime.strptime(raw_date.split('+')[0].split('Z')[0], fmt)
+                dt = datetime.strptime(core, fmt)
                 break
             except Exception: pass
+    if dt is None:
+        _sync_log(f"⚠️ [{d.get('stock','?')}] unparsable date {raw_date!r} for asset "
+                  f"{d.get('asset_id','?')} — record DROPPED")
+        return
+    # Date-only input (no time component) must be deduped by day+price, not by
+    # exact datetime: the normalized "00:00:00" would otherwise make every
+    # second same-day sale of an asset look like an exact duplicate (bug that
+    # dropped Dreamstime/Alamy/Depositphotos/SS same-day sales at other prices).
+    has_time = 'T' in raw_date or (' ' in raw_date and len(raw_date) > 10)
     d['date']  = dt.strftime("%Y-%m-%d %H:%M:%S")
     d['stock'] = d.get('stock', 'Adobe Stock')
+    dedup_date = d['date'] if has_time else d['date'][:10]
     # Dedup guard: skip if already in DB (collectors call this without checking).
     # Without this, re-syncs would balloon _session_new_keys with duplicates.
     try:
-        if is_already_saved(d['stock'], d.get('asset_id', ''), d.get('price', 0), d['date']):
+        if is_already_saved(d['stock'], d.get('asset_id', ''), d.get('price', 0), dedup_date):
             return
-    except Exception:
-        pass
+    except Exception as ex:
+        _sync_log(f"⚠️ dedup check failed for {d.get('stock')}/{d.get('asset_id')}: {ex}")
     d.setdefault('sync_batch', _sync_batch[0])
-    save_to_db(d)
+    if not save_to_db(d):
+        _sync_log(f"⚠️ [{d['stock']}] DB insert failed for asset {d.get('asset_id','?')} "
+                  f"({d['date']}) — sale NOT saved")
+        return
     # Record the key for client blue-highlight diff. Uses 10-char date prefix
     # so it matches /api/feed which slices date to YYYY-MM-DD.
     try:

@@ -105,6 +105,11 @@ def is_already_saved(stock, asset_id, price, date_str):
     2. Fallback: price±0.005 + day match via substr(date,1,10). Matches BOTH
        legacy 10-char and current 19-char rows.
 
+    Pass selection is driven by the INCOMING date_str. _save_record passes the
+    10-char day for date-only stocks (Dreamstime/Alamy/Depositphotos/SS/Freepik/
+    Envato) so they take Pass 2; passing the normalized "... 00:00:00" would send
+    them to Pass 1 and drop every second same-day sale at a different price.
+
     ⚠️ DO NOT add `AND LENGTH(date)=10` — past bug: with all current rows in
     19-char format, that filter matched nothing → SS daily aggregates were
     re-inserted as duplicates every sync (6,241 dups deleted 2026-05-19).
@@ -145,11 +150,16 @@ def is_already_saved(stock, asset_id, price, date_str):
                 (stock, str(asset_id), day, p)
             ).fetchone()
         return row is not None
-    except Exception:
+    except Exception as e:
+        # A failed check must not look like "new": the caller re-inserts.
+        print(f"[DB] is_already_saved failed for {stock}/{asset_id}: {e}", flush=True)
         return False
 
 
-def save_to_db(d):
+def save_to_db(d) -> bool:
+    """Insert one sale row. Returns True on success, False if the insert failed
+    (e.g. 'database is locked' past the 15 s timeout). Callers must not treat a
+    failed insert as saved — _save_record logs and skips the blue-highlight key."""
     try:
         stock = d.get('stock', 'Adobe Stock')
         aid   = str(d.get('asset_id', ''))
@@ -162,5 +172,7 @@ def save_to_db(d):
                  d.get('thumb_url'), d.get('date'), d.get('filename'),
                  int(d.get('sync_batch') or 0)))
             c.commit()
+        return True
     except Exception as e:
-        print(f"[DB] {e}")
+        print(f"[DB] insert failed: {e}", flush=True)
+        return False
