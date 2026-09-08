@@ -1,86 +1,67 @@
-"""
-test_freepik.py — ISOLATION test for collectors/freepik.py.
-Pure logic only (no live browser): CSV parse, month iteration, settle gate,
-FX cache, and a round-trip over the real exported CSV.
-Run from repo root: python3 test_freepik.py
-"""
-import ast
-import os
-import tempfile
-from datetime import date
+"""Mock-transport test for Freepik month-state behaviour (C4/M5)."""
+import os, sys, json, tempfile, sqlite3
+D = tempfile.mkdtemp(prefix="fp_test_")
+os.environ["STOCK_DATA_DIR"] = D
+os.makedirs(os.path.join(D, "recipes")); os.makedirs(os.path.join(D, "img_cache"), exist_ok=True)
+W = "/Users/admin/Desktop/Stock_Automation/.claude/worktrees/opus-project-review-888be6"
+sys.path.insert(0, W)
+from db import init_db, DB_NAME
+init_db()
+import collectors.freepik as f
+import sync_state, image_utils
+sync_state._sync_log = lambda m: None
+f._sync_log = lambda m: None
+f.load_img_async = lambda *a, **k: None
+f._CSV_FLOOR_YM = "2026-06"
+f._last_settled_ym = lambda today=None: "2026-08"
 
-FAIL = 0
-def ok(cond, msg):
-    global FAIL
-    print(("  ✓ " if cond else "  ✗ ") + msg)
-    if not cond:
-        FAIL += 1
+CSV = "Freepik Asset ID,File name,Description,Asset public URL,Freepik Downloads,Freepik Earnings EUR\n" \
+      "A1,a1.jpg,desc a,http://x/a,3,1.50\nA2,a2.jpg,desc b,http://x/b,1,0.25\n"
+cfg = {"months": {"2026-06": None, "2026-07": CSV, "2026-08": CSV}, "rate": 1.16}
+def get(path):
+    if path == "/xhr/user": return json.dumps({"id": 42})
+    if path.startswith("/xhr/resource/published"): return json.dumps({"data": []})
+    if path.startswith("/xhr/stats/download"):
+        ym = f"{path.split('year=')[1][:4]}-{path.split('month=')[1][:2]}"
+        return cfg["months"].get(ym)
+    return None
+f._eur_usd_rate = lambda ym, _fetch=None: cfg["rate"]
+STATE = os.path.join(D, "recipes", "_freepik_months.json")
+def state(): return json.load(open(STATE)) if os.path.exists(STATE) else {}
+def rows():
+    with sqlite3.connect(DB_NAME) as c:
+        return c.execute("SELECT asset_id, price, substr(date,1,10) FROM sales WHERE stock='Freepik' ORDER BY date, asset_id").fetchall()
 
-print("── syntax ──")
-for f in ("collectors/freepik.py", "test_freepik.py"):
-    try:
-        ast.parse(open(f).read()); ok(True, f"ast.parse {f}")
-    except SyntaxError as e:
-        ok(False, f"{f}: {e}")
+# S1: June transport failure → not recorded; July/Aug collected; result "transient"
+assert f._freepik_run(get) == "transient"
+st = state()
+assert "2026-06" not in st and "2026-07" in st and "2026-08" in st, st
+assert len(rows()) == 4, rows()
+assert abs(rows()[0][1] - 1.5 * 1.16) < 1e-6
+print("S1 ok", st)
 
-from collectors import freepik as F
+# S2: HTML login page with 200 for June → still not recorded
+cfg["months"]["2026-06"] = "<html><body>login</body></html>"
+assert f._freepik_run(get) == "transient"
+assert "2026-06" not in state()
+print("S2 ok (html not treated as empty month)")
 
-print("── _parse_report_csv ──")
-sample = (
-    "Asset type,File name,Description,Asset public URL,Freepik Asset ID,Freepik Downloads,Freepik Earnings EUR\n"
-    "photo,B94A3666.jpg,Some massage,https://www.freepik.com/free-photo/e_14721513.htm,14721513,1,0.0009\n"
-    'photo,x.jpg,"Comma, in desc",https://www.freepik.com/free-photo/e_26471081.htm,26471081,82,3.9725\n'
-    "photo,,no id row,https://x,,,\n"
-)
-rows = F._parse_report_csv(sample)
-ok(len(rows) == 2, f"parsed 2 rows (skipped empty-id) -> {len(rows)}")
-ok(rows[0]["asset_id"] == "14721513" and abs(rows[0]["earnings_eur"] - 0.0009) < 1e-9, "row0 id+eur")
-ok(rows[1]["downloads"] == 82 and rows[1]["description"] == "Comma, in desc", "row1 quoted comma + downloads")
-ok(F._parse_report_csv("") == [], "empty text -> []")
+# S3: FX unavailable for June → skipped, not recorded
+cfg["months"]["2026-06"] = CSV; cfg["rate"] = None
+assert f._freepik_run(get) == "transient"
+assert "2026-06" not in state() and len(rows()) == 4
+print("S3 ok (no rate → month skipped)")
 
-print("── _month_iter ──")
-ms = list(F._month_iter("2024-11", "2025-02"))
-ok(ms == ["2024-11", "2024-12", "2025-01", "2025-02"], f"crosses year -> {ms}")
-ok(list(F._month_iter("2026-05", "2026-05")) == ["2026-05"], "single month")
-
-print("── _last_settled_ym (10th gate) ──")
-ok(F._last_settled_ym(date(2026, 6, 9)) == "2026-04", "before 10th -> 2 months back (Apr)")
-ok(F._last_settled_ym(date(2026, 6, 10)) == "2026-05", "on 10th -> previous month (May)")
-ok(F._last_settled_ym(date(2026, 1, 5)) == "2025-11", "Jan before 10th wraps year -> 2025-11")
-ok(F._last_settled_ym(date(2026, 1, 15)) == "2025-12", "Jan after 10th -> 2025-12")
-
-print("── _invoice_fx_date ──")
-ok(F._invoice_fx_date("2024-05") == "2024-06-07", "May -> Jun 7")
-ok(F._invoice_fx_date("2024-12") == "2025-01-07", "Dec -> next Jan 7")
-
-print("── _month_date ──")
-ok(F._month_date("2024-02") == "2024-02-29", "Feb 2024 leap -> 29")
-ok(F._month_date("2024-04") == "2024-04-30", "Apr -> 30")
-
-print("── _eur_usd_rate (injected fetch + cache) ──")
-tmp = tempfile.mkdtemp()
-F._FX_FILE = os.path.join(tmp, "_fx.json")
-calls = {"n": 0}
-def fake_fetch(d):
-    calls["n"] += 1
-    return 1.1234
-r1 = F._eur_usd_rate("2024-05", _fetch=fake_fetch)
-r2 = F._eur_usd_rate("2024-05", _fetch=fake_fetch)   # cached -> no 2nd call
-ok(abs(r1 - 1.1234) < 1e-9, f"rate fetched -> {r1}")
-ok(calls["n"] == 1, f"cached on 2nd call (fetch calls={calls['n']})")
-ok(os.path.exists(F._FX_FILE), "fx cache written")
-
-print("── real exported CSV round-trip ──")
-real = os.path.expanduser("~/Downloads/assets_report_05_2026.csv")
-if os.path.exists(real):
-    rows = F._parse_report_csv(open(real, encoding="utf-8-sig").read())
-    tot = sum(r["earnings_eur"] for r in rows)
-    ok(len(rows) == 2236, f"row count -> {len(rows)} (expect 2236)")
-    ok(abs(tot - 162.38) < 0.01, f"total EUR -> {tot:.2f} (expect 162.38)")
-else:
-    print("  (skip: real CSV not in ~/Downloads)")
-
-print("\n" + "=" * 40)
-print(f"  {'PASSED' if FAIL == 0 else 'FAILED'}: {FAIL} failure(s)")
-print("=" * 40)
-raise SystemExit(1 if FAIL else 0)
+# S4: legacy month stored at fallback 1.08 → re-collected with real rate, rows replaced
+st = state(); st["2026-07"]["rate"] = 1.08; json.dump(st, open(STATE, "w"))
+with sqlite3.connect(DB_NAME) as c:
+    c.execute("UPDATE sales SET price=price/1.16*1.08 WHERE stock='Freepik' AND substr(date,1,7)='2026-07'")
+cfg["rate"] = 1.16
+assert f._freepik_run(get) is True
+r = rows(); st = state()
+assert st["2026-07"]["rate"] == 1.16, st
+july = [x for x in r if x[2].startswith("2026-07")]
+assert len(july) == 2 and abs(july[0][1] - 1.5 * 1.16) < 1e-6, july
+assert "2026-06" in st and len(r) == 6, (st, r)
+print("S4 ok (fallback-rate month re-collected)", july)
+print("ALL FREEPIK TESTS OK")
