@@ -199,32 +199,56 @@ def _parse_report_csv(text: str) -> list[dict]:
 
 # ── browser-context fetch helpers ────────────────────────────────────────────
 
-def _fetch_text(pw_page, path: str) -> str | None:
-    """GET `path` inside the browser (cookie + x-requested-with). Returns text."""
-    js = f"""async () => {{
-        const r = await fetch("{_BASE}{path}", {{
-            credentials: "include",
-            headers: {{"x-requested-with":"XMLHttpRequest","Accept":"*/*"}}
-        }});
-        if (!r.ok) return JSON.stringify({{__error: r.status}});
-        return await r.text();
-    }}"""
-    try:
-        t = pw_page.evaluate(js)
-    except Exception as ex:
-        _app_log(f"[Freepik] fetch {path} failed: {ex}")
-        return None
-    if isinstance(t, str) and t.startswith('{"__error"'):
+def _fetch_text(get, path: str) -> str | None:
+    """Transport-agnostic GET: `get` is a path->text|None callable (Playwright
+    in-page fetch or direct requests). Kept as a function so all the call sites
+    that pass it around read the same."""
+    return get(path)
+
+
+def _pw_get(pw_page):
+    """Playwright transport: in-page fetch (cookie + x-requested-with)."""
+    def get(path):
+        js = f'''async () => {{
+            const r = await fetch("{_BASE}{path}", {{
+                credentials: "include",
+                headers: {{"x-requested-with":"XMLHttpRequest","Accept":"*/*"}}
+            }});
+            if (!r.ok) return JSON.stringify({{__error: r.status}});
+            return await r.text();
+        }}'''
         try:
-            _app_log(f"[Freepik] {path} → HTTP {json.loads(t)['__error']}")
-        except Exception:
-            pass
-        return None
-    return t
+            t = pw_page.evaluate(js)
+        except Exception as ex:
+            _app_log(f"[Freepik] fetch {path} failed: {ex}")
+            return None
+        if isinstance(t, str) and t.startswith('{"__error"'):
+            try:
+                _app_log(f"[Freepik] {path} → HTTP {json.loads(t)['__error']}")
+            except Exception:
+                pass
+            return None
+        return t
+    return get
 
 
-def _fetch_json(pw_page, path: str):
-    t = _fetch_text(pw_page, path)
+def _http_get(sess):
+    """Direct transport: requests.Session with native-login cookies."""
+    def get(path):
+        try:
+            r = sess.get(_BASE + path, timeout=30)
+        except Exception as ex:
+            _app_log(f"[Freepik] direct {path} failed: {ex}")
+            return None
+        if not r.ok:
+            _app_log(f"[Freepik] {path} → HTTP {r.status_code}")
+            return None
+        return r.text
+    return get
+
+
+def _fetch_json(get, path: str):
+    t = _fetch_text(get, path)
     if t is None:
         return {"__error": "no body"}
     try:
@@ -233,8 +257,8 @@ def _fetch_json(pw_page, path: str):
         return {"__error": f"json: {ex}"}
 
 
-def _get_user_id(pw_page) -> str | None:
-    d = _fetch_json(pw_page, "/xhr/user")
+def _get_user_id(get) -> str | None:
+    d = _fetch_json(get, "/xhr/user")
     if "__error" in d:
         return None
     # the id may be nested under data/user
@@ -248,23 +272,32 @@ def _get_user_id(pw_page) -> str | None:
 
 # ── portfolio (clean thumbnails + per-asset all-time stats) ──────────────────
 
-def _fetch_portfolio(pw_page, limit: int = 100, max_pages: int = 400) -> dict:
+def _fetch_portfolio(get, limit: int = 100, max_pages: int = 400) -> dict:
     """Page /xhr/resource/published → {asset_id: {thumb, downloads, earnings,
-    date, title}}. Merged into _freepik_portfolio.json for reuse."""
+    date, title}}. Merged into _freepik_portfolio.json for reuse.
+
+    Early-stop: the endpoint is newest-first, so once a whole page contains only
+    ids already in the cached portfolio file, everything below is known too —
+    stop paging. Without this every sync walked all ~153 pages (15k assets) just
+    to rediscover the same map. First run (empty cache) still walks everything."""
+    prev = _load_json(_PORTFOLIO_FILE)
     out = {}
     page = 1
     while page <= max_pages and not _sync_stop_flag[0]:
-        d = _fetch_json(pw_page, f"/xhr/resource/published?limit={limit}&page={page}")
+        d = _fetch_json(get, f"/xhr/resource/published?limit={limit}&page={page}")
         if "__error" in d:
             _sync_log(f"⚠️ Freepik portfolio p{page}: {d['__error']}")
             break
         items = d.get("data") or []
         if not items:
             break
+        page_new = 0
         for it in items:
             aid = str(it.get("id") or "")
             if not aid:
                 continue
+            if aid not in prev:
+                page_new += 1
             out[aid] = {
                 "thumb":     it.get("imgPreview") or "",
                 "downloads": it.get("downloads") or 0,
@@ -272,35 +305,54 @@ def _fetch_portfolio(pw_page, limit: int = 100, max_pages: int = 400) -> dict:
                 "date":      it.get("date") or "",
                 "title":     it.get("title") or "",
             }
+        if prev and page_new == 0:
+            break                      # all-known page → rest is cached
         if len(items) < limit:
             break
         page += 1
     if out:
-        prev = _load_json(_PORTFOLIO_FILE)
         prev.update(out)
         _save_json(_PORTFOLIO_FILE, prev)
-    return out
+    return prev if prev else out
 
 
 # ── main collect ─────────────────────────────────────────────────────────────
 
-def _freepik_collect(pw_page):
-    """Collect Freepik earnings. Returns True / 'needs_login'."""
-    import time
+def _freepik_collect_direct():
+    """Direct-HTTPS collect with native-login cookies (no Playwright).
+    Returns True / False (False → caller opens a native login)."""
+    from collectors.session import stock_session
+    sess = stock_session(["magnific.com", "freepik.com"], xhr=True, accept="*/*",
+                         referer="https://contributor.magnific.com/statistics")
+    if sess is None:
+        _sync_log("⚠️ Freepik direct: нема cookies — потрібен нативний логін")
+        return False
+    res = _freepik_run(_http_get(sess))
+    return False if res == "needs_login" else True
 
-    _sync_log("📊 Freepik: перевіряємо сесію…")
-    for _ in range(10):
+
+def _freepik_collect(pw_page):
+    """Playwright fallback (in-page fetch). Returns True / 'needs_login'."""
+    import time
+    for _ in range(10):                 # let the SPA finish booting
         if not _is_login_url(pw_page.url):
             break
         time.sleep(0.5)
-    uid = _get_user_id(pw_page)
+    return _freepik_run(_pw_get(pw_page))
+
+
+def _freepik_run(get):
+    """Core collection loop, transport-agnostic: get(path) -> text|None.
+    Returns True / 'needs_login'."""
+    _sync_log("📊 Freepik: перевіряємо сесію…")
+    uid = _get_user_id(get)
     if not uid:
         _sync_log("⚠️ Freepik: не залогінений / нема user_id — Import Cookies або кнопка Freepik")
         return "needs_login"
     _sync_log(f"✅ Freepik: сесія активна (user_id={uid})")
 
     # 1) clean thumbnails map (also used by pre-2024 weighting later)
-    portfolio = _fetch_portfolio(pw_page)
+    portfolio = _fetch_portfolio(get)
     _sync_log(f"🖼️ Freepik: портфоліо {len(portfolio)} ассетів (чисті сабнейли)")
 
     # 2) per-asset monthly earnings — every settled month not yet collected
@@ -314,7 +366,7 @@ def _freepik_collect(pw_page):
         if ym in months_state:               # final + already collected → never refetch
             continue
         yyyy, mm = ym[:4], ym[5:7]
-        csv_text = _fetch_text(pw_page, f"/xhr/stats/download?user_id={uid}&month={mm}&year={yyyy}")
+        csv_text = _fetch_text(get, f"/xhr/stats/download?user_id={uid}&month={mm}&year={yyyy}")
         rows = _parse_report_csv(csv_text or "")
         if not rows:
             months_state[ym] = {"total_eur": 0.0, "rows": 0}
@@ -373,12 +425,12 @@ def _freepik_collect(pw_page):
             load_img_async(aid, turl, None, is_adobe=False, stock="Freepik")
 
     if COLLECT_PRE_HISTORY and not _sync_stop_flag[0]:
-        _collect_pre_history(pw_page, uid, portfolio, end_ym)
+        _collect_pre_history(get, uid, portfolio, end_ym)
 
     return True
 
 
-def _recent_downloads(pw_page, uid: str, end_ym: str) -> dict:
+def _recent_downloads(get, uid: str, end_ym: str) -> dict:
     """Per-asset downloads in the per-asset (2025+) era, cached in
     _freepik_dl_recent.json so we fetch each month's CSV only once ever. Needed to
     derive pre-2025 downloads = portfolio all-time − this."""
@@ -390,7 +442,7 @@ def _recent_downloads(pw_page, uid: str, end_ym: str) -> dict:
         if ym in months or _sync_stop_flag[0]:
             continue
         yyyy, mm = ym[:4], ym[5:7]
-        txt = _fetch_text(pw_page, f"/xhr/stats/download?user_id={uid}&month={mm}&year={yyyy}")
+        txt = _fetch_text(get, f"/xhr/stats/download?user_id={uid}&month={mm}&year={yyyy}")
         for r in _parse_report_csv(txt or ""):
             dl[r["asset_id"]] = dl.get(r["asset_id"], 0) + r["downloads"]
         months.add(ym); changed = True
@@ -399,7 +451,7 @@ def _recent_downloads(pw_page, uid: str, end_ym: str) -> dict:
     return dl
 
 
-def _collect_pre_history(pw_page, uid: str, portfolio: dict, end_ym: str):
+def _collect_pre_history(get, uid: str, portfolio: dict, end_ym: str):
     """ESTIMATE pre-2025 earnings (Freepik has no per-asset data before 2025-01).
     Anchor = REAL aggregate monthly revenue (/xhr/stats); split per-asset by
     all-time download weight; one record per (asset, year) dated year-end. Stored
@@ -422,7 +474,7 @@ def _collect_pre_history(pw_page, uid: str, portfolio: dict, end_ym: str):
     _sync_log("📜 Freepik: оцінка історії до 2025 (агрегат × вага завантажень)…")
 
     # 1) real aggregate monthly revenue (EUR) for months < 2025-01
-    agg = _fetch_json(pw_page,
+    agg = _fetch_json(get,
         "/xhr/stats?format=monthly&license=all&typeFile=all"
         "&dateStart=2006-01-01&dateEnd=2024-12-31")
     data = (agg or {}).get("data") or {}
@@ -449,7 +501,7 @@ def _collect_pre_history(pw_page, uid: str, portfolio: dict, end_ym: str):
         return
 
     # 2) pre-2025 download weight = all-time(portfolio) − 2025+ downloads
-    recent = _recent_downloads(pw_page, uid, end_ym)
+    recent = _recent_downloads(get, uid, end_ym)
     pre_dl = {}
     for aid, info in portfolio.items():
         pre = int(info.get("downloads") or 0) - int(recent.get(aid, 0))

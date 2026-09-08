@@ -36,6 +36,7 @@ struct Sale: Codable, Identifiable, Equatable {
     var price: Double
     var stock: String
     var thumb_url: String?
+    var thumb_aid: String?
     var by_stock: [String: SaleStockStat]?
 
     /// Stable identity even when the API omits a numeric id.
@@ -79,6 +80,7 @@ struct TopPhoto: Codable, Identifiable, Equatable {
     var count: Int
     var stock: String
     var thumb_url: String?
+    var thumb_aid: String?
     var merged: Bool?
     var by_stock: [String: SaleStockStat]?
     var id: String { asset_id }
@@ -91,6 +93,33 @@ struct TopPhoto: Codable, Identifiable, Equatable {
 struct SalesResponse: Codable {
     var items: [TopPhoto] = []
     var total: Int?
+}
+
+// MARK: - Analytics (/api/analytics)
+
+struct AnalyticsPoint: Codable, Identifiable, Equatable {
+    var bucket: String
+    var total: Double
+    var count: Int
+    var by_stock: [String: SaleStockStat]?
+    var id: String { bucket }
+}
+
+struct AnalyticsStock: Codable, Identifiable, Equatable {
+    var stock: String
+    var total: Double
+    var count: Int
+    var id: String { stock }
+}
+
+struct Analytics: Codable, Equatable {
+    var granularity: String = "day"
+    var start: String = ""
+    var end: String = ""
+    var total: Double = 0
+    var count: Int = 0
+    var timeline: [AnalyticsPoint] = []
+    var by_stock: [AnalyticsStock] = []
 }
 
 // MARK: - Periods

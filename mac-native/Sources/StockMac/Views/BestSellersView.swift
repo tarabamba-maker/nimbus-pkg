@@ -172,7 +172,7 @@ struct TopPhotoCard: View {
         let imgH = s.size("cardImgH", 112)
         VStack(alignment: .leading, spacing: 0) {
             ZStack(alignment: .topLeading) {
-                CachedThumb(assetID: photo.asset_id, fallback: photo.thumb_url)
+                CachedThumb(assetID: photo.thumb_aid ?? photo.asset_id, fallback: photo.thumb_url)
                     .frame(width: w, height: imgH).clipped()
                 WeightBars(byStock: photo.by_stock)
                     .frame(width: w, height: imgH)

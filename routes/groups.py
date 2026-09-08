@@ -13,13 +13,41 @@ import sqlite3
 from flask import Blueprint, jsonify, request
 
 from app_globals import (
-    DB_NAME, RECIPES_DIR,
+    DB_NAME, GROUP_ALIASES_FILE,
     _RELEVANT_STOCKS, _query_earnings_batch, _load_matches,
+    load_group_aliases, resolve_group_alias,
 )
 from image_utils import load_groups, save_groups, load_ms_library, save_ms_library
 from sync_state import _app_log
 
 groups_bp = Blueprint('groups', __name__)
+
+
+# _load_group_aliases / resolution live in app_globals (single source of truth,
+# shared with the rebuild passes). Kept as a thin local alias for readability.
+_load_group_aliases = load_group_aliases
+
+
+def _write_group_alias(old: str, new: str) -> None:
+    """Record old→new so a rebuild / display never resurrects `old` from ms_library.
+    Canonicalizes `new` through the existing chain FIRST (so we never store a link
+    to a dead intermediate name), then re-points anything that pointed at `old`."""
+    import json as _json
+    old, new = (old or '').strip(), (new or '').strip()
+    if not old or not new:
+        return
+    aliases = _load_group_aliases()
+    new = resolve_group_alias(new, aliases)   # collapse to the true canonical
+    if not new or old == new:
+        return
+    aliases[old] = new
+    for _k, _v in list(aliases.items()):
+        if _v == old:
+            aliases[_k] = new
+    _tmp = GROUP_ALIASES_FILE + '.tmp'
+    with open(_tmp, 'w') as _f:
+        _json.dump(aliases, _f, indent=2, ensure_ascii=False)
+    os.replace(_tmp, GROUP_ALIASES_FILE)
 
 
 @groups_bp.route('/api/groups', methods=['GET'])
@@ -45,9 +73,21 @@ def api_groups_get():
         preview_n = int(request.args.get('preview', 0))
     except ValueError:
         preview_n = 0
-    user_groups = load_groups()
-    if not user_groups:
+    _aliases = load_group_aliases()
+    # Canonicalize photo_groups keys up front: an alias-source name (an old,
+    # already-merged group) must fold into its canonical group, not render as a
+    # separate card. This is the display side of the "new sales resurrect the old
+    # group name" bug — the first render loop used raw keys with no resolution.
+    _raw_groups = load_groups()
+    if not _raw_groups:
         return jsonify([])
+    user_groups: dict = {}
+    for _gname, _aids in _raw_groups.items():
+        _canon = resolve_group_alias(_gname, _aliases) or _gname
+        user_groups.setdefault(_canon, [])
+        for _a in _aids:
+            if _a not in user_groups[_canon]:
+                user_groups[_canon].append(_a)
 
     lib = load_ms_library()
     sid_to_photo: dict = {}
@@ -219,7 +259,8 @@ def api_groups_get():
     represented_groups = set(g['name'] for g in result)
     ms_lib_groups: dict = {}
     for photo in lib:
-        gname = photo.get('group', '')
+        gname = (photo.get('group', '') or '').strip()
+        gname = resolve_group_alias(gname, _aliases)   # old name → canonical; folds into existing card
         if gname and gname not in represented_groups:
             ms_lib_groups.setdefault(gname, []).append(photo)
 
@@ -262,6 +303,7 @@ def api_group_photos():
         return jsonify({'error': 'name required'}), 400
 
     lib = load_ms_library()
+    _aliases = load_group_aliases()          # match a renamed group's ms_library photos too
     photos_raw = [
         {
             'filename': p.get('filename', ''),
@@ -269,7 +311,8 @@ def api_group_photos():
             'stockids': {k: str(v) for k, v in p.get('stockids', {}).items()
                          if k in _RELEVANT_STOCKS and v},
         }
-        for p in lib if (p.get('group') or '').strip() == gname
+        for p in lib
+        if resolve_group_alias((p.get('group') or '').strip(), _aliases) == gname
     ]
     user_groups = load_groups()
     user_extra = [str(a) for a in user_groups.get(gname, [])]
@@ -443,23 +486,9 @@ def api_photo_groups_rename():
     groups[new] = groups.pop(old)
     save_groups(groups)
 
-    # Persist the rename as a group alias so a rebuild doesn't re-create the old
-    # name from ms_library (whose `group` field still says `old`). Maps any
-    # ms_library group name → canonical. Re-points existing alias chains too.
-    import json as _json
-    _af = os.path.join(RECIPES_DIR, '_group_aliases.json')
-    try:
-        with open(_af) as _f: _aliases = _json.load(_f)
-    except Exception:
-        _aliases = {}
-    _aliases[old] = new
-    for _k, _v in list(_aliases.items()):
-        if _v == old:
-            _aliases[_k] = new          # follow the chain to the newest name
-    _tmp = _af + '.tmp'
-    with open(_tmp, 'w') as _f:
-        _json.dump(_aliases, _f, indent=2, ensure_ascii=False)
-    os.replace(_tmp, _af)
+    # Persist the rename as a group alias so neither a rebuild nor the display
+    # fallback re-creates the old name from ms_library (whose `group` still says old).
+    _write_group_alias(old, new)
     return jsonify({"status": "ok"})
 
 
@@ -613,6 +642,11 @@ def api_photo_groups_merge():
     if changed:
         save_ms_library(lib)
 
+    # Durable alias: the ms_library rewrite above is wiped on the next MS+ sync
+    # (ms_library is regenerated), which would resurrect `source` via the display
+    # fallback. The alias keeps source→target folded permanently.
+    _write_group_alias(source, target)
+
     return jsonify({'status': 'ok', 'merged': len(merged)})
 
 
@@ -636,6 +670,8 @@ def api_ms_remove_from_group():
 def api_group_names():
     """Returns sorted list of all group names (ms_library + user)."""
     lib = load_ms_library()
-    ms_names = {p.get('group', '').strip() for p in lib if p.get('group', '').strip()}
-    user_names = set(load_groups().keys())
-    return jsonify(sorted(ms_names | user_names))
+    _aliases = load_group_aliases()          # show canonical names, not pre-rename ones
+    ms_names = {resolve_group_alias(g, _aliases) for p in lib
+                if (g := p.get('group', '').strip())}
+    user_names = {resolve_group_alias(g, _aliases) for g in load_groups().keys()}
+    return jsonify(sorted(n for n in (ms_names | user_names) if n))

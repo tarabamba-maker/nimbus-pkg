@@ -22,6 +22,20 @@
   const onToggleGroup = toggleGroupMember;
   const onCreateGroup = createGroup;
 
+  // Authoritative cross-stock breakdown — the card's by_stock only holds the
+  // slice of whatever stock filter was active in the parent tab.
+  let fullByStock = $state(/** @type {Record<string, any>|null} */ (null));
+  $effect(() => {
+    const aid = item?.asset_id;
+    if (!aid) { fullByStock = null; return; }
+    fullByStock = null;
+    fetch(`${API_BASE}/api/photo-detail?asset_id=${encodeURIComponent(aid)}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d && d.by_stock && Object.keys(d.by_stock).length) fullByStock = d.by_stock; })
+      .catch(() => {});
+  });
+  const byStockShown = $derived(fullByStock || item.by_stock || {});
+
   let showNewGroup  = $state(false);
   let newGroupName  = $state('');
   let groupSearch   = $state('');
@@ -85,7 +99,7 @@
 
     <!-- Per-stock breakdown -->
     <div class="stocks">
-      {#each Object.entries(item.by_stock || {}) as [sk, d]}
+      {#each Object.entries(byStockShown) as [sk, d]}
         <div class="stock-row">
           <span class="stock-icon" style="background:{STOCK_COLORS[sk]||'#555'}">
             <img src="{API_BASE}/img/stock-icon/{sk}" alt={sk}
@@ -96,7 +110,7 @@
           <span class="dim">· {d.count} sales</span>
         </div>
       {/each}
-      {#if Object.keys(item.by_stock || {}).length === 0}
+      {#if Object.keys(byStockShown).length === 0}
         <div class="dim" style="padding:8px 16px;font-size:12px">No sales</div>
       {/if}
     </div>
@@ -160,7 +174,8 @@
 <style>
   .overlay {
     position: fixed; inset: 0; z-index: 300;
-    backdrop-filter: blur(16px) saturate(160%); -webkit-backdrop-filter: blur(16px) saturate(160%);
+    backdrop-filter: blur(5px) saturate(130%); -webkit-backdrop-filter: blur(5px) saturate(130%);
+    background: rgba(0,0,0,0.18);
     display: flex; align-items: center; justify-content: center;
   }
   .panel {

@@ -69,3 +69,5 @@ get-pip.py
 recipes/_gemini_key.json
 recipes/_gdrive_client.json
 recipes/_gdrive_token.json
+_flux_config.json
+mac-native/.build/

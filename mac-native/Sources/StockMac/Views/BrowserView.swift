@@ -17,7 +17,7 @@ struct BrowserView: View {
     // Must match STOCK_URLS keys in config.py — these names are passed verbatim to
     // /api/sync/start. "Getty Images" (not "iStock") is the sync key; "iStock" is only
     // the stock NAME on saved sales rows. Mirrors STOCKS in Browser.svelte (Windows).
-    private let syncStocks = ["Adobe Stock", "Shutterstock", "Getty Images", "Depositphotos", "Envato", "Freepik"]
+    private let syncStocks = ["Adobe Stock", "Shutterstock", "Getty Images", "Depositphotos", "Envato", "Freepik", "123RF", "PIXTA", "Dreamstime", "Alamy"]
 
     var body: some View {
         VStack(spacing: 12) {

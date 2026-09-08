@@ -41,26 +41,13 @@ def _getty_collect_direct():
     from datetime import date as _date_gt
     today = _date_gt.today()
 
-    # Statement-availability gate: Getty publishes the statement for month M
-    # around the 21st of month M+1. Skip ONLY when the newest statement that
-    # could exist is already imported (in Getty_statements). If a previous
-    # period is missing — always run, regardless of the day of month.
-    proc_file_gt = os.path.join(RECIPES_DIR, "_processed_dates.json")
-    try:
-        with open(proc_file_gt) as _f: _pd_gt = json.load(_f)
-    except Exception:
-        _pd_gt = {}
-    done_gt = set(_pd_gt.get("Getty_statements", []))
-    if done_gt:
-        # newest statement that should be available now
-        y, m = today.year, today.month
-        m -= 1 if today.day >= 21 else 2
-        while m <= 0:
-            m += 12; y -= 1
-        expected = f"{y}-{m:02d}"
-        if expected in done_gt:
-            _sync_log(f"⏭️  Getty: останній доступний statement {expected} вже імпортовано — skip")
-            return True
+    # NOTE: no whole-collector early-exit. A Getty statement PERIOD is NOT frozen
+    # once imported — it can still gain rows while it settles in the first days
+    # after publication (~21st), and later periods carry back-dated sales for
+    # earlier months (measured 2026-06-23: ~73% of a period's rows are its own
+    # month, ~27% the previous month, a 2-month tail + rare old refunds). So we
+    # always run and re-fetch a small rolling window of the newest periods (see
+    # REFETCH_RECENT below). Cost is a few TSV exports per sync.
 
     try:
         all_cookies = _load_browser_cookies()
@@ -74,7 +61,7 @@ def _getty_collect_direct():
     g_cookies = {c['name']: c['value'] for c in all_cookies
                  if 'gettyimages' in c.get('domain', '').lower()}
     if 'ccw' not in g_cookies:
-        _sync_log("⚠️ Getty direct: no ccw cookie — log in via the app browser, fallback")
+        _sync_log("⚠️ Getty direct: no ccw cookie (esp.gettyimages.com) — потрібен логін")
         return False
 
     import urllib.parse as _up
@@ -93,16 +80,15 @@ def _getty_collect_direct():
     try:
         r = session.get(f"{am_base}/Reports/Export", timeout=20, allow_redirects=False)
     except Exception as e:
-        _sync_log(f"⚠️ Getty direct: connect failed: {e} — fallback")
-        return False
+        _sync_log(f"⚠️ Getty direct: connect failed: {e} — пропускаю цей синк")
+        return True   # transient network failure — not a login problem
     if r.status_code != 200:
-        _sync_log(f"⚠️ Getty direct: accountmanagement not logged in (HTTP {r.status_code}). "
-                  f"Log in via the app browser → https://accountmanagement.gettyimages.com → fallback")
+        _sync_log(f"⚠️ Getty direct: accountmanagement not logged in (HTTP {r.status_code}) — потрібен логін")
         return False
     csrf_match = re.search(r'name="__RequestVerificationToken"[^>]+value="([^"]+)"', r.text)
     if not csrf_match:
-        _sync_log("⚠️ Getty direct: CSRF token not found in HTML — fallback")
-        return False
+        _sync_log("⚠️ Getty direct: CSRF token not found in HTML — пропускаю цей синк")
+        return True   # page structure change, not an auth failure
     csrf = csrf_match.group(1)
     # Contract ID lives in HTML too; extract or use stored
     cid_match = re.search(r'(?:contractId|data-contract[\w-]*)["\s=:]+["\']?(\d+:True)', r.text)
@@ -116,8 +102,8 @@ def _getty_collect_direct():
         ar = session.get(f"{am_base}/Reports/AvailableStatementPeriod", timeout=20)
         avail = ar.json()
     except Exception as e:
-        _sync_log(f"⚠️ Getty direct: AvailableStatementPeriod failed: {e} — fallback")
-        return False
+        _sync_log(f"⚠️ Getty direct: AvailableStatementPeriod failed: {e} — пропускаю цей синк")
+        return True   # step 1 already proved we're logged in — transient
     _opts = avail.get("Options") or {}
     raw_periods = _opts.get("AvailableStatementPeriods", [])
 
@@ -131,8 +117,8 @@ def _getty_collect_direct():
     if sel and sel.get("Value"):
         contract_id = sel["Value"]
     if not contract_id:
-        _sync_log("⚠️ Getty direct: no contract found in AvailableContracts — fallback")
-        return False
+        _sync_log("⚠️ Getty direct: no contract found in AvailableContracts — пропускаю цей синк")
+        return True   # data/structure issue, not auth
     _sync_log(f"🔑 Getty direct: contract={contract_id} ({(sel or {}).get('Text','')[:40]})")
 
     periods = []
@@ -142,10 +128,14 @@ def _getty_collect_direct():
             periods.append((val[:4], val[5:7]))
     _sync_log(f"📋 Getty direct: {len(periods)} statements available")
 
-    # Early-stop: skip statements we've already fully imported.
-    # Past months (NOT current month) don't change retroactively, so once
-    # downloaded + parsed they're frozen. Re-fetching them wastes ~5-10 min
-    # per sync. Current month always re-fetched (new sales may appear).
+    # Early-stop: skip OLD statement periods already fully imported, but ALWAYS
+    # re-fetch a rolling window of the newest periods — they keep gaining rows
+    # (settle-in revisions + back-dated sales from the prior 1-2 months). Older
+    # periods are immutable once that window passes, so skipping them is safe
+    # and saves ~5-10 min/sync. Re-import is ADDITIVE (dedup by asset+price+day);
+    # never delete-and-replace by month — that would wipe accumulated back-dated
+    # rows (a period dated "M" holds sales from M AND M-1/M-2).
+    REFETCH_RECENT = 3
     proc_file = os.path.join(RECIPES_DIR, "_processed_dates.json")
     try:
         with open(proc_file) as _f: _pd = json.load(_f)
@@ -154,16 +144,18 @@ def _getty_collect_direct():
     done_statements = set(_pd.get("Getty_statements", []))
     from datetime import date as _date_g
     cur_ym = _date_g.today().strftime("%Y-%m")
+    recent = {f"{y}-{m}" for y, m in sorted(periods, reverse=True)[:REFETCH_RECENT]}
     skipped_periods = 0
     periods_to_fetch = []
     for year, month in periods:
         label = f"{year}-{month}"
-        if label != cur_ym and label in done_statements:
+        if label in done_statements and label not in recent and label != cur_ym:
             skipped_periods += 1
             continue
         periods_to_fetch.append((year, month))
     if skipped_periods:
-        _sync_log(f"⏭️  Getty: пропущено {skipped_periods} уже оброблених statements")
+        _sync_log(f"⏭️  Getty: пропущено {skipped_periods} старих statements "
+                  f"(re-fetch останніх {REFETCH_RECENT})")
     periods = periods_to_fetch
 
     # Step 3: parse + import TSV per period
@@ -228,9 +220,10 @@ def _getty_collect_direct():
                 if exists:
                     total_skipped += 1; continue
                 fname_no_ext = filename.rsplit(".", 1)[0] if filename and "." in filename else filename
+                from sync_state import _sync_batch
                 _conn.execute(
-                    'INSERT INTO sales (asset_id,photo_name,stock,price,thumb_url,date,filename) VALUES (?,?,?,?,?,?,?)',
-                    (asset_id, title or filename or asset_id, stock, price, None, date, fname_no_ext or ""))
+                    'INSERT INTO sales (asset_id,photo_name,stock,price,thumb_url,date,filename,sync_batch) VALUES (?,?,?,?,?,?,?,?)',
+                    (asset_id, title or filename or asset_id, stock, price, None, date, fname_no_ext or "", _sync_batch[0]))
                 total_saved += 1
             try: _conn.commit()
             except Exception as e: _sync_log(f"  ⚠️ {label}: commit failed: {e}")

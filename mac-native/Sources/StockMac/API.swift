@@ -27,6 +27,26 @@ enum API {
         try await get("/api/stock-list")
     }
 
+    static func analytics(period: Period, stock: String,
+                          start: String? = nil, end: String? = nil) async throws -> Analytics {
+        var q = "stock=\(enc(stock))"
+        if let s = start, let e = end {
+            q += "&start=\(enc(s))&end=\(enc(e))"
+        } else {
+            q += "&period=\(enc(period.rawValue))"
+        }
+        return try await get("/api/analytics?\(q)")
+    }
+
+    struct PhotoDetail: Codable {
+        let asset_id: String
+        let by_stock: [String: SaleStockStat]
+    }
+
+    static func photoDetail(assetID: String) async throws -> PhotoDetail {
+        try await get("/api/photo-detail?asset_id=\(enc(assetID))")
+    }
+
     static func feed(period: Period, stock: String, page: Int, perPage: Int = 60) async throws -> Feed {
         let q = "period=\(enc(period.rawValue))&stock=\(enc(stock))&page=\(page)&per_page=\(perPage)"
         return try await get("/api/feed?\(q)")

@@ -8,6 +8,12 @@ const DEFAULTS = {
   'iStock':        '#6366f1',
   'iStockphoto':   '#6366f1',
   'Depositphotos': '#0061ff',
+  'Envato':        '#81b441',
+  'Freepik':       '#1273eb',
+  '123RF':         '#e64a19',
+  'PIXTA':         '#00b0a8',
+  'Dreamstime':    '#8cc63f',
+  'Alamy':         '#00a651',
 };
 
 export const stockColors = writable(/** @type {Record<string,string>} */ ({ ...DEFAULTS }));

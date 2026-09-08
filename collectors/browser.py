@@ -69,7 +69,29 @@ _STEALTH_JS = """
 """
 
 
-def _apply_stealth(ctx, real_chrome=False):
+# Minimal, platform-SAFE evasion for PerimeterX "Press & Hold" sites (Dreamstime).
+# Only hides the automation tells (navigator.webdriver + CDP globals) — no UA /
+# platform / WebGL spoofing, so it's safe to inject even on REAL system Chrome
+# (unlike _STEALTH_JS, which would mismatch the real platform). PerimeterX rejects
+# the human-verify challenge outright while navigator.webdriver===true.
+_MIN_STEALTH_JS = """
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    try {
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+    } catch (e) {}
+"""
+
+
+def _apply_stealth(ctx, real_chrome=False, px_mode=False):
+    # px_mode: PerimeterX site (Dreamstime). Even when driving real Chrome (where
+    # full stealth is skipped to keep the fingerprint consistent), inject the
+    # minimal webdriver-hiding script — without it the Press & Hold challenge can
+    # never pass. Safe on real Chrome: no platform/UA/WebGL spoofing.
+    if px_mode:
+        ctx.add_init_script(_MIN_STEALTH_JS)
+        return
     # _STEALTH_JS spoofs navigator.platform=MacIntel + Apple WebGL to match the
     # macOS UA on bundled Chromium. On Windows/Linux we drive REAL system Chrome,
     # which is already consistent and trusted — injecting Mac signals there makes
@@ -103,16 +125,23 @@ def _is_login_url(url_str):
 
 # ── Browser context ───────────────────────────────────────────────────────────
 
-def _open_browser_context(p, profile_dir, headless, off_screen=False, channel=None):
+def _open_browser_context(p, profile_dir, headless, off_screen=False, channel=None, px_mode=False):
     """Open a Playwright persistent browser context.
     channel='chrome' uses the system-installed Chrome instead of bundled Chromium
     — reduces DataDome detection on Shutterstock. Falls back to chromium if
-    Chrome binary isn't found."""
+    Chrome binary isn't found.
+    px_mode (PerimeterX sites like Dreamstime): keep Chrome's sandbox ON so the
+    "--no-sandbox" automation banner doesn't appear, and strip every automation
+    default arg — the Press & Hold challenge inspects these."""
     extra = ["--window-position=0,2000", "--window-size=1280,900"] if off_screen else []
+    ignore = ["--enable-automation", "--enable-blink-features=IdleDetection"]
+    if px_mode:
+        ignore.append("--no-sandbox")
     kwargs = dict(
         user_data_dir=profile_dir,
         headless=headless,
         no_viewport=True,
+        chromium_sandbox=True if px_mode else False,
         user_agent=(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -125,8 +154,8 @@ def _open_browser_context(p, profile_dir, headless, off_screen=False, channel=No
             "--disable-session-crashed-bubble",
             "--disable-features=IsolateOrigins,site-per-process",
         ] + extra,
-        # Strip Playwright's automation flags that DataDome fingerprints on
-        ignore_default_args=["--enable-automation", "--enable-blink-features=IdleDetection"],
+        # Strip Playwright's automation flags that DataDome/PerimeterX fingerprint on
+        ignore_default_args=ignore,
     )
     # Will we drive the user's REAL system Chrome (clean, trusted fingerprint)?
     # — always on Windows, and on macOS whenever channel='chrome' resolves to the
@@ -160,10 +189,11 @@ def _open_browser_context(p, profile_dir, headless, off_screen=False, channel=No
 def _do_login_flow_global(p, profile_dir, target_url, stock_label, wait_cond):
     """Відкриває видимий браузер, чекає поки юзер залогіниться і закриє вікно."""
     _sync_log(f"🔒 {stock_label}: потрібна авторизація — відкриваю браузер...")
-    # Shutterstock: use real Chrome for login too (matches collector engine)
-    channel = "chrome" if stock_label == "Shutterstock" else None
-    vis = _open_browser_context(p, profile_dir, headless=False, channel=channel)
-    _apply_stealth(vis, real_chrome=(channel == "chrome"))
+    # Shutterstock + Dreamstime: real Chrome for login too (matches collector engine)
+    channel = "chrome" if stock_label in ("Shutterstock", "Dreamstime") else None
+    px = stock_label == "Dreamstime"   # PerimeterX Press & Hold — hide webdriver
+    vis = _open_browser_context(p, profile_dir, headless=False, channel=channel, px_mode=px)
+    _apply_stealth(vis, real_chrome=(channel == "chrome"), px_mode=px)
     vp = vis.pages[0] if vis.pages else vis.new_page()
     try:
         vp.goto(target_url, wait_until=wait_cond, timeout=90000)

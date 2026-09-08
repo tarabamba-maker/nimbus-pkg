@@ -21,13 +21,7 @@ from sync_state import (
 from collectors.browser import (
     _open_browser_context, _apply_stealth, _is_login_url, _do_login_flow_global,
 )
-from collectors.adobe import _adobe_collect_direct, _adobe_api_collect_global
-from collectors.shutterstock import _shutterstock_api_collect_direct, _shutterstock_api_collect_global
-from collectors.getty import _getty_collect_direct, _getty_api_collect_global
-from collectors.depositphotos import _depositphotos_collect
-from collectors.envato import _envato_collect
-from collectors.freepik import _freepik_collect
-from collectors.ms_plus import _ms_plus_collect_direct, _ms_plus_collect_global
+from collectors.alamy import _alamy_collect
 
 _BASE_DIR = os.environ.get("STOCK_DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 RECIPES_DIR          = os.path.join(_BASE_DIR, "recipes")
@@ -36,99 +30,177 @@ PROCESSED_DATES_FILE = os.path.join(RECIPES_DIR, "_processed_dates.json")
 
 from config import STOCK_URLS
 
+# Stocks collected via the global native-login + direct-HTTPS mechanism (no
+# Playwright). "stock name": "module:function" of its *_collect_direct(). Migrating
+# a stock here = it stops opening any browser to collect. See _collect_one_stock_global.
+# Contract: *_collect_direct() returns True on success OR transient failure
+# (network/API hiccup — just skip this sync), and False ONLY when the session is
+# invalid/missing (→ caller opens a native Chrome login window and retries once).
+# Only Alamy stays off this list — Playwright is its PRIMARY transport (ASP.NET
+# UpdatePanel pagination, see CLAUDE.md).
+_DIRECT_COLLECTORS = {
+    "Dreamstime": "collectors.dreamstime:_dreamstime_collect_direct",
+    "123RF":      "collectors.rf123:_rf123_collect_direct",
+    "PIXTA":      "collectors.pixta:_pixta_collect_direct",
+    "Freepik":    "collectors.freepik:_freepik_collect_direct",
+    "Depositphotos": "collectors.depositphotos:_depositphotos_collect_direct",
+    "Envato":     "collectors.envato:_envato_collect_direct",
+    "Adobe Stock":  "collectors.adobe:_adobe_collect_direct",
+    "Shutterstock": "collectors.shutterstock:_shutterstock_api_collect_direct",
+    "Getty Images": "collectors.getty:_getty_collect_direct",
+    "Microstock+":  "collectors.ms_plus:_ms_plus_collect_direct",
+}
+
+# Login URLs for the native Chrome login window. Getty needs TWO tabs: the TSV
+# export lives on accountmanagement.* while the `ccw` thumb token is minted only
+# on esp.* — one SSO login covers both, but each tab must be visited/refreshed.
+_DIRECT_LOGIN_URLS = {
+    "Getty Images": ["https://accountmanagement.gettyimages.com/Reports/Export",
+                     "https://esp.gettyimages.com/contribute/stats"],
+}
+
+# Month-granularity stocks: their source data only changes once a month, so sync
+# them once per cycle. {stock: (min_day, sales-stock names in DB, state key)}.
+# Getty statements publish ~21st; Freepik invoice validates by the 10th; Envato's
+# previous month is settled in item_performance well before the 11th.
+_MONTHLY_GATES = {
+    "Getty Images": (21, ("iStock", "iStockphoto"), "Getty/iStock_last_sync"),
+    "Freepik":      (11, ("Freepik",),              "Freepik_last_sync"),
+    "Envato":       (11, ("Envato",),               "Envato_last_sync"),
+}
+
+
+def _load_processed_dates():
+    try:
+        with open(PROCESSED_DATES_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _monthly_gate_skip(name):
+    """True → this month-granularity stock was already synced this cycle (or the
+    cycle hasn't opened yet) — skip. Cold start (no rows for the stock) never
+    skips. A cycle opens on the stock's min_day each month."""
+    cfg = _MONTHLY_GATES.get(name)
+    if not cfg:
+        return False
+    min_day, db_stocks, state_key = cfg
+    try:
+        with sqlite3.connect(DB_NAME, timeout=15) as c:
+            ph = ",".join("?" * len(db_stocks))
+            has_data = c.execute(
+                f"SELECT 1 FROM sales WHERE stock IN ({ph}) LIMIT 1", db_stocks
+            ).fetchone() is not None
+    except Exception:
+        has_data = False
+    if not has_data:
+        return False
+    from datetime import date as _date
+    today = _date.today()
+    pd = _load_processed_dates()
+    last_str = pd.get(state_key) or (pd.get("Getty_last_run") if name == "Getty Images" else None)
+    if not last_str:
+        return False
+    try:
+        last = _date.fromisoformat(last_str)
+    except Exception:
+        return False
+    # Most recent cycle opening on/before today:
+    if today.day >= min_day:
+        cycle_start = _date(today.year, today.month, min_day)
+    else:
+        py, pm = (today.year - 1, 12) if today.month == 1 else (today.year, today.month - 1)
+        cycle_start = _date(py, pm, min_day)
+    if last >= cycle_start:
+        nm = cycle_start.month % 12 + 1
+        ny = cycle_start.year + (1 if cycle_start.month == 12 else 0)
+        nxt = _date(ny, nm, min_day)
+        _sync_log(f"📅 [{name}] already collected this cycle — next sync from {nxt.strftime('%d.%m.%Y')}")
+        return True
+    return False
+
+
+def _mark_monthly_synced(name):
+    cfg = _MONTHLY_GATES.get(name)
+    if not cfg:
+        return
+    from datetime import date as _date
+    pd = _load_processed_dates()
+    pd[cfg[2]] = _date.today().isoformat()
+    try:
+        os.makedirs(RECIPES_DIR, exist_ok=True)
+        with open(PROCESSED_DATES_FILE, "w") as f:
+            json.dump(pd, f, indent=2)
+    except Exception:
+        pass
+
+
+def _dispatch_collector(stock_name, pw_page):
+    """Run one stock's Playwright collector. Returns True / 'needs_login'.
+    Only Alamy reaches this — every other stock collects via _DIRECT_COLLECTORS
+    (native login + direct HTTPS) and never opens a browser."""
+    if stock_name == "Alamy":
+        return _alamy_collect(pw_page)
+    _sync_log(f"[{stock_name}] ⚠️ no Playwright collector — stock should be in _DIRECT_COLLECTORS")
+    return True
+
 
 def _run_collector_global(p, profile_dir, stock_name, start_url, headless, allow_login=False):
-    """Відкриває браузер і запускає потрібний колектор.
-    allow_login=True (single-stock button) opens a login window if the session
-    expired; allow_login=False (Sync All) just logs that the stock needs login
-    and skips it — so unwanted stocks don't pop windows on every full sync."""
-    wait_cond = "networkidle" if stock_name == "Shutterstock" else "domcontentloaded"
-    # Shutterstock: use real Chrome (channel='chrome') instead of bundled Chromium.
-    # DataDome blocks the Playwright Chromium build by fingerprint; system Chrome
-    # passes through normally.
-    channel = "chrome" if stock_name == "Shutterstock" else None
-    _real = channel == "chrome"
-    browser = _open_browser_context(p, profile_dir, headless, channel=channel)
-    _apply_stealth(browser, real_chrome=_real)
-    pw_page = browser.pages[0] if browser.pages else browser.new_page()
-    pw_page.goto(start_url, wait_until=wait_cond, timeout=60000)
-    time.sleep(3 if stock_name != "Shutterstock" else 5)
+    """Open a browser, run the stock's collector, and — UNIFORMLY for every stock —
+    open a login window whenever the session is invalid/expired.
 
-    # Getty має свою login-логіку всередині колектора (чекає у тому самому вікні).
-    # Не закриваємо браузер — просто йдемо далі.
-    if _is_login_url(pw_page.url) and stock_name != "Getty Images":
+    Two triggers, one behaviour:
+      1. landing on a login URL after navigating to start_url, or
+      2. the collector returning 'needs_login' (auth / anti-bot failure).
+    When allow_login (single-stock button) → open the login window and retry once.
+    When not (Sync All) → log that the stock needs login and skip it (no popup)."""
+    wait_cond = "networkidle" if stock_name == "Shutterstock" else "domcontentloaded"
+    # Real system Chrome (not bundled Chromium): Shutterstock (DataDome) and
+    # Dreamstime (aggressive WAF) — the genuine Chrome fingerprint passes cleaner.
+    channel = "chrome" if stock_name in ("Shutterstock", "Dreamstime") else None
+    _real = channel == "chrome"
+    _px = stock_name == "Dreamstime"   # PerimeterX Press & Hold site
+    settle = 5 if stock_name == "Shutterstock" else 3
+
+    def _open():
+        # Always reuse the SAME channel/stealth on (re)open — otherwise a post-login
+        # reopen would drop channel='chrome' and re-trip the anti-bot (old bug).
+        b = _open_browser_context(p, profile_dir, headless, channel=channel, px_mode=_px)
+        _apply_stealth(b, real_chrome=_real, px_mode=_px)
+        pg = b.pages[0] if b.pages else b.new_page()
+        pg.goto(start_url, wait_until=wait_cond, timeout=60000)
+        time.sleep(settle)
+        return b, pg
+
+    def _needs_login_now():
+        """Uniform: not allow_login → log + signal skip; else open login window,
+        wait for the user, and reopen the browser fresh."""
+        nonlocal browser, pw_page
         if not allow_login:
             _sync_log(f"[{stock_name}] 🔒 потрібен логін — натисни кнопку «{stock_name}» щоб увійти")
-            return browser, pw_page
+            return False
+        _sync_log(f"[{stock_name}] 🔒 сесія недійсна — відкриваю вікно для логіну…")
         browser.close()
         _do_login_flow_global(p, profile_dir, start_url, stock_name, wait_cond)
-        # Keep the SAME channel after login — Shutterstock must stay on real Chrome,
-        # otherwise the re-open falls back to bundled Chromium and re-trips DataDome.
-        browser = _open_browser_context(p, profile_dir, headless, channel=channel)
-        _apply_stealth(browser, real_chrome=_real)
-        pw_page = browser.pages[0] if browser.pages else browser.new_page()
-        pw_page.goto(start_url, wait_until=wait_cond, timeout=60000)
-        time.sleep(3 if stock_name != "Shutterstock" else 5)
+        browser, pw_page = _open()
+        return True
 
-    if stock_name == "Adobe Stock":
-        result = _adobe_api_collect_global(pw_page)
-        if result == "needs_login":
-            if not allow_login:
-                _sync_log(f"[{stock_name}] 🔒 потрібен логін — натисни кнопку «{stock_name}» щоб увійти")
-                return browser, pw_page
-            browser.close()
-            _do_login_flow_global(p, profile_dir, start_url, stock_name, wait_cond)
-            browser = _open_browser_context(p, profile_dir, headless)
-            _apply_stealth(browser)
-            pw_page = browser.pages[0] if browser.pages else browser.new_page()
-            pw_page.goto(start_url, wait_until="networkidle", timeout=60000)
-            time.sleep(3)
-            _adobe_api_collect_global(pw_page)
-    elif stock_name == "Shutterstock":
-        _shutterstock_api_collect_global(pw_page)
-    elif stock_name == "Depositphotos":
-        _depositphotos_collect(pw_page)
-    elif stock_name == "Envato":
-        result = _envato_collect(pw_page)
-        if result == "needs_login":
-            if not allow_login:
-                _sync_log(f"[Envato] 🔒 потрібен логін — натисни кнопку «Envato» щоб увійти")
-                return browser, pw_page
-            browser.close()
-            _do_login_flow_global(p, profile_dir, start_url, stock_name, wait_cond)
-            browser = _open_browser_context(p, profile_dir, headless)
-            _apply_stealth(browser)
-            pw_page = browser.pages[0] if browser.pages else browser.new_page()
-            pw_page.goto(start_url, wait_until=wait_cond, timeout=60000)
-            time.sleep(2)
-            _envato_collect(pw_page)
-    elif stock_name == "Freepik":
-        result = _freepik_collect(pw_page)
-        if result == "needs_login":
-            if not allow_login:
-                _sync_log(f"[Freepik] 🔒 потрібен логін — натисни кнопку «Freepik» щоб увійти")
-                return browser, pw_page
-            browser.close()
-            _do_login_flow_global(p, profile_dir, start_url, stock_name, wait_cond)
-            browser = _open_browser_context(p, profile_dir, headless)
-            _apply_stealth(browser)
-            pw_page = browser.pages[0] if browser.pages else browser.new_page()
-            pw_page.goto(start_url, wait_until=wait_cond, timeout=60000)
-            time.sleep(2)
-            _freepik_collect(pw_page)
-    elif stock_name == "Getty Images":
-        # Auto-force on empty DB: pulls every available TSV statement instead of
-        # waiting for the monthly-21st gate.
-        try:
-            with sqlite3.connect(DB_NAME, timeout=15) as _c:
-                _g_count = _c.execute(
-                    "SELECT COUNT(*) FROM sales WHERE stock IN ('iStock','iStockphoto','Getty Images')"
-                ).fetchone()[0]
-        except Exception:
-            _g_count = 0
-        _getty_api_collect_global(pw_page, force=(_g_count == 0))
-    elif stock_name == "Microstock+":
-        _ms_plus_collect_global(pw_page)
+    browser, pw_page = _open()
+
+    # Trigger 1: navigated straight onto a login page (Getty logs in inside its own
+    # collector, so it's exempt from this generic landing check).
+    if _is_login_url(pw_page.url) and stock_name != "Getty Images":
+        if not _needs_login_now():
+            return browser, pw_page
+
+    # Trigger 2: collector reports it can't authenticate / is blocked.
+    result = _dispatch_collector(stock_name, pw_page)
+    if result == "needs_login":
+        if not _needs_login_now():
+            return browser, pw_page
+        _dispatch_collector(stock_name, pw_page)   # retry once in the fresh session
+
     # Refresh the macOS cookie cache from this live context so the NEXT sync can use
     # the fast direct-API path instead of opening a browser again.
     try:
@@ -146,161 +218,59 @@ def _collect_one_stock_global(name, url, allow_login=False):
     from playwright.sync_api import sync_playwright as _spw
     import shutil
 
-    # ⚠️ DO NOT REMOVE THIS FAST PATH — direct-API collectors using Safari cookies
-    # are 10-100x faster than Playwright. They bypass DataDome because the datadome
-    # trust token from the user's daily browsing carries over the request.
-    # If the fast path returns True, we MUST skip the Playwright fallback for this
-    # stock — otherwise we'd open a browser unnecessarily and risk re-triggering
-    # anti-bot detection on a clean session. Each fast-path collector internally
-    # falls back (returns False) if cookies missing/expired → Playwright kicks in.
-    if name == "Adobe Stock":
-        try:
-            if _adobe_collect_direct():
-                return
-            _sync_log("[Adobe Stock] direct API failed — fallback to Playwright")
-        except Exception as ex:
-            _sync_log(f"[Adobe Stock] direct API exception: {ex} — fallback")
-    if name == "Shutterstock":
-        try:
-            if _shutterstock_api_collect_direct():
-                return
-            _sync_log("[Shutterstock] direct API failed — fallback to Playwright")
-        except Exception as ex:
-            _sync_log(f"[Shutterstock] direct API exception: {ex} — fallback")
-    if name == "Microstock+":
-        try:
-            if _ms_plus_collect_direct():
-                return
-            _sync_log("[Microstock+] direct API failed — fallback to Playwright")
-        except Exception as ex:
-            _sync_log(f"[Microstock+] direct API exception: {ex} — fallback")
-    if name == "Getty Images":
-        try:
-            if _getty_collect_direct():
-                return
-            _sync_log("[Getty Images] direct API failed — fallback to Playwright")
-        except Exception as ex:
-            _sync_log(f"[Getty Images] direct API exception: {ex} — fallback")
-
-    is_getty   = name == "Getty Images"
-    main_prof  = os.path.join(_BASE_DIR, "chrome_profile")
-
-    # Getty guard: stats publish around the 21st each month.
-    # 1) Block before the 21st of the current month.
-    # 2) Block after a successful sync until the 21st of the NEXT month.
-    if is_getty:
-        from datetime import date as _date
-        today = _date.today()
-        _has_getty2 = False
-        try:
-            with sqlite3.connect(DB_NAME, timeout=15) as _gc2:
-                _has_getty2 = _gc2.execute(
-                    "SELECT 1 FROM sales WHERE stock IN ('iStock','iStockphoto') LIMIT 1"
-                ).fetchone() is not None
-        except Exception:
-            pass
-        if _has_getty2 and today.day < 21:
-            _sync_log(f"📅 [{name}] skipped — available from the 21st (today is the {today.day}th)")
+    # ── The ONE collection mechanism (macOS == Windows scheme) ────────────────
+    # Cookies from a NATIVE Chrome login (real human session, NO Playwright/CDP →
+    # passes PerimeterX/DataDome) → direct HTTPS requests. Every stock except
+    # Alamy lives here. Flow: monthly gate → direct collect → if the session is
+    # invalid (False) open a native Chrome login window → retry direct once.
+    # NEVER falls back to Playwright. Adding a stock = *_collect_direct() + one
+    # line in _DIRECT_COLLECTORS.
+    if name in _DIRECT_COLLECTORS:
+        if _monthly_gate_skip(name):
             return
-        # Check if already synced this month cycle
+        import importlib
+        mod, fn = _DIRECT_COLLECTORS[name].rsplit(":", 1)
+        direct_fn = getattr(importlib.import_module(mod), fn)
         try:
-            with open(PROCESSED_DATES_FILE) as _pf:
-                _pd_g = json.load(_pf)
-        except Exception:
-            _pd_g = {}
-        last_sync_str = _pd_g.get('Getty/iStock_last_sync', '')
-        if last_sync_str:
-            try:
-                last = _date.fromisoformat(last_sync_str)
-                # Next allowed = 21st of the month after last sync
-                next_m = last.month % 12 + 1
-                next_y = last.year + (1 if last.month == 12 else 0)
-                next_allowed = _date(next_y, next_m, 21)
-                if today < next_allowed:
-                    _sync_log(f"📅 [{name}] already collected this cycle — next sync from {next_allowed.strftime('%d.%m.%Y')}")
-                    return
-            except Exception:
-                pass
+            if direct_fn():
+                _mark_monthly_synced(name)
+                return
+        except Exception as ex:
+            _sync_log(f"[{name}] direct exception: {ex}")
+            return   # transient/unknown failure — don't pop a login window
+        if not allow_login:
+            _sync_log(f"[{name}] 🔒 потрібен логін — натисни кнопку «{name}»")
+            return
+        from cookies import _native_chrome_login
+        prof = os.path.join(_BASE_DIR, f"chrome_profile_native_{name.replace(' ', '_')}")
+        login_url = _DIRECT_LOGIN_URLS.get(name, url)
+        _native_chrome_login(prof, login_url, name)
+        try:
+            if direct_fn():
+                _mark_monthly_synced(name)
+        except Exception as ex:
+            _sync_log(f"[{name}] direct retry exception: {ex}")
+        return   # never fall through to Playwright for native-direct stocks
 
-    if is_getty:
-        stock_profile = os.path.abspath("getty_profile")
-    else:
-        safe = name.replace(" ", "_")
-        stock_profile = os.path.abspath(f"chrome_profile_{safe}")
-        if not os.path.exists(stock_profile) and os.path.exists(main_prof):
-            _sync_log(f"[{name}] 📋 Copying profile...")
-            _skip = {"SingletonSocket","SingletonLock","SingletonCookie","RunningChromeVersion"}
-            shutil.copytree(main_prof, stock_profile,
-                            ignore=lambda d, files: [f for f in files if f in _skip])
-        # remove stale lock files so Chrome doesn't create a temp profile
-        for _lf in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
-            _lp = os.path.join(stock_profile, _lf)
-            if os.path.exists(_lp):
-                try: os.remove(_lp)
-                except Exception: pass
+    # ── Playwright path — ONLY Alamy (ASP.NET UpdatePanel pagination) ─────────
+    main_prof  = os.path.join(_BASE_DIR, "chrome_profile")
+    safe = name.replace(" ", "_")
+    stock_profile = os.path.abspath(f"chrome_profile_{safe}")
+    if not os.path.exists(stock_profile) and os.path.exists(main_prof):
+        _sync_log(f"[{name}] 📋 Copying profile...")
+        _skip = {"SingletonSocket","SingletonLock","SingletonCookie","RunningChromeVersion"}
+        shutil.copytree(main_prof, stock_profile,
+                        ignore=lambda d, files: [f for f in files if f in _skip])
+    # remove stale lock files so Chrome doesn't create a temp profile
+    for _lf in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        _lp = os.path.join(stock_profile, _lf)
+        if os.path.exists(_lp):
+            try: os.remove(_lp)
+            except Exception: pass
     try:
         with _spw() as _p:
             from sync_state import get_headless
             headless = get_headless()
-            # First-time/rebuild mode: force visible browser + login wait for ALL stocks.
-            # User just wiped DB → likely needs to verify logins everywhere.
-            _db_is_empty = False
-            try:
-                with sqlite3.connect(DB_NAME, timeout=15) as _c:
-                    _db_is_empty = _c.execute(
-                        "SELECT 1 FROM sales LIMIT 1").fetchone() is None
-            except Exception:
-                pass
-            # For empty DB: trigger login flow for ALL stocks including MS+.
-            # ms_library.json absence is the empty-state indicator for MS+.
-            _ms_empty = not os.path.exists(MS_LIBRARY_FILE)
-            # Cold-start (empty DB) WOULD force a login for every stock — but if the
-            # user already logged in inside the in-app Chrome profile, the cookies are
-            # there and we must NOT skip. Consult the actual session (generic for all
-            # current + future stocks). Only force login when truly not logged in.
-            _logged_in = False
-            try:
-                from cookies import _stock_has_valid_session
-                _logged_in = _stock_has_valid_session(name)
-            except Exception:
-                pass
-            _needs_login = (_db_is_empty and name != "Microstock+") or \
-                           (name == "Microstock+" and _ms_empty)
-            _should_login = _needs_login and not _logged_in
-            if _should_login and not allow_login:
-                _sync_log(f"[{name}] 🔒 не залогінено — натисни кнопку «{name}» щоб увійти (пропускаю у Sync All)")
-                return
-            if _should_login:
-                _sync_log(f"[{name}] 🖥️ перший запуск — видимий браузер, чекаю поки залогінишся")
-                # Force pre-login flow: opens visible browser, waits for user to close window
-                _do_login_flow_global(_p, stock_profile,
-                    "https://contributor.stock.adobe.com/en/insights/sales-earnings" if name == "Adobe Stock"
-                    else "https://submit.shutterstock.com/earnings" if name == "Shutterstock"
-                    else "https://depositphotos.com/account/sales-history.html" if name == "Depositphotos"
-                    else "https://accountmanagement.gettyimages.com/Reports/Export" if is_getty
-                    else "https://microstock.plus/myfiles" if name == "Microstock+"
-                    else "https://contributor.magnific.com/statistics" if name == "Freepik"
-                    else url,
-                    name,
-                    "networkidle" if name == "Shutterstock" else "domcontentloaded")
-                headless = True  # after login confirmed, run actual sync headless
-            # Getty: видимий тільки якщо сесія протухла (нема ccw cookie у профілі).
-            # Якщо cookie валідна — синк у фоні (headless).
-            if is_getty and not _db_is_empty:
-                cookies_db = os.path.join(stock_profile, "Default", "Cookies")
-                has_ccw = False
-                try:
-                    import sqlite3 as _sql3
-                    con = _sql3.connect(f"file:{cookies_db}?mode=ro", uri=True, timeout=2)
-                    row = con.execute(
-                        "SELECT 1 FROM cookies WHERE name='ccw' AND expires_utc > 0 LIMIT 1"
-                    ).fetchone()
-                    has_ccw = row is not None
-                    con.close()
-                except Exception:
-                    has_ccw = False
-                headless = has_ccw
-                _sync_log(f"[{name}] {'🤖 headless (сесія активна)' if has_ccw else '🖥️ видимий (потрібен логін)'}")
             _sync_log(f"[{name}] ⏳ Starting...")
             browser, _ = _run_collector_global(_p, stock_profile, name, url, headless, allow_login)
             _sync_log(f"[{name}] ✅ Done")
@@ -335,6 +305,8 @@ def _sync_all_global():
     _sync_state["log"]     = []
     with _session_new_keys_lock:
         _session_new_keys.clear()
+    from sync_state import _begin_sync_batch
+    _begin_sync_batch()   # one batch number for the whole run (all stocks)
     # First-run safeguard: empty DB → sequential mode. From-scratch sync hits
     # the full backfill path in every collector (Adobe = 2900+ pages, SS = days
     # since 2018, Getty = all 63 statements + ESP thumbs). 4 parallel doing
@@ -352,7 +324,7 @@ def _sync_all_global():
     else:
         _sync_log(f"🚀 Sequential sync (DB has {_sales_count} rows — cold start safeguard)")
 
-    SALES_STOCKS = ["Depositphotos", "Envato", "Freepik", "Getty Images", "Shutterstock", "Adobe Stock"]
+    SALES_STOCKS = ["Depositphotos", "Envato", "Freepik", "123RF", "PIXTA", "Dreamstime", "Alamy", "Getty Images", "Shutterstock", "Adobe Stock"]
 
     def _run_one(name):
         if _sync_stop_flag[0]:
@@ -362,7 +334,9 @@ def _sync_all_global():
             return
         _sync_log(f"━━━ [{name}] start ━━━")
         try:
-            _collect_one_stock_global(name, url)
+            # allow_login=True: an expired session auto-opens a login window for
+            # that stock (user request 2026-06-13) instead of silently skipping.
+            _collect_one_stock_global(name, url, allow_login=True)
             _sync_log(f"━━━ [{name}] finished ━━━")
         except Exception as ex:
             _sync_log(f"━━━ [{name}] ⚠️ exception: {ex} ━━━")

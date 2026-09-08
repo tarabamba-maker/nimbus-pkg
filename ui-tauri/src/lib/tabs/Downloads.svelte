@@ -19,6 +19,7 @@
   let page    = $state(1);
 
   let items      = $state(/** @type {any[]} */ ([]));
+  let filtersH   = $state(56);
   let totalCount = $state(0);
   let loading    = $state(false);
   let syncing    = $state(false);
@@ -194,9 +195,9 @@
   });
 </script>
 
-<div class="tab-wrap">
+<div class="glass-wrap">
   <!-- Filters: period is controlled by top stat boxes; only Stock + Refresh here -->
-  <div class="filters">
+  <div class="filters glass-panel" bind:clientHeight={filtersH}>
     <div class="filter-row">
       <FilterPills label="Stock:" options={stocks}
         value={stock} onSelect={(s) => { stock=s; load(true); onStockChange?.(s); }} />
@@ -207,8 +208,8 @@
     </div>
   </div>
 
-  <!-- Tile grid with infinite scroll -->
-  <div class="grid scroll-y">
+  <!-- Tile grid with infinite scroll (scrolls UNDER the frosted filter panel) -->
+  <div class="grid glass-canvas" style="--panel-h:{filtersH}px">
     {#each items as item (item.id ?? item.asset_id + item.date)}
       {@const isNew       = $newSaleKeys.has(_k(item))}
       {@const isFirstSale = Object.values(item.by_stock||{}).reduce((/** @type {number} */ s, /** @type {any} */ d) => s + d.count, 0) === 1}
@@ -221,7 +222,7 @@
         onkeydown={(e) => e.key === 'Enter' && openPopup(item)}>
         {#if isFirstSale}<div class="ribbon-new">NEW</div>{/if}
         <div class="img-box">
-          <img src={`${API_BASE}/img/cache/${item.asset_id}`}
+          <img src={`${API_BASE}/img/cache/${item.thumb_aid || item.asset_id}`}
             onerror={(e) => { const t=/** @type {HTMLImageElement} */(e.target),url=item.thumb_url||''; if(url&&t.src!==url){t.src=url;}else{t.src=API_BASE+'/img/placeholder';t.onerror=null;} }}
             alt="" class="thumb" />
         </div>
@@ -252,15 +253,8 @@
 {/if}
 
 <style>
-  .tab-wrap { display:flex; flex-direction:column; height:100%; gap:8px; }
-
-  .filters {
-    display:flex; flex-direction:column; gap:6px; flex-shrink:0;
-    background: var(--glass); border:1px solid var(--glass-border);
-    backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);
-    border-radius: var(--radius); padding:10px 12px;
-    box-shadow: var(--shadow-sm), var(--glass-shine);
-  }
+  /* layout (.glass-wrap/.glass-panel/.glass-canvas) is global — see +page.svelte */
+  .filters { display:flex; flex-direction:column; gap:6px; }
   .filter-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
 
   .refresh-btn { margin-left: auto; }
@@ -270,7 +264,6 @@
   @keyframes spin { to { transform:rotate(360deg); } }
 
   .grid {
-    flex:1; overflow-y:auto;
     display:flex; flex-wrap:wrap;
     gap:8px; align-content:start;
     padding-right:2px;

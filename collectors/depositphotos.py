@@ -17,8 +17,66 @@ _BASE_DIR   = os.environ.get("STOCK_DATA_DIR", os.path.dirname(os.path.dirname(o
 RECIPES_DIR = os.path.join(_BASE_DIR, "recipes")
 
 
+def _depositphotos_collect_direct():
+    """Direct-HTTPS collect with native-login cookies (no Playwright).
+    Returns True / False (False → caller opens a native login)."""
+    from collectors.session import stock_session
+    sess = stock_session(["depositphotos.com"], xhr=True,
+                         accept="text/html, */*; q=0.01",
+                         referer="https://depositphotos.com/sales.html")
+    if sess is None:
+        _sync_log("⚠️ Depositphotos direct: нема cookies — потрібен нативний логін")
+        return False
+
+    def get_html(path):
+        try:
+            r = sess.get("https://depositphotos.com" + path, timeout=60)
+        except Exception as ex:
+            _sync_log(f"Depositphotos direct: {ex}")
+            return None
+        if not r.ok or _is_login_url(r.url) or "/login" in r.url:
+            return None
+        return r.text
+
+    res = _depositphotos_run(get_html)
+    return False if res == "needs_login" else True
+
+
 def _depositphotos_collect(pw_page):
-    """Collect Depositphotos sales via HTML scraping of /sales/pageN.html?ajax=true"""
+    """Playwright fallback (in-page fetch)."""
+    _sync_log("Depositphotos: loading sales page…")
+    pw_page.goto("https://depositphotos.com/sales.html",
+                 wait_until="domcontentloaded", timeout=30000)
+    pw_page.wait_for_timeout(2000)
+    if _is_login_url(pw_page.url):
+        _sync_log("Depositphotos: ⚠️ not logged in, skipping")
+        return "needs_login"
+
+    def get_html(path):
+        try:
+            pw_page.set_default_timeout(60000)
+            return pw_page.evaluate(f"""async () => {{
+                const ctrl = new AbortController();
+                const tid = setTimeout(() => ctrl.abort(), 55000);
+                try {{
+                    const r = await fetch("{path}", {{
+                        credentials: "include", signal: ctrl.signal,
+                        headers: {{ "x-requested-with": "XMLHttpRequest",
+                                   "accept": "text/html, */*; q=0.01" }}
+                    }});
+                    return await r.text();
+                }} finally {{ clearTimeout(tid); }}
+            }}""")
+        except Exception as e:
+            _sync_log(f"Depositphotos: fetch error {path}: {e}")
+            return None
+
+    return _depositphotos_run(get_html)
+
+
+def _depositphotos_run(get_html):
+    """Core scrape loop, transport-agnostic: get_html(path) -> str|None.
+    Returns True / 'needs_login'."""
     from image_utils import load_img_async
     from bs4 import BeautifulSoup
     import re
@@ -62,15 +120,6 @@ def _depositphotos_collect(pw_page):
                          "date": date, "price": price, "title": title})
         return rows
 
-    _sync_log("Depositphotos: loading sales page…")
-    pw_page.goto("https://depositphotos.com/sales.html",
-                 wait_until="domcontentloaded", timeout=30000)
-    pw_page.wait_for_timeout(2000)
-
-    if _is_login_url(pw_page.url):
-        _sync_log("Depositphotos: ⚠️ not logged in, skipping")
-        return
-
     total_saved = 0
 
     proc_file = os.path.join(RECIPES_DIR, "_processed_dates.json")
@@ -87,25 +136,15 @@ def _depositphotos_collect(pw_page):
         """Fetch one sales page → list of rows ([] = real empty, None = error)."""
         url = (f"/sales.html?limit=160&ajax=true" if page_num == 1
                else f"/sales/page{page_num}.html?limit=160&ajax=true")
-        try:
-            pw_page.set_default_timeout(60000)
-            html = pw_page.evaluate(f"""async () => {{
-                const ctrl = new AbortController();
-                const tid = setTimeout(() => ctrl.abort(), 55000);
-                try {{
-                    const r = await fetch("{url}", {{
-                        credentials: "include",
-                        signal: ctrl.signal,
-                        headers: {{ "x-requested-with": "XMLHttpRequest",
-                                   "accept": "text/html, */*; q=0.01" }}
-                    }});
-                    return await r.text();
-                }} finally {{ clearTimeout(tid); }}
-            }}""")
-        except Exception as e:
-            _sync_log(f"Depositphotos: fetch error page {page_num}: {e}")
+        html = get_html(url)
+        if html is None:
             return None
         return extract_rows(html)
+
+    # Session check: page 1 must load. None = not logged in / blocked.
+    if _fetch_rows(1) is None:
+        _sync_log("⚠️ Depositphotos: не залогінений — натисни кнопку «Depositphotos»")
+        return "needs_login"
 
     def _save_row(row):
         # _save_record (not save_to_db) → new sale appended to _session_new_keys
@@ -201,3 +240,4 @@ def _depositphotos_collect(pw_page):
             page += 1
 
     _sync_log(f"✅ Depositphotos: {total_saved} new records saved")
+    return True

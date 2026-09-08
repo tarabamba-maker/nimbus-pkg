@@ -70,7 +70,11 @@ def load_img(asset_id, url, stock=None):
     for u in candidates:
         if not u: continue
         try:
-            r = req_lib.get(u, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+            hdrs = {"User-Agent": "Mozilla/5.0"}
+            # 123rf CDN (us.123rf.com) returns 403 without a site referer
+            if "123rf.com" in u:
+                hdrs["Referer"] = "https://www.123rf.com/"
+            r = req_lib.get(u, timeout=8, headers=hdrs)
             if r.status_code == 200:
                 img = Image.open(BytesIO(r.content)).convert("RGB")
                 img = ImageOps.fit(img, (400, 400), Image.Resampling.LANCZOS)

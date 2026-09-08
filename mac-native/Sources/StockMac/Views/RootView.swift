@@ -3,7 +3,7 @@ import SwiftUI
 struct RootView: View {
     @Environment(AppModel.self) private var model
 
-    private let tabs = ["Downloads", "Best Sellers", "Groups", "Browser"]
+    private let tabs = ["Downloads", "Best Sellers", "Groups", "Analytics", "Browser"]
     @State private var showSettings = false
     @State private var showLab = false
     @AppStorage("showLabButton") private var showLabButton = false
@@ -123,7 +123,8 @@ struct RootView: View {
         case 0: DownloadsView()
         case 1: BestSellersView()
         case 2: GroupsView()
-        case 3: BrowserView()
+        case 3: AnalyticsView()
+        case 4: BrowserView()
         default: EmptyView()
         }
     }

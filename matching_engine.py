@@ -689,3 +689,93 @@ def _apply_manual_overrides(matches, overrides):
         matches[pk] = sorted(existing)
     return matches, changes
 
+
+
+# Per-stock hamming threshold to the MS+ ROOT. Matching is hub-and-spoke: every
+# stock matches to its MS+ reference, never stock-to-stock. Some stocks generate
+# their thumbnail with a DIFFERENT crop/processing than the MS+ reference (PIXTA
+# re-crops + letterboxes), so their dHash sits a consistent ~1 bit further out and
+# misses the strict ≤4. Calibrate each such stock to its own offset. Verified safe:
+# PIXIA ungrouped sweep → 0 ambiguous up to hamming 7. Default stays strict (4).
+_STOCK_MSPLUS_HAM = {"PIXTA": 6}
+
+
+def _basepath_group_fallback(grouped_ids, aliases=None,
+                             ham_max=4, rgb_max=30, aspect_max=0.05,
+                             stock_ham=None):
+    """FALLBACK (pHash + MS+ basepath) for SALES that ended up with NO group.
+
+    Sales whose MS+ reference carries no stockids (recolors, orphan ms_meta) never
+    get a group via the stockid-anchored Pass D / Pass F. Here we match each such
+    sale to its MS+ reference by pHash, and read the SHOOT straight from the
+    reference's basepath (ms_meta fname = "year__group__file"), alias-resolved.
+
+    MS+ stays the source of truth — the group is the MS+ basepath, NOT a stockid
+    (stockids are unreliable: the camera repeats basenames every ~10k frames and
+    stockids don't always match MS+). The hamming budget is PER STOCK (`stock_ham`,
+    default `_STOCK_MSPLUS_HAM`) because each stock has its own crop/thumbnail offset
+    from the MS+ root. ONLY ungrouped sales are touched; an ambiguous match (2+
+    distinct shoots) is skipped, never guessed.
+
+    Returns {group_name: [asset_id, ...]} additions to append to photo_groups.
+    """
+    import numpy as np
+    aliases = aliases or {}
+    stock_ham = _STOCK_MSPLUS_HAM if stock_ham is None else stock_ham
+    grouped = {str(x) for x in grouped_ids}
+
+    def _grp(fname):
+        parts = fname.split('__')
+        g = parts[-2].strip() if len(parts) >= 2 else ''
+        seen = set()                       # follow alias chain, cycle-guarded
+        while g in aliases and g not in seen:
+            seen.add(g)
+            g = (aliases[g] or '').strip()
+        return g
+
+    with sqlite3.connect(DB_NAME, timeout=15) as c:
+        sales = c.execute(
+            "SELECT m.asset_id, m.stock, m.thumb_hash, m.aspect_ratio, m.r, m.g, m.b "
+            "FROM asset_meta m "
+            "WHERE m.thumb_hash IS NOT NULL AND m.thumb_hash != '' "
+            "AND m.asset_id IN (SELECT asset_id FROM sales)").fetchall()
+        ms = c.execute(
+            "SELECT fname, thumb_hash, aspect_ratio, r, g, b FROM ms_meta "
+            "WHERE thumb_hash IS NOT NULL AND thumb_hash != ''").fetchall()
+    if not sales or not ms:
+        return {}
+
+    def _u64(h):
+        try:
+            return np.uint64(int(h, 16))
+        except Exception:
+            return np.uint64(0)
+
+    mh = np.array([_u64(r[1]) for r in ms], dtype=np.uint64)
+    mar = np.array([r[2] if r[2] is not None else -1 for r in ms], dtype=np.float32)
+    mrgb = np.array([[r[3] or 0, r[4] or 0, r[5] or 0] for r in ms], dtype=np.int32)
+    mgrp = [_grp(r[0]) for r in ms]
+    POP = np.array([bin(i).count('1') for i in range(256)], dtype=np.uint8)
+
+    def popc(x):
+        return POP[x.view(np.uint8).reshape(-1, 8)].sum(1).astype(np.int16)
+
+    additions: dict = {}
+    for aid, stock, h, ar, r, g, b in sales:
+        aid = str(aid)
+        if aid in grouped:
+            continue
+        hmax = stock_ham.get(stock, ham_max)
+        ham = popc(mh ^ np.uint64(_u64(h)))
+        mask = ham <= hmax
+        if ar is not None:
+            mask &= (mar < 0) | (np.abs(mar - ar) <= aspect_max)
+        mask &= np.abs(mrgb - np.array([r or 0, g or 0, b or 0], dtype=np.int32)).sum(1) <= rgb_max
+        idx = np.where(mask)[0]
+        if len(idx) == 0:
+            continue
+        cg = {mgrp[i] for i in idx if mgrp[i]}
+        if len(cg) != 1:                       # ambiguous / no group → skip, never guess
+            continue
+        additions.setdefault(next(iter(cg)), []).append(aid)
+    return additions

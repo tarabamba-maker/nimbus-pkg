@@ -29,6 +29,7 @@
   let page     = $state(1);
 
   let items      = $state(/** @type {any[]} */ ([]));
+  let filtersH   = $state(56);
   let totalCount = $state(0);
   let totalSum   = $state(0);
   let loading    = $state(false);
@@ -239,7 +240,9 @@
 
 <svelte:window onkeydown={(e) => { if (e.key === 'Escape' && pendingMatch) pendingMatch = null; }} />
 
-<div class="bs">
+<div class="bs glass-wrap">
+  <!-- Floating frosted panel: header + select-bar (content scrolls under it) -->
+  <div class="bs-top glass-panel" bind:clientHeight={filtersH}>
   <!-- Header -->
   <div class="header">
     <div class="top-row">
@@ -300,9 +303,10 @@
       {/if}
     </div>
   {/if}
+  </div><!-- /.bs-top -->
 
-  <!-- Grid: fixed 160px cards -->
-  <div class="grid scroll-y">
+  <!-- Grid: fixed 160px cards (scrolls under the frosted panel) -->
+  <div class="grid glass-canvas" style="--panel-h:{filtersH}px">
     {#each items as item, i (item.asset_id)}
       {@const isSrc      = pendingMatch === item.asset_id}
       {@const stockKeys  = Object.keys(item.by_stock || {}).length ? Object.keys(item.by_stock) : [item.stock]}
@@ -326,7 +330,7 @@
         <!-- Thumbnail -->
         <div class="img-box">
           <img
-            src={`${API_BASE}/img/cache/${item.asset_id}`}
+            src={`${API_BASE}/img/cache/${item.thumb_aid || item.asset_id}`}
             onerror={(e) => {
               const t = /** @type {HTMLImageElement} */ (e.target), url = item.thumb_url || '';
               if (url && t.src !== url) { t.src = url; }
@@ -392,15 +396,9 @@
 {/if}
 
 <style>
-  .bs { display:flex; flex-direction:column; height:100%; gap:8px; }
-
-  .header {
-    display:flex; flex-direction:column; gap:6px; flex-shrink:0;
-    background: var(--glass); border:1px solid var(--glass-border);
-    backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);
-    border-radius: var(--radius); padding:10px 12px;
-    box-shadow: var(--shadow-sm), var(--glass-shine);
-  }
+  /* layout (.glass-wrap/.glass-panel/.glass-canvas) is global — see +page.svelte */
+  .bs-top { display:flex; flex-direction:column; gap:6px; }
+  .header { display:flex; flex-direction:column; gap:6px; }
   .top-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
   .total-sum { font-size:22px; font-weight:700; color: var(--accent); letter-spacing:-0.5px; }
   .total-count { font-size:11px; color: var(--label2); }
@@ -433,8 +431,7 @@
 
   .select-bar {
     display:flex; align-items:center; gap:8px; flex-shrink:0;
-    background: rgba(10,132,255,0.10); border:1px solid rgba(10,132,255,0.30);
-    backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);
+    background: rgba(10,132,255,0.12); border:1px solid rgba(10,132,255,0.30);
     border-radius: var(--radius); padding:7px 12px;
   }
   .select-count { font-size:12px; font-weight:700; color: var(--accent); }
@@ -485,7 +482,6 @@
   }
 
   .grid {
-    flex:1; overflow-y:auto;
     display:flex; flex-wrap:wrap;
     gap:8px; align-content:start; padding-right:2px;
   }

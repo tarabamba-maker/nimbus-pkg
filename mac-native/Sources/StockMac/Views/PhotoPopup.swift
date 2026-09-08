@@ -14,9 +14,13 @@ struct PhotoPopup: View {
     @State private var groupSearch = ""
     @State private var newGroup = ""
     @State private var uploading = false
+    // Authoritative cross-stock breakdown fetched on open; the byStock passed in
+    // from the card only contains the slice of whatever stock filter was active.
+    @State private var fullByStock: [String: SaleStockStat]? = nil
 
-    private var total: Double { byStock.values.reduce(0) { $0 + $1.total } }
-    private var count: Int { byStock.values.reduce(0) { $0 + $1.count } }
+    private var shownByStock: [String: SaleStockStat] { fullByStock ?? byStock }
+    private var total: Double { shownByStock.values.reduce(0) { $0 + $1.total } }
+    private var count: Int { shownByStock.values.reduce(0) { $0 + $1.count } }
     private var memberOf: [String] { model.groups(for: assetID) }
 
     var body: some View {
@@ -50,7 +54,7 @@ struct PhotoPopup: View {
 
                 // per-stock breakdown
                 VStack(spacing: 6) {
-                    ForEach(byStock.sorted { $0.value.total > $1.value.total }, id: \.key) { stock, stat in
+                    ForEach(shownByStock.sorted { $0.value.total > $1.value.total }, id: \.key) { stock, stat in
                         HStack {
                             Circle().fill(model.color(for: stock)).frame(width: 9, height: 9)
                             Text(stock).font(.system(size: 12))
@@ -106,6 +110,11 @@ struct PhotoPopup: View {
         }
         .clipShape(RoundedRectangle(cornerRadius: Theme.radius))
         .popupChrome(width: 380, height: 640)
+        .task(id: assetID) {
+            if let d = try? await API.photoDetail(assetID: assetID), !d.by_stock.isEmpty {
+                fullByStock = d.by_stock
+            }
+        }
     }
 
     private var filteredGroups: [String] {

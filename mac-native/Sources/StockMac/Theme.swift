@@ -44,11 +44,15 @@ enum Theme {
         "Depositphotos": Color(red: 0.20, green: 0.55, blue: 0.95),
         "Envato":        Color(red: 0.51, green: 0.78, blue: 0.32),
         "Freepik":       Color(red: 0.07, green: 0.45, blue: 0.92),
+        "123RF":         Color(red: 0.90, green: 0.29, blue: 0.10),
+        "PIXTA":         Color(red: 0.00, green: 0.69, blue: 0.66),
+        "Dreamstime":    Color(red: 0.55, green: 0.78, blue: 0.25),
+        "Alamy":         Color(red: 0.00, green: 0.65, blue: 0.32),
     ]
 
     static let stockAbbr: [String: String] = [
         "Adobe Stock": "AS", "Shutterstock": "SS", "iStock": "iS", "Getty Images": "iS",
-        "Depositphotos": "DP", "Envato": "EN", "Freepik": "FP",
+        "Depositphotos": "DP", "Envato": "EN", "Freepik": "FP", "123RF": "RF", "PIXTA": "PX", "Dreamstime": "DT", "Alamy": "AL",
     ]
 
     static func color(for stock: String) -> Color { stockColors[stock] ?? .gray }

@@ -22,6 +22,7 @@ from flask import Blueprint, jsonify, request
 from app_globals import (
     CACHE_DIR, DB_NAME, MS_CACHE_DIR, RECIPES_DIR,
     _load_matches, _save_matches, _load_overrides, _save_overrides,
+    load_group_aliases, resolve_group_alias,
 )
 from cookies import _load_browser_cookies
 from image_utils import load_groups, save_groups, load_ms_library, load_img
@@ -359,15 +360,12 @@ def _rebuild_matches_locked(force=False):
     # vs new YY-MM-DD date format), which a force rebuild would re-create as two
     # groups. _group_aliases.json maps any alias → canonical name so they always
     # collapse into one. User-extendable; merge endpoint writes here too.
-    try:
-        _aliases = json.load(open(os.path.join(RECIPES_DIR, '_group_aliases.json')))
-    except Exception:
-        _aliases = {}
+    _aliases = load_group_aliases()
     ms_authoritative = {}
     for photo in lib:
         gname = (photo.get('group') or '').strip()
         if not gname: continue
-        gname = _aliases.get(gname, gname)
+        gname = resolve_group_alias(gname, _aliases)
         stockids = photo.get('stockids') or {}
         primary = _pick_primary(stockids)
         if not primary: continue
@@ -450,6 +448,7 @@ def _rebuild_matches_locked(force=False):
         from image_utils import load_manual_members
         _manual_restored = 0
         for _mg, _mids in load_manual_members().items():
+            _mg = resolve_group_alias(_mg, _aliases) or _mg   # never resurrect an old name
             cur = groups.setdefault(_mg, [])
             have = set(cur)
             for _mid in _mids:
@@ -527,6 +526,38 @@ def _rebuild_matches_locked(force=False):
 
     # (Pass G moved BEFORE Pass F — groups already deduped + saved above.)
 
+    # ── Pass I: pHash + MS+ basepath fallback for UNGROUPED sales ─────────
+    # A sale whose MS+ reference has no stockids (recolors, orphan ms_meta) never
+    # got a group via the stockid-anchored Pass D/F. Match it by pHash to the MS+
+    # reference and take the shoot straight from its basepath (alias-resolved).
+    # MS+ stays the source of truth; ONLY ungrouped sales are touched; ambiguous
+    # matches are skipped. Recomputed every rebuild → force-rebuild re-derives it,
+    # and manual edits / Pass H always win on top.
+    fb_added = 0
+    try:
+        from matching_engine import _basepath_group_fallback
+        grouped_now = {str(a) for aids in groups.values() for a in aids}
+        for key, members in matches.items():
+            cluster = {str(m) for m in members} | {str(key)}
+            if cluster & grouped_now:
+                grouped_now |= cluster
+        fb = _basepath_group_fallback(grouped_now, _aliases)
+        for gname, aids in fb.items():
+            cur = groups.setdefault(gname, [])
+            have = set(cur)
+            for a in aids:
+                if a not in have:
+                    cur.append(a); have.add(a); fb_added += 1
+        if fb_added:
+            for gname in list(groups.keys()):
+                seen: set = set()
+                groups[gname] = [a for a in groups[gname] if not (a in seen or seen.add(a))]
+            save_groups(groups)
+            _sync_log(f"🔗 Basepath-fallback згрупувало {fb_added} безгрупних продажів")
+    except Exception as _exI:
+        _sync_log(f"⚠️ Pass I (basepath fallback) error: {_exI}")
+        fb_added = 0
+
     # ── Pass H: apply manual overrides ───────────────────────────────────
     matches, override_changes = _apply_manual_overrides(matches, overrides)
     _save_matches(matches)
@@ -554,6 +585,7 @@ def _rebuild_matches_locked(force=False):
                     'filename_pairs': fn_pairs,
                     'auto_grouped': auto_added,
                     'ms_visual_grouped': ms_added,
+                    'basepath_grouped': fb_added,
                     'override_changes': override_changes})
 
 

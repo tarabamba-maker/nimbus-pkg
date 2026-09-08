@@ -206,8 +206,15 @@ struct SettingsView: View {
         // Destructive endpoints require a confirm token in the body.
         let body = confirm.isEmpty ? [:] : ["confirm": confirm]
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        // rebuild-from-db / reset run a full rebuild (~60s+) — don't let the default
+        // 60s timeout abort it and refresh stale data.
+        req.timeoutInterval = 600
         _ = try? await URLSession.shared.data(for: req)
         await model.refresh()
+        // These endpoints rewrite groups + matches → invalidate the Groups cache so
+        // the tab reloads the fresh data (otherwise it shows the pre-rebuild state).
+        model.groupsStore.loaded = false
+        await model.groupsStore.reload(period: model.period)
         msg = "Готово"
     }
 }

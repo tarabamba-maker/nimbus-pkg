@@ -316,30 +316,30 @@
   <main class="tab-content">
     {#if activeTab === 0}
       <div class="tab-slide"
-        in:fly={{ x: tabDir * -50, duration: 320, easing: cubicOut, opacity: 0.3 }}
-        out:fly={{ x: tabDir * 50, duration: 260, easing: cubicIn, opacity: 0 }}>
+        in:fly={{ x: tabDir * -28, duration: 170, easing: cubicOut }}
+        out:fly={{ x: tabDir * 28, duration: 130, easing: cubicIn }}>
         <Downloads
           onRefresh={loadStats}
           onStockChange={onDownloadsStockChange} />
       </div>
     {:else if activeTab === 1}
       <div class="tab-slide"
-        in:fly={{ x: tabDir * -50, duration: 320, easing: cubicOut, opacity: 0.3 }}
-        out:fly={{ x: tabDir * 50, duration: 260, easing: cubicIn, opacity: 0 }}>
+        in:fly={{ x: tabDir * -28, duration: 170, easing: cubicOut }}
+        out:fly={{ x: tabDir * 28, duration: 130, easing: cubicIn }}>
         <BestSellers onStockChange={onDownloadsStockChange} />
       </div>
     {:else if activeTab === 2}
       <div class="tab-slide"
-        in:fly={{ x: tabDir * -50, duration: 320, easing: cubicOut, opacity: 0.3 }}
-        out:fly={{ x: tabDir * 50, duration: 260, easing: cubicIn, opacity: 0 }}>
+        in:fly={{ x: tabDir * -28, duration: 170, easing: cubicOut }}
+        out:fly={{ x: tabDir * 28, duration: 130, easing: cubicIn }}>
         <Groups
           onGroupSelect={(/** @type {any} */ g) => activeGroup = g}
           onGroupDeselect={() => activeGroup = null} />
       </div>
     {:else if activeTab === 3}
       <div class="tab-slide"
-        in:fly={{ x: tabDir * -50, duration: 320, easing: cubicOut, opacity: 0.3 }}
-        out:fly={{ x: tabDir * 50, duration: 260, easing: cubicIn, opacity: 0 }}>
+        in:fly={{ x: tabDir * -28, duration: 170, easing: cubicOut }}
+        out:fly={{ x: tabDir * 28, duration: 130, easing: cubicIn }}>
         <Browser onSyncDone={loadStats} />
       </div>
     {/if}
@@ -359,11 +359,12 @@
     --bg2:           #2c2c2e;
     --bg3:           #3a3a3c;
     --bg4:           #48484a;
-    --glass:         rgba(50,50,54,0.55);
-    --glass2:        rgba(30,30,32,0.72);
-    --glass-border:  rgba(255,255,255,0.13);
-    --glass-shine:   inset 0 1px 0 rgba(255,255,255,0.14), inset 0 -1px 0 rgba(0,0,0,0.30);
-    --refract:       inset 1px 0 0 rgba(255,255,255,0.05), inset -1px 0 0 rgba(0,0,0,0.20);
+    --glass:         rgba(60,62,72,0.22);
+    --glass2:        rgba(28,30,38,0.34);
+    --glass-border:  rgba(255,255,255,0.22);
+    /* icy: bright top specular + chromatic edges (cyan left / magenta right) */
+    --glass-shine:   inset 0 1.5px 0 rgba(255,255,255,0.42), inset 0 -1px 0 rgba(0,0,0,0.28);
+    --refract:       inset 1.5px 1px 0 rgba(120,200,255,0.22), inset -1.5px -1px 0 rgba(255,150,210,0.16);
     --label:         #ffffff;
     --label2:        rgba(235,235,245,0.60);
     --label3:        rgba(235,235,245,0.30);
@@ -379,7 +380,11 @@
     --radius-sm:     11px;
     --radius-xs:     7px;
     --radius-pill:   999px;
-    --blur:          blur(22px) saturate(160%);
+    --blur:          blur(14px) saturate(180%) brightness(1.08);
+    /* wet-ice gloss: diagonal specular sheen layered over the translucent fill */
+    --gloss:         linear-gradient(150deg, rgba(255,255,255,0.22) 0%, rgba(255,255,255,0.05) 22%, rgba(255,255,255,0) 46%, rgba(255,255,255,0.04) 100%);
+    --bg-img:        linear-gradient(180deg, rgba(18,20,28,0.22), rgba(12,14,20,0.42)), url('/bg-dark.jpg');
+    --glass-edge:    linear-gradient(140deg, rgba(255,255,255,0.45) 0%, rgba(255,255,255,0.04) 30%, rgba(255,255,255,0.0) 55%, rgba(255,255,255,0.10) 100%);
     --sel-bg:        rgba(10,132,255,0.32);
     --sel-bg-solid:  rgba(10,132,255,0.52);
     --sel-border:    rgba(10,132,255,0.55);
@@ -391,11 +396,11 @@
     --bg2:           #ffffff;
     --bg3:           #e5e5ea;
     --bg4:           #d1d1d6;
-    --glass:         rgba(255,255,255,0.55);
-    --glass2:        rgba(240,240,245,0.72);
-    --glass-border:  rgba(0,0,0,0.09);
-    --glass-shine:   inset 0 1px 0 rgba(255,255,255,0.95), inset 0 -1px 0 rgba(0,0,0,0.07);
-    --refract:       inset 1px 0 0 rgba(255,255,255,0.6), inset -1px 0 0 rgba(0,0,0,0.06);
+    --glass:         rgba(255,255,255,0.28);
+    --glass2:        rgba(250,250,253,0.40);
+    --glass-border:  rgba(255,255,255,0.7);
+    --glass-shine:   inset 0 1.5px 0 rgba(255,255,255,1), inset 0 -1px 0 rgba(0,0,0,0.06);
+    --refract:       inset 1.5px 1px 0 rgba(150,210,255,0.4), inset -1.5px -1px 0 rgba(255,180,220,0.3);
     --label:         #000000;
     --label2:        rgba(60,60,67,0.60);
     --label3:        rgba(60,60,67,0.30);
@@ -412,17 +417,26 @@
     --sel-border:    rgba(60,60,67,0.30);
     --sel-fg:        #000000;
     --sel-glow:      0 1px 3px rgba(0,0,0,0.14);
+    --blur:          blur(14px) saturate(170%) brightness(1.04);
+    --gloss:         linear-gradient(150deg, rgba(255,255,255,0.5) 0%, rgba(255,255,255,0.12) 22%, rgba(255,255,255,0) 46%, rgba(255,255,255,0.1) 100%);
+    --bg-img:        linear-gradient(180deg, rgba(255,255,255,0.26), rgba(255,255,255,0.42)), url('/bg-light.jpg');
+    --glass-edge:    linear-gradient(140deg, rgba(255,255,255,0.85) 0%, rgba(255,255,255,0.2) 28%, rgba(255,255,255,0.0) 55%, rgba(255,255,255,0.35) 100%);
+  }
+
+  /* macOS native glass: body transparent → window's NSVisualEffectView shows through */
+  :global(html.vibrancy), :global(body.vibrancy) {
+    background: transparent !important;
   }
 
   :global(*) { box-sizing: border-box; margin: 0; padding: 0; }
   /* SVG icons sit on text baseline by default — force block so flex align-items:center works */
   :global(button svg, a svg, span svg) { display: block; flex-shrink: 0; }
   :global(body) {
-    background: var(--bg);
-    background-image:
-      radial-gradient(ellipse at 18% 12%, rgba(10,132,255,0.28) 0%, transparent 42%),
-      radial-gradient(ellipse at 82% 88%, rgba(94,50,220,0.24) 0%, transparent 42%),
-      radial-gradient(ellipse at 55% 45%, rgba(48,209,88,0.07) 0%, transparent 38%);
+    background-color: var(--bg);
+    background-image: var(--bg-img);
+    background-size: cover;
+    background-position: center;
+    background-attachment: fixed;
     color: var(--label);
     font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', sans-serif;
     font-size: 13px; overflow: hidden; user-select: none;
@@ -452,7 +466,7 @@
   .topbar {
     display: flex; align-items: center; justify-content: space-between;
     padding: 12px 20px 8px; flex-shrink: 0;
-    background: var(--glass2);
+    background: var(--gloss), var(--glass2);
     backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);
     border-bottom: 1px solid var(--sep);
     border-radius: 0 0 var(--radius) var(--radius);
@@ -465,14 +479,15 @@
   }
   .topbar-right { display: flex; gap: 6px; }
   .icon-btn {
-    background: var(--glass); border: 1px solid var(--glass-border);
+    background: var(--gloss), var(--glass); border: 1px solid var(--glass-border);
     color: var(--label2); border-radius: var(--radius-sm);
     width: 30px; height: 30px; cursor: pointer; font-size: 14px;
     display: flex; align-items: center; justify-content: center;
-    transition: all 0.15s; backdrop-filter: var(--blur);
-    box-shadow: var(--glass-shine);
+    transition: transform .12s, color .15s, border-color .15s; backdrop-filter: var(--blur);
+    box-shadow: var(--glass-shine), var(--refract), 0 1px 3px rgba(0,0,0,0.18);
   }
-  .icon-btn:hover { color: var(--label); background: var(--bg3); }
+  .icon-btn:hover { color: var(--label); border-color: rgba(10,132,255,0.45); transform: translateY(-1px); }
+  .icon-btn:active { transform: translateY(0) scale(.95); }
 
   /* ── stats row ───────────────────────────────────────── */
   .stats-row {
@@ -480,7 +495,7 @@
   }
   .stat-card {
     flex: 1;
-    background: var(--glass); border: 1px solid var(--glass-border);
+    background: var(--gloss), var(--glass); border: 1px solid var(--glass-border);
     backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);
     border-radius: var(--radius); padding: 11px 14px;
     cursor: pointer; transition: all 0.18s; text-align: left;
@@ -514,7 +529,7 @@
   .tab-bar-inner {
     position: relative;
     display: flex; gap: 0;
-    background: var(--glass); border: 1px solid var(--glass-border);
+    background: var(--gloss), var(--glass); border: 1px solid var(--glass-border);
     backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);
     border-radius: var(--radius-pill); padding: 3px;
     box-shadow: var(--shadow-sm), var(--glass-shine), inset 0 1px 3px rgba(0,0,0,0.18);
@@ -548,7 +563,7 @@
   .tab-btn.active { color: var(--sel-fg); font-weight: 700; }
 
   .tab-content { flex: 1; overflow: hidden; position: relative; }
-  .tab-slide { position: absolute; inset: 0; padding: 0 20px 20px; display: flex; flex-direction: column; }
+  .tab-slide { position: absolute; inset: 0; padding: 0 20px 20px; display: flex; flex-direction: column; will-change: transform; transform: translateZ(0); }
 
   /* ── shared global utility classes ───────────────────── */
 
@@ -557,22 +572,26 @@
   :global(.btn),
   :global(.action-pill) {
     display: inline-flex; align-items: center; gap: 7px;
-    background: rgba(10,132,255,0.08);
-    border: 1px solid rgba(10,132,255,0.35);
+    background: var(--gloss), var(--glass);
+    backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);
+    border: 1px solid var(--glass-border);
     border-radius: var(--radius-pill);
     color: var(--label2); font-size: 12px; font-weight: 600;
     padding: 6px 16px; cursor: pointer; font-family: inherit;
     white-space: nowrap;
-    box-shadow: 0 0 10px rgba(10,132,255,0.08), inset 0 1px 0 rgba(255,255,255,0.07);
-    transition: background .15s, box-shadow .15s, color .15s;
+    box-shadow: var(--glass-shine), var(--refract), 0 1px 3px rgba(0,0,0,0.18);
+    transition: transform .12s, border-color .15s, box-shadow .15s, color .15s;
   }
   :global(.pill:hover:not(:disabled)),
   :global(.btn:hover:not(:disabled)),
   :global(.action-pill:hover:not(:disabled)) {
-    background: rgba(10,132,255,0.14);
-    color: var(--label);
-    box-shadow: 0 0 16px rgba(10,132,255,0.15), inset 0 1px 0 rgba(255,255,255,0.09);
+    color: var(--label); border-color: rgba(10,132,255,0.45);
+    transform: translateY(-1px);
+    box-shadow: var(--glass-shine), var(--refract), 0 3px 10px rgba(10,132,255,0.18);
   }
+  :global(.pill:active:not(:disabled)),
+  :global(.btn:active:not(:disabled)),
+  :global(.action-pill:active:not(:disabled)) { transform: translateY(0) scale(.97); }
   :global(.pill:disabled),
   :global(.btn:disabled),
   :global(.action-pill:disabled) { opacity: .45; cursor: not-allowed; }
@@ -581,9 +600,9 @@
   :global(.pill.active),
   :global(.btn.primary),
   :global(.action-pill.active) {
-    background: var(--sel-bg-solid);
-    border-color: var(--sel-border); color: var(--sel-fg);
-    box-shadow: 0 0 16px rgba(10,132,255,0.18), inset 0 1px 0 rgba(255,255,255,0.20), inset 0 -1px 0 rgba(0,0,0,0.15);
+    background: linear-gradient(160deg, rgba(120,200,255,.4), rgba(10,132,255,.32)), var(--sel-bg-solid);
+    border-color: rgba(120,200,255,0.7); color: var(--sel-fg);
+    box-shadow: var(--glass-shine), 0 0 0 1px rgba(10,132,255,.25), 0 2px 10px rgba(10,132,255,0.3);
   }
 
   /* Danger variant (Stop button etc.) */
@@ -601,6 +620,34 @@
   :global(.card:hover) { border-color: var(--accent); }
 
   :global(.scroll-y) { overflow-y: auto; height: 100%; }
+
+  /* ── Floating frosted toolbar + content that scrolls UNDER it ──
+     Global pattern (Downloads, BestSellers, …). The panel is real glass:
+     content slides beneath it (blurred by its backdrop-filter) and fades
+     out at the panel's edge via a mask on the scroll canvas.
+     Each tab sets --panel-h (panel height, px) on .glass-canvas. */
+  :global(.glass-wrap) { position: relative; height: 100%; }
+  :global(.glass-panel) {
+    position: absolute; top: 0; left: 0; right: 0; z-index: 12;
+    background: var(--gloss), var(--glass); border: 1px solid var(--glass-border);
+    backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);
+    border-radius: var(--radius); padding: 10px 12px;
+    box-shadow: var(--shadow-sm), var(--glass-shine), var(--refract);
+  }
+  :global(.glass-canvas) {
+    position: absolute; inset: 0; overflow-y: auto;
+    contain: paint; will-change: scroll-position;
+    padding-top: calc(var(--panel-h, 56px) + 12px);
+    /* content fades out just as it slides under the panel's top edge */
+    -webkit-mask-image: linear-gradient(to bottom,
+      transparent 0,
+      transparent calc(var(--panel-h, 56px) * 0.35),
+      #000 calc(var(--panel-h, 56px) + 6px), #000 100%);
+    mask-image: linear-gradient(to bottom,
+      transparent 0,
+      transparent calc(var(--panel-h, 56px) * 0.35),
+      #000 calc(var(--panel-h, 56px) + 6px), #000 100%);
+  }
   :global(.accent) { color: var(--accent); }
   :global(.dim) { color: var(--label2); }
 

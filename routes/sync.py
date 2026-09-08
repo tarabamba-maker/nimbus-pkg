@@ -366,6 +366,8 @@ def api_sync_start():
         # stock's photos stay blue across every refresh (the Freepik "permanent blue").
         with _session_new_keys_lock:
             _session_new_keys.clear()
+        from sync_state import _begin_sync_batch
+        _begin_sync_batch()
         try:
             _sync_log(f"🚀 Single-stock sync: {name}")
             _collect_one_stock_global(name, u, allow_login=True)

@@ -67,15 +67,15 @@ def _ms_plus_collect_direct():
         r = session.post(f"{base}/contentdb/directories/getfulllist", data="", timeout=20)
         dirs_resp = r.json()
     except Exception as e:
-        _sync_log(f"⚠️ MS+ direct: getfulllist exception: {e} — fallback")
-        return False
+        _sync_log(f"⚠️ MS+ direct: getfulllist exception: {e} — пропускаю цей синк")
+        return True   # transient network failure — not a login problem
     if not dirs_resp.get("isOk"):
         msg = dirs_resp.get("message", "unknown")
         if "сессия" in msg.lower() or "session" in msg.lower():
-            _sync_log("⚠️ MS+ direct: session expired — залогінься на microstock.plus у in-app browser, перезапусти sync")
-        else:
-            _sync_log(f"⚠️ MS+ direct: getfulllist failed: {msg} — fallback")
-        return False
+            _sync_log("⚠️ MS+ direct: session expired — потрібен логін")
+            return False
+        _sync_log(f"⚠️ MS+ direct: getfulllist failed: {msg} — пропускаю цей синк")
+        return True   # API-level failure, not auth
 
     dirs = [d for d in dirs_resp.get("list", []) if d.get("filestotal", 0) > 0]
     _sync_log(f"📁 MS+ direct: {len(dirs)} папок з файлами")

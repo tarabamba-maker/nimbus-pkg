@@ -22,6 +22,7 @@ RECIPES_DIR           = os.path.join(_BASE_DIR, "recipes")
 MATCHES_FILE          = os.path.join(RECIPES_DIR, "_cross_stock_matches.json")
 MANUAL_OVERRIDES_FILE = os.path.join(RECIPES_DIR, "_manual_overrides.json")
 GROUPS_FILE           = os.path.join(RECIPES_DIR, "photo_groups.json")
+GROUP_ALIASES_FILE    = os.path.join(RECIPES_DIR, "_group_aliases.json")
 MS_LIBRARY_FILE       = os.path.join(RECIPES_DIR, "ms_library.json")
 PROCESSED_DATES_FILE  = os.path.join(RECIPES_DIR, "_processed_dates.json")
 
@@ -37,6 +38,29 @@ _STOCK_KEY = {
 }
 
 _RELEVANT_STOCKS = {'adobestock', 'shutterstock', 'istock', 'esp', 'depositphotos'}
+
+
+def load_group_aliases() -> dict:
+    """old group name → canonical (current) name. Written by rename/merge."""
+    try:
+        with open(GROUP_ALIASES_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def resolve_group_alias(name, aliases) -> str:
+    """Follow the alias chain old→…→canonical, cycle-guarded. THE single way to
+    turn any raw ms_library / photo_groups group name into its current canonical
+    name. Single-hop `.get(name, name)` was the bug: a 2-step merge (A→B, B→C)
+    left A resolving to a dead intermediate B, so a new sale re-created B as its
+    own card. MUST be used everywhere a group name is read or written."""
+    n = (name or '').strip()
+    seen = set()
+    while n in aliases and n not in seen:
+        seen.add(n)
+        n = (aliases[n] or '').strip()
+    return n
 
 
 def _load_matches() -> dict:

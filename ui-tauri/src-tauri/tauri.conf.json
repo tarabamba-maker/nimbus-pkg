@@ -42,7 +42,8 @@
       "../../orchestrator.py",
       "../../app_globals.py",
       "../../collectors",
-      "../../routes"
+      "../../routes",
+      "../../assets"
     ],
     "icon": [
       "icons/32x32.png",

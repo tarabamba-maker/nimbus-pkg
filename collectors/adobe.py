@@ -37,7 +37,7 @@ def _adobe_collect_direct():
     try:
         all_cookies = _load_browser_cookies()
     except Exception as e:
-        _sync_log(f"⚠️ Adobe direct: cookies read failed: {e} — fallback")
+        _sync_log(f"⚠️ Adobe direct: cookies read failed: {e} — потрібен логін")
         return False
     if not all_cookies:
         _sync_log("⚠️ Adobe direct: no browser cookies — log in to Adobe in the app browser")
@@ -47,7 +47,7 @@ def _adobe_collect_direct():
                      if 'adobe.com' in c.get('domain', '').lower()
                      or 'adobelogin.com' in c.get('domain', '').lower()}
     if 'RDC' not in adobe_cookies and 'ftauth_token' not in adobe_cookies and 'IMS' not in str(adobe_cookies):
-        _sync_log(f"⚠️ Adobe direct: no session cookie (have {len(adobe_cookies)}) — fallback")
+        _sync_log(f"⚠️ Adobe direct: no session cookie (have {len(adobe_cookies)}) — потрібен логін")
         return False
     _sync_log(f"🔑 Adobe direct: {len(adobe_cookies)} cookies")
 
@@ -103,11 +103,13 @@ def _adobe_collect_direct():
 
     page1 = _get_page(_p1_url)
     if "error" in page1:
-        if page1.get('needs_login'):
-            _sync_log("⚠️ Adobe direct: сесія expired — потрібен логін, fallback to Playwright")
-        else:
-            _sync_log(f"⚠️ Adobe direct: page 1 error {page1.get('error')} — fallback")
-        return False
+        # False = needs login (caller opens a native Chrome login window).
+        # Transient errors (network, 5xx) → True: skip this sync, no popup.
+        if page1.get('needs_login') or page1.get('error') in (401, 403):
+            _sync_log("⚠️ Adobe direct: сесія протухла — потрібен логін")
+            return False
+        _sync_log(f"⚠️ Adobe direct: page 1 error {page1.get('error')} — пропускаю цей синк")
+        return True
     pagination = page1.get("view", {}).get("pagination", {})
     total_pages = pagination.get("pages", 1)
     total_items = pagination.get("total", 0)

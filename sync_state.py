@@ -56,6 +56,25 @@ _session_new_keys: list = []
 _session_new_keys_lock = threading.Lock()
 _sync_log_lock = threading.Lock()  # guards _sync_state["log"] reads/writes
 
+# Current sync-batch number. All rows saved by ONE sync run share it, so the
+# feed can keep sync batches in recency order while sorting by sale date WITHIN
+# each batch. Bumped ONCE per sync start (_begin_sync_batch) — never per stock.
+_sync_batch: list = [0]
+
+
+def _begin_sync_batch():
+    """Start a new sync batch: next number after the largest one in the DB.
+    Call ONCE at the start of a sync run (Sync All or single-stock)."""
+    import sqlite3
+    from db import DB_NAME
+    try:
+        with sqlite3.connect(DB_NAME, timeout=15) as c:
+            r = c.execute("SELECT MAX(sync_batch) FROM sales").fetchone()
+            _sync_batch[0] = int(r[0] or 0) + 1
+    except Exception:
+        _sync_batch[0] += 1
+    return _sync_batch[0]
+
 # Headless mode toggle — use a list so importers get a shared mutable reference.
 # DO NOT use a plain bool — `from sync_state import _headless_mode` makes a copy.
 _headless_flag: list = [True]   # _headless_flag[0] = current headless setting
@@ -109,6 +128,7 @@ def _save_record(d: dict):
             return
     except Exception:
         pass
+    d.setdefault('sync_batch', _sync_batch[0])
     save_to_db(d)
     # Record the key for client blue-highlight diff. Uses 10-char date prefix
     # so it matches /api/feed which slices date to YYYY-MM-DD.

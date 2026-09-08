@@ -26,6 +26,7 @@
   $effect(() => { groups = $groupsList; });   // mirror central store → local reactive var
 
   let loading      = $state(false);
+  let filtersH     = $state(56);
   let rebuilding   = $state(false);
   let rebuildMsg   = $state('');
   let _rebuildTimer = /** @type {ReturnType<typeof setTimeout>|null} */ (null);
@@ -478,27 +479,27 @@
 
 <svelte:window onkeydown={handleKey} />
 
-<div class="groups">
-  <!-- Header -->
-  <div class="header">
-    <span class="header-title">My Groups</span>
-    <input class="search-input" placeholder="Search group…" bind:value={search} />
-    <div style="flex:1"></div>
-    <button class="action-pill {rebuilding?'busy':''}" onclick={rebuild} disabled={rebuilding}>
-      <span class:spin={rebuilding}><RotateCcw size={13} strokeWidth={2} /></span>
-      {rebuilding ? 'Rebuilding…' : 'Rebuild'}
-    </button>
-    {#if rebuildMsg}<span class="rebuild-msg">{rebuildMsg}</span>{/if}
-  </div>
-
-  <!-- Sort tabs -->
-  <div class="sort-tabs">
-    {#each ['Earnings','Sales','Name'] as tab}
-      <button class="sort-tab {sortBy===tab?'active':''}" onclick={() => pickSort(tab)}>
-        {tab}{sortBy===tab ? (sortDir==='desc' ? ' ↓' : ' ↑') : ''}
+<div class="groups glass-wrap">
+  <!-- Floating frosted panel: title + sort + search + Rebuild -->
+  <div class="g-top glass-panel" bind:clientHeight={filtersH}>
+    <div class="header">
+      <span class="header-title">My Groups</span>
+      <!-- Sort buttons live in the panel now -->
+      {#each ['Earnings','Sales','Name'] as tab}
+        <button class="pill {sortBy===tab?'active':''}" onclick={() => pickSort(tab)}>
+          {tab}{sortBy===tab ? (sortDir==='desc' ? ' ↓' : ' ↑') : ''}
+        </button>
+      {/each}
+      <span class="groups-count">{groups.length} groups</span>
+      <div style="flex:1"></div>
+      <!-- Search moved to the right, next to Rebuild -->
+      <input class="search-input" placeholder="Search group…" bind:value={search} />
+      <button class="action-pill {rebuilding?'busy':''}" onclick={rebuild} disabled={rebuilding}>
+        <span class:spin={rebuilding}><RotateCcw size={13} strokeWidth={2} /></span>
+        {rebuilding ? 'Rebuilding…' : 'Rebuild'}
       </button>
-    {/each}
-    <span class="groups-count">{groups.length} groups</span>
+      {#if rebuildMsg}<span class="rebuild-msg">{rebuildMsg}</span>{/if}
+    </div>
     {#if mergeClickSrc}
       <div class="merge-mode-bar">
         <Merge size={13} strokeWidth={2} />
@@ -508,7 +509,7 @@
     {/if}
   </div>
 
-  <div class="grid scroll-y">
+  <div class="grid glass-canvas" style="--panel-h:{filtersH}px">
     {#if loading}
       <div class="loader-inline">Loading…</div>
     {:else}
@@ -801,39 +802,24 @@
 {/if}
 
 <style>
-  .groups { display:flex; flex-direction:column; height:100%; gap:8px; }
-
+  /* layout (.glass-wrap/.glass-panel/.glass-canvas) is global — see +page.svelte */
   .header {
-    display:flex; align-items:center; gap:8px; flex-shrink:0; flex-wrap:wrap;
-    background: var(--glass); backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);
-    border: 1px solid var(--glass-border); border-radius: var(--radius);
-    padding: 10px 16px;
+    display:flex; align-items:center; gap:8px; flex-wrap:wrap;
   }
   .header-title { font-size:16px; font-weight:700; color: var(--label); margin-right:4px; }
   .search-input {
     background: var(--bg3); border: 1px solid var(--glass-border); color: var(--label);
-    border-radius: var(--radius-sm); padding:5px 10px; font-size:12px; width:200px;
+    border-radius: var(--radius-sm); padding:5px 10px; font-size:12px; width:180px;
   }
   :global(.spin) { animation: spin 1s linear infinite; display:inline-flex; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .busy { opacity:.5; cursor:not-allowed; }
   .rebuild-msg { font-size:11px; color: var(--green); }
 
-  .sort-tabs { display:flex; align-items:center; gap:4px; flex-shrink:0; }
-  .sort-tab {
-    background: rgba(10,132,255,0.08); border: 1px solid rgba(10,132,255,0.35);
-    color: var(--label2); font-size:12px; font-weight:600;
-    padding:4px 14px; border-radius: var(--radius-pill); cursor:pointer;
-    font:inherit; transition: background .15s, color .15s;
-    box-shadow: 0 0 8px rgba(10,132,255,0.06);
-  }
-  .sort-tab.active { background: var(--sel-bg-solid); border-color: var(--sel-border); color: var(--sel-fg); box-shadow: 0 0 14px rgba(10,132,255,0.16); }
-  .sort-tab:hover:not(.active) { background: rgba(10,132,255,0.14); color: var(--label); }
-  .groups-count { margin-left:auto; font-size:11px; color: var(--label3); }
+  .groups-count { font-size:11px; color: var(--label3); }
   .loader-inline { width:100%; color: var(--label3); font-size:12px; text-align:center; padding:40px; flex-basis:100%; }
 
   .grid {
-    flex:1; overflow-y:auto;
     display:flex; flex-wrap:wrap;
     gap:12px; align-content:start;
   }

@@ -199,7 +199,7 @@ def _shutterstock_api_collect_direct():
         day_new, day_already, blocked = _collect_day(date_str, active_cats, consec)
         total_saved += day_new
         if blocked:
-            _sync_log("🛑 Shutterstock direct: 3× HTTP 403 — datadome cookie expired, fallback")
+            _sync_log("🛑 Shutterstock direct: 3× HTTP 403 — datadome cookie expired, потрібен логін")
             return False
         if day_new > 0 and total_saved % 200 < day_new:
             _sync_log(f"  📆 {date_str}: +{day_new} (total {total_saved})")

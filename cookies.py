@@ -3,13 +3,15 @@ cookies.py — Browser cookie helpers.
 
 Primary cookie source: recipes/_pw_cookies.json — captured directly from
 the in-app Playwright context (decrypted, httpOnly included) during login.
-_load_browser_cookies() reads this first on macOS; Windows uses app Chrome profiles.
+_load_browser_cookies() reads this first on macOS, then app profiles, then the
+user's real Chrome; Windows uses app Chrome profiles.
 
 Functions:
   - _save_pw_cookie_cache, _load_pw_cookie_cache, _capture_pw_cookies, _wait_close_capturing
   - _is_chrome_running, _chrome_cookies_path
   - _decrypt_chrome_cookie_db, _load_chrome_cookies_windows
-  - _load_appprofile_cookies_windows, _load_browser_cookies
+  - _load_appprofile_cookies_windows, _load_system_chrome_cookies_mac
+  - _load_browser_cookies
   - _inject_cookies_via_playwright
   - _STOCK_COOKIE_DOMAINS, _import_cookies_for_stock
   - _STOCK_LOGIN_URLS, _stock_profile_dir, _clear_profile_locks
@@ -55,6 +57,7 @@ def _save_pw_cookie_cache(pw_cookies):
         merged = {}
         for c in _load_pw_cookie_cache():           # keep existing
             merged[(c.get('domain', ''), c.get('name', ''))] = c
+        _invalidate_cookie_cache()
         for c in pw_cookies:                          # overlay fresh
             d = (c.get('domain') or '').lstrip('.')
             if not c.get('name'):
@@ -93,6 +96,98 @@ def _capture_pw_cookies(context):
     except Exception:
         return 0
     return _save_pw_cookie_cache(cks) if cks else 0
+
+
+def _chrome_binary_mac():
+    for p in ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+              "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta"):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _import_native_profile_cookies(profile_dir, stock_label=""):
+    """Decrypt a PLAIN-Chrome (non-Playwright) profile's cookie DB and merge into
+    the cookie cache. Works because plain Chrome encrypts with the real 'Chrome
+    Safe Storage' Keychain key (the app owns the profile → can read it), unlike
+    Playwright's --use-mock-keychain cookies which are undecryptable."""
+    found = []
+    for sub in ("Default/Network/Cookies", "Default/Cookies"):
+        db = os.path.join(profile_dir, sub)
+        if os.path.exists(db):
+            found = _decrypt_chrome_cookie_db_mac(db)
+            if found:
+                break
+    if not found:
+        _sync_log(f"[{stock_label}] ⚠️ не вдалося прочитати cookies профілю")
+        return 0
+    n = _save_pw_cookie_cache([
+        {"name": c["name"], "value": c["value"], "domain": c["domain"],
+         "path": "/", "expires": -1, "secure": True, "httpOnly": False}
+        for c in found])
+    _sync_log(f"🍪 {stock_label}: імпортовано {len(found)} cookies з нативного профілю (кеш={n})")
+    return len(found)
+
+
+def _native_chrome_login(profile_dir, start_url, stock_label, timeout_s=600):
+    """Open the user's REAL Chrome (NOT Playwright) on an isolated, app-owned
+    profile, so the login session is indistinguishable from a human — it passes
+    PerimeterX/DataDome challenges that detect CDP automation (the Dreamstime
+    "Press & Hold" wall). After the user logs in and closes the window, decrypt
+    the profile's cookies straight into the cache for the direct collectors.
+    This is the documented 'Cookie Import First' mechanism, end-to-end.
+
+    start_url may be a list of URLs — each opens as its own tab (Getty needs both
+    accountmanagement.* and esp.*: one SSO login, two cookie domains)."""
+    import subprocess
+    chrome = _chrome_binary_mac()
+    if not chrome:
+        _sync_log(f"[{stock_label}] ⚠️ Google Chrome не знайдено в /Applications")
+        return 0
+    urls = list(start_url) if isinstance(start_url, (list, tuple)) else [start_url]
+    os.makedirs(profile_dir, exist_ok=True)
+    for lf in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        try:
+            os.remove(os.path.join(profile_dir, lf))
+        except OSError:
+            pass
+    if len(urls) > 1:
+        _sync_log(f"🔒 {stock_label}: відкриваю Chrome ({len(urls)} вкладки) — залогінься, ОНОВИ решту вкладок і ЗАКРИЙ ВІКНО (макс 10 хв)")
+    else:
+        _sync_log(f"🔒 {stock_label}: відкриваю Chrome — залогінься (пройди перевірку) і ЗАКРИЙ ВІКНО (макс 10 хв)")
+    subprocess.Popen(
+        [chrome, f"--user-data-dir={profile_dir}", "--no-first-run",
+         "--no-default-browser-check", "--no-service-autorun", *urls],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Chrome's launcher may fork, so don't wait on the Popen PID — poll for ANY
+    # Chrome process still bound to this profile, until it's gone or we time out.
+    time.sleep(4)
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        r = subprocess.run(["pgrep", "-f", f"user-data-dir={profile_dir}"],
+                           capture_output=True, text=True)
+        if not r.stdout.strip():
+            break
+        time.sleep(3)
+    # Chrome buffers cookies in memory and only flushes them to the DB on a clean
+    # exit — which can lag a second or two behind the process vanishing. Importing
+    # too early grabs only the early (PerimeterX) cookies, missing the login
+    # session. Poll the DB until the auth cookie lands (or a short grace window).
+    for _ in range(15):                       # up to ~15s
+        time.sleep(1)
+        cks = []
+        for sub in ("Default/Network/Cookies", "Default/Cookies"):
+            db = os.path.join(profile_dir, sub)
+            if os.path.exists(db):
+                cks = _decrypt_chrome_cookie_db_mac(db)
+                if cks:
+                    break
+        if any(c["name"] in ("PHPSESSID", "sessionid", "session", "koa.sid",
+                             "_author_warehouse_session", "ccw", "accts_contributor")
+               or "sess" in c["name"].lower()
+               for c in cks):
+            break
+    return _import_native_profile_cookies(profile_dir, stock_label)
 
 
 def _wait_close_capturing(context, timeout_ms=600000):
@@ -185,6 +280,26 @@ def _chrome_cookies_path():
 # _dpapi_unprotect → utils.py
 
 
+def _aes_module():
+    """AES from whichever pycryptodome flavour is installed.
+
+    The package ships under two import names: 'Cryptodome' (pycryptodomex) and
+    'Crypto' (pycryptodome). The code used to import only 'Cryptodome' and swallow
+    the ImportError with `return []` — so on a machine with plain pycryptodome
+    installed, EVERY cookie DB silently decrypted to nothing, the app concluded
+    "not logged in", and every collector fell through to the slow Playwright path.
+    Silent, and it looked exactly like an expired session. Hence: try both, and if
+    neither is there, say so out loud instead of returning empty."""
+    for mod in ('Cryptodome.Cipher', 'Crypto.Cipher'):
+        try:
+            return __import__(mod, fromlist=['AES']).AES
+        except ImportError:
+            continue
+    _app_log("❌ pycryptodome не встановлений — куки браузера не розшифрувати "
+             "(pip install pycryptodome). Колектори підуть у Playwright-фолбек.")
+    return None
+
+
 def _decrypt_chrome_cookie_db(cookie_db):
     """Decrypt one Chrome cookie SQLite directly. Handles v10/v11 (AES-256-GCM
     under a DPAPI-wrapped key) and legacy raw-DPAPI values. v20 (App-Bound
@@ -236,7 +351,9 @@ def _decrypt_chrome_cookie_db(cookie_db):
         except Exception:
             pass
 
-    from Cryptodome.Cipher import AES
+    AES = _aes_module()
+    if AES is None:
+        return []
     out, n_v20, n_fail = [], 0, 0
     for host, name, ev, plain in rows:
         ev = bytes(ev) if ev else b''
@@ -365,9 +482,8 @@ def _decrypt_one_mac(ev, keys, AES):
 def _decrypt_chrome_cookie_db_mac(cookie_db):
     """Decrypt Chrome/Chromium cookie DB on macOS (v10/v11 = AES-128-CBC)."""
     import shutil, tempfile
-    try:
-        from Cryptodome.Cipher import AES
-    except ImportError:
+    AES = _aes_module()
+    if AES is None:
         return []
     if not cookie_db or not os.path.exists(cookie_db):
         return []
@@ -449,30 +565,102 @@ def _latin1_safe_cookies(cookies):
     return clean
 
 
+def _load_system_chrome_cookies_mac():
+    """Read stock cookies from the user's REAL Chrome (not the app's profiles).
+
+    Why this exists: the app's own Chrome profiles are driven by Playwright, which
+    launches with --use-mock-keychain, so their cookie DBs are encrypted with a key
+    that can't be recovered afterwards — _load_appprofile_cookies_mac() returns
+    nothing for them. Meanwhile the user often just logs into a stock in their
+    normal Chrome, where cookies ARE decryptable with the 'Chrome Safe Storage'
+    Keychain key. Without this source the app saw no session at all and every
+    collector fell through to the slow Playwright path (or reported "not logged in")
+    while a perfectly good session sat one directory over.
+
+    Only cookies for known stock domains are read — the user's normal browser holds
+    everything else too, and none of it is any of the app's business.
+    """
+    import glob
+    wanted = {d for doms in _STOCK_COOKIE_DOMAINS.values() for d in doms}
+    dbs = []
+    for root in ("Google/Chrome", "Chromium"):
+        base = os.path.expanduser(f"~/Library/Application Support/{root}")
+        dbs += glob.glob(os.path.join(base, "*", "Network", "Cookies"))
+        dbs += glob.glob(os.path.join(base, "*", "Cookies"))
+    seen, out = set(), []
+    for db in sorted(dbs):
+        if "Guest Profile" in db or "System Profile" in db:
+            continue
+        for c in _decrypt_chrome_cookie_db_mac(db):
+            dom = c["domain"]
+            if not any(dom == w or dom.endswith("." + w) for w in wanted):
+                continue
+            k = (dom, c["name"])
+            if k not in seen:
+                seen.add(k)
+                out.append(c)
+    if out:
+        _app_log(f"🍪 System Chrome: {len(out)} stock cookies "
+                 f"({', '.join(sorted({c['domain'] for c in out}))})")
+    return out
+
+
+# Короткий кеш прочитаних кук. _stock_has_valid_session() смикає
+# _load_browser_cookies() на кожен стік, а той перечитує і розшифровує ДЕСЯТОК
+# баз (профілі застосунку + системний Chrome на сотні кук). Без кеша перевірка
+# восьми стоків = вісім повних сканів і вісім однакових простирадл у лозі.
+# TTL короткий навмисно: щойно людина залогінилась, нова сесія має підхопитися.
+_COOKIE_CACHE = {"at": 0.0, "cookies": None}
+_COOKIE_CACHE_TTL = 20.0
+
+
+def _invalidate_cookie_cache():
+    _COOKIE_CACHE["cookies"] = None
+
+
 def _load_browser_cookies():
     """OS-agnostic: returns all browser cookies as list of dicts.
     On macOS: app Chrome profiles first (if browser-login was done), then Safari.
     On Windows: the app's own Chrome login profiles (variant 3).
     Always passes through _latin1_safe_cookies so corrupt values can't crash
     collectors (the 'latin-1 codec' bug that took down every stock)."""
+    if _COOKIE_CACHE["cookies"] is not None and \
+            time.time() - _COOKIE_CACHE["at"] < _COOKIE_CACHE_TTL:
+        return _COOKIE_CACHE["cookies"]
+
+    def _done(cookies):
+        _COOKIE_CACHE.update(at=time.time(), cookies=cookies)
+        return cookies
+
     if IS_MAC:
         # 1) Playwright cookie cache — captured during the login window, decrypted by
         #    Playwright itself. Primary source on macOS (profile DBs aren't decryptable).
         cached = _load_pw_cookie_cache()
         if cached:
-            return _latin1_safe_cookies(cached)
+            return _done(_latin1_safe_cookies(cached))
         # 2) App Chrome profiles (works only if the keychain key happens to match).
         #    NO Safari fallback: the architecture is "open the in-app isolated Chrome
         #    profile, log into each stock, close — the app reads cookies back from THAT
         #    profile" (via the pw cache above). Safari isn't part of the login flow and
         #    its container is sandbox-blocked anyway (Operation not permitted spam).
-        chrome_cookies = _load_appprofile_cookies_mac()
-        if chrome_cookies:
-            return _latin1_safe_cookies(chrome_cookies)
-        return []
+        # 2) App Chrome profiles (works only if the keychain key happens to match)
+        # 3) The user's real Chrome — where a session actually lands when they just
+        #    log in normally instead of through the app's browser window.
+        #
+        # MERGED, not first-non-empty: a stale app profile that still yields a few
+        # cookies used to short-circuit this function and hide a fresh session in
+        # real Chrome. Earlier sources win per (domain, name).
+        merged, seen = [], set()
+        for src in (_load_appprofile_cookies_mac(), _load_system_chrome_cookies_mac()):
+            for c in src:
+                k = (c.get('domain', ''), c.get('name', ''))
+                if k not in seen:
+                    seen.add(k)
+                    merged.append(c)
+        return _done(_latin1_safe_cookies(merged))
     if IS_WIN:
-        return _latin1_safe_cookies(_load_appprofile_cookies_windows())
-    return []
+        return _done(_latin1_safe_cookies(_load_appprofile_cookies_windows()))
+    return _done([])
 
 
 def _inject_cookies_via_playwright(stock_name, cookies):
@@ -529,6 +717,10 @@ _STOCK_COOKIE_DOMAINS = {
                       "elements.envato.com"],
     "Microstock+":   ["microstock.plus"],
     "Freepik":       ["magnific.com", "contributor.magnific.com", "freepik.com"],
+    "123RF":         ["123rf.com", "www.123rf.com"],
+    "PIXTA":         ["pixtastock.com", "www.pixtastock.com", "pixta.jp"],
+    "Dreamstime":    ["dreamstime.com", "www.dreamstime.com"],
+    "Alamy":         ["alamy.com", "www.alamy.com"],
 }
 
 
@@ -595,6 +787,10 @@ _STOCK_LOGIN_URLS = {
     "Microstock+":   "https://microstock.plus/myfiles",
     "Envato":        "https://author.envato.com/reports/performance",
     "Freepik":       "https://contributor.magnific.com/statistics",
+    "123RF":         "https://www.123rf.com/contributor/earning-details",
+    "PIXTA":         "https://www.pixtastock.com/mypage/earning",
+    "Dreamstime":    "https://www.dreamstime.com/account/earnings-images",
+    "Alamy":         "https://www.alamy.com/alamycontributorreports/Reports.aspx?Rep=0",
 }
 
 

@@ -143,6 +143,16 @@ def _thumb_cached(item_id: str) -> bool:
     return os.path.exists(os.path.join(CACHE_DIR, f"{item_id}.jpg"))
 
 
+def _item_perf_path(ym: str, page: int) -> str:
+    """item_performance endpoint path for one calendar month."""
+    y, m = int(ym[:4]), int(ym[5:7])
+    last = calendar.monthrange(y, m)[1]
+    return (f"/reports/api/v1/performance/item_performance"
+            f"?shopfront=Elements&start_date={ym}-01&end_date={ym}-{last:02d}"
+            f"&sort_by=total_earnings&sort_direction=desc"
+            f"&new_item_only=false&page={page}")
+
+
 def _fetch_json(pw_page, path: str, csrf: str):
     """Browser-context fetch of an author.envato.com JSON endpoint (DataDome-safe)."""
     js = f"""async () => {{
@@ -160,11 +170,55 @@ def _fetch_json(pw_page, path: str, csrf: str):
         return {"__error": str(ex)}
 
 
-def _envato_collect(pw_page):
-    """Collect Envato Elements earnings. Returns True on success, 'needs_login' if
-    the session expired (orchestrator then triggers the login flow)."""
+def _envato_collect_direct():
+    """Direct-HTTPS collect with native-login cookies (no Playwright).
+    Returns True / False (False → caller opens a native login)."""
+    import re as _re
+    from collectors.session import stock_session
+    sess = stock_session(["envato.com"], accept="application/json")
+    if sess is None:
+        _sync_log("⚠️ Envato direct: нема cookies — потрібен нативний логін")
+        return False
+    # CSRF lives in a <meta> on the report page HTML.
+    csrf = ""
+    # /reports/performance is a client-side SPA route (direct GET → 404). The
+    # server-rendered page with the csrf <meta> is /reports/earnings. Cloudflare's
+    # __cf_bm sometimes serves a transient 403 → retry.
+    for _try in range(4):
+        try:
+            # MUST request as HTML — the session's default Accept is application/json,
+            # and asking this HTML page for JSON returns 404 (content negotiation).
+            r = sess.get(_AUTHOR_BASE + "/reports/earnings", timeout=30,
+                         headers={"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
+            m = _re.search(r'name="csrf-token"[^>]*content="([^"]+)"', r.text) \
+                or _re.search(r'content="([^"]+)"[^>]*name="csrf-token"', r.text)
+            if m:
+                csrf = m.group(1)
+                break
+        except Exception as ex:
+            _sync_log(f"⚠️ Envato direct: CSRF fetch {ex}")
+        time.sleep(2)
+    if not csrf:
+        _sync_log("⚠️ Envato direct: нема CSRF/сесії — потрібен нативний логін")
+        return False
 
-    # ── Step 1: confirm session ───────────────────────────────────────────
+    def getj(path):
+        try:
+            r = sess.get(_AUTHOR_BASE + path, timeout=30, headers={
+                "Accept": "application/json", "Content-Type": "application/json",
+                "X-CSRF-Token": csrf})
+            if not r.ok:
+                return {"__error": r.status_code}
+            return r.json()
+        except Exception as ex:
+            return {"__error": str(ex)}
+
+    res = _envato_run(getj, lambda ids: _envato_thumbs_direct(sess, ids))
+    return False if res == "needs_login" else True
+
+
+def _envato_collect(pw_page):
+    """Playwright fallback (in-page fetch). Returns True / 'needs_login'."""
     _sync_log("📊 Envato: перевіряємо сесію…")
     for _ in range(10):
         url = pw_page.url
@@ -177,7 +231,6 @@ def _envato_collect(pw_page):
         return "needs_login"
     _sync_log(f"✅ Envato: сесія активна ({pw_page.url[:60]}…)")
 
-    # CSRF token (retry — page may still be settling)
     csrf = ""
     for _ in range(15):
         try:
@@ -188,16 +241,19 @@ def _envato_collect(pw_page):
             pass
         time.sleep(1)
     if not csrf:
-        # No CSRF usually means DataDome served a challenge instead of the page.
         _sync_log("⚠️ Envato: нема CSRF (можливо DataDome) — переімпортуй cookies / перелогінься")
         return "needs_login"
 
+    return _envato_run(lambda path: _fetch_json(pw_page, path, csrf),
+                       lambda ids: _fetch_thumbnails(pw_page, ids))
+
+
+def _envato_run(getj, fetch_thumbs):
+    """Core collection loop, transport-agnostic. getj(path)->dict;
+    fetch_thumbs(ids)->None. Returns True / 'needs_login'."""
     # ── Step 2: monthly aggregate totals + daily boundary ─────────────────
-    detail = _fetch_json(
-        pw_page,
-        "/reports/api/v1/earnings/detail?view=monthly&start_date=2018-01-01&end_date=2030-12-31",
-        csrf,
-    )
+    detail = getj(
+        "/reports/api/v1/earnings/detail?view=monthly&start_date=2018-01-01&end_date=2030-12-31")
     if "__error" in detail:
         _sync_log(f"⚠️ Envato: earnings/detail помилка: {detail['__error']}")
         return False
@@ -231,14 +287,32 @@ def _envato_collect(pw_page):
         if _sync_stop_flag[0]:
             break
         total = month_totals.get(ym, 0.0)
-        if total <= 0:
-            new_months[ym] = 0.0
-            continue
+        is_per_item = ym >= boundary_ym
 
-        # Skip unchanged months (settling-delay aware: re-collect only on change)
-        if abs(prev_months.get(ym, -1) - total) < 0.005:
-            new_months[ym] = total
-            continue
+        if total > 0:
+            # Aggregate has the month → use it as the gate.
+            # Skip unchanged months (settling-delay aware: re-collect only on change).
+            if abs(prev_months.get(ym, -1) - total) < 0.005:
+                new_months[ym] = total
+                continue
+        else:
+            # Aggregate == 0. For pre-boundary months that's genuinely empty.
+            # For per-item months the earnings/detail (monthly aggregate) endpoint
+            # LAGS ~1-2 months behind item_performance — so probe the per-item
+            # endpoint directly before skipping (otherwise a freshly-available
+            # month like the just-settled one is silently lost). See CLAUDE.md.
+            if not is_per_item:
+                new_months[ym] = 0.0
+                continue
+            probe = getj(_item_perf_path(ym, 1))
+            has_data = ("__error" not in probe
+                        and (probe.get("total_count") or 0) > 0
+                        and any(float(it.get("total_earnings", 0) or 0) > 0
+                                for it in probe.get("data", [])))
+            if not has_data:
+                new_months[ym] = 0.0
+                continue
+            # else: per-item data exists while aggregate still 0 → collect below
 
         months_touched += 1
         rec_date = _month_date(ym)
@@ -266,32 +340,22 @@ def _envato_collect(pw_page):
             new_months[ym] = total
         else:
             # ── PER-ITEM month ────────────────────────────────────────────
-            # Delete this month's per-item rows (keep aggregates), then re-collect.
-            try:
-                with sqlite3.connect(DB_NAME, timeout=15) as c:
-                    c.execute(
-                        "DELETE FROM sales WHERE stock='Envato' "
-                        "AND asset_id NOT LIKE 'envato-%' AND substr(date,1,7)=?",
-                        (ym,))
-            except Exception as ex:
-                _app_log(f"[Envato] per-item delete {ym} failed: {ex}")
-
-            y, m = int(ym[:4]), int(ym[5:7])
-            last = calendar.monthrange(y, m)[1]
-            start, end = f"{ym}-01", f"{ym}-{last:02d}"
+            # Fetch ALL pages into memory FIRST, then write. Two reasons:
+            # 1. When the aggregate lags (total==0) the only change signal is the
+            #    per-item sum itself — if it matches the stored snapshot, skip the
+            #    delete+reinsert entirely. The old code re-wrote the whole month
+            #    every sync, and every re-inserted row landed in _session_new_keys
+            #    → ~150 false "new sale" blue highlights per sync.
+            # 2. No partial-delete window if a later page errors mid-walk.
             page_n, total_pages = 1, 1
-            month_items = 0
+            fetched = []
+            month_sum = 0.0
+            fetch_err = False
             while not _sync_stop_flag[0]:
-                data = _fetch_json(
-                    pw_page,
-                    f"/reports/api/v1/performance/item_performance"
-                    f"?shopfront=Elements&start_date={start}&end_date={end}"
-                    f"&sort_by=total_earnings&sort_direction=desc"
-                    f"&new_item_only=false&page={page_n}",
-                    csrf,
-                )
+                data = getj(_item_perf_path(ym, page_n))
                 if "__error" in data:
                     _sync_log(f"⚠️ Envato {ym}: API error p{page_n}: {data['__error']}")
+                    fetch_err = True
                     break
                 items = data.get("data", [])
                 if not items:
@@ -302,25 +366,52 @@ def _envato_collect(pw_page):
                     earn = round(float(it.get("total_earnings", 0) or 0), 4)
                     if not aid or earn <= 0:
                         continue
-                    _save_record({
-                        "asset_id":   aid,
-                        "photo_name": it.get("title", ""),
-                        "stock":      "Envato",
-                        "price":      earn,
-                        "date":       rec_date,
-                        "thumb_url":  "",
-                        "filename":   it.get("filename", ""),
-                    })
-                    item_saved += 1
-                    month_items += 1
-                    if not _thumb_cached(aid):
-                        items_for_thumbs[aid] = True
+                    fetched.append((aid, earn, it.get("title", ""), it.get("filename", "")))
+                    month_sum += earn
                 if page_n >= total_pages:
                     break
                 page_n += 1
                 time.sleep(0.25)
-            _sync_log(f"   {ym}: {month_items} items (${total})")
-            new_months[ym] = total
+            month_sum = round(month_sum, 2)
+
+            if fetch_err or _sync_stop_flag[0]:
+                months_touched -= 1          # nothing written — retry next sync
+                continue
+            # Lagging aggregate (total==0): per-item sum unchanged → month settled.
+            if total <= 0 and abs(prev_months.get(ym, -1) - month_sum) < 0.005:
+                new_months[ym] = month_sum
+                months_touched -= 1
+                continue
+
+            # Data changed → replace this month's per-item rows (keep aggregates).
+            try:
+                with sqlite3.connect(DB_NAME, timeout=15) as c:
+                    c.execute(
+                        "DELETE FROM sales WHERE stock='Envato' "
+                        "AND asset_id NOT LIKE 'envato-%' AND substr(date,1,7)=?",
+                        (ym,))
+            except Exception as ex:
+                _app_log(f"[Envato] per-item delete {ym} failed: {ex}")
+            month_items = 0
+            for aid, earn, title, fname in fetched:
+                _save_record({
+                    "asset_id":   aid,
+                    "photo_name": title,
+                    "stock":      "Envato",
+                    "price":      earn,
+                    "date":       rec_date,
+                    "thumb_url":  "",
+                    "filename":   fname,
+                })
+                item_saved += 1
+                month_items += 1
+                if not _thumb_cached(aid):
+                    items_for_thumbs[aid] = True
+            # When the aggregate still lags (total==0) store the real per-item
+            # sum so this month settles in the snapshot instead of re-collecting
+            # every sync; once the aggregate finalizes it takes over as the gate.
+            new_months[ym] = total if total > 0 else month_sum
+            _sync_log(f"   {ym}: {month_items} items (${new_months[ym]})")
 
     _save_months(new_months)
     _sync_log(f"✅ Envato: {months_touched} міс оновлено — "
@@ -328,7 +419,7 @@ def _envato_collect(pw_page):
 
     # ── Step 4: thumbnails for new per-item photos ────────────────────────
     if items_for_thumbs and not _sync_stop_flag[0]:
-        _fetch_thumbnails(pw_page, list(items_for_thumbs.keys()))
+        fetch_thumbs(list(items_for_thumbs.keys()))
 
     return True
 
@@ -408,3 +499,56 @@ def _fetch_thumbnails(pw_page, item_ids):
             load_img_async(aid, url, None, is_adobe=False, stock="Envato")
             dl += 1
     _sync_log(f"   ✅ Envato thumbnails: {dl}/{len(item_ids)} clean (portfolio)")
+
+
+def _envato_thumbs_direct(sess, item_ids):
+    """Direct version of _fetch_thumbnails — portfolio.envato.com via requests.
+    Same envato.com cookies cover the portfolio subdomain."""
+    need = set(item_ids)
+    _sync_log(f"🖼️ Envato: чисті thumbnails з портфоліо ({len(need)} потрібно)…")
+    found = {}
+    page, total_pages = 1, 1
+    while need and page <= 200 and not _sync_stop_flag[0]:
+        try:
+            r = sess.get(_PORTFOLIO_BASE + f"/items/search?status=distributable"
+                         f"&page={page}&per_page=100&sort=newest",
+                         headers={"Accept": "application/json"}, timeout=30)
+            if not r.ok:
+                _sync_log(f"⚠️ Envato portfolio p{page}: HTTP {r.status_code}")
+                break
+            data = r.json()
+        except Exception as ex:
+            _sync_log(f"⚠️ Envato portfolio p{page}: {ex}")
+            break
+        items = data.get("items", [])
+        if not items:
+            break
+        total_pages = (data.get("meta") or {}).get("total_pages", 1)
+        for it in items:
+            uid = it.get("uuid"); turl = it.get("thumbnail_url")
+            if uid and turl:
+                found[uid] = turl
+                need.discard(uid)
+        if page >= total_pages:
+            break
+        page += 1
+        time.sleep(0.15)
+    try:
+        prev = {}
+        if os.path.exists(_PORTFOLIO_FILE):
+            with open(_PORTFOLIO_FILE) as f:
+                prev = json.load(f)
+        prev.update(found)
+        with open(_PORTFOLIO_FILE, "w") as f:
+            json.dump(prev, f)
+    except Exception:
+        pass
+    dl = 0
+    for aid in item_ids:
+        if _sync_stop_flag[0]:
+            break
+        url = found.get(aid)
+        if url:
+            load_img_async(aid, url, None, is_adobe=False, stock="Envato")
+            dl += 1
+    _sync_log(f"   ✅ Envato thumbnails: {dl}/{len(item_ids)} clean (portfolio, direct)")

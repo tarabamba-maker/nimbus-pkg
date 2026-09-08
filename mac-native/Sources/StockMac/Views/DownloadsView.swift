@@ -143,7 +143,7 @@ struct SaleCard: View {
         let imgH = s.size("cardImgH", 112)
         VStack(alignment: .leading, spacing: 0) {
             ZStack(alignment: .topLeading) {
-                CachedThumb(assetID: sale.asset_id, fallback: sale.thumb_url)
+                CachedThumb(assetID: sale.thumb_aid ?? sale.asset_id, fallback: sale.thumb_url)
                     .frame(width: w, height: imgH)
                     .clipped()
                 if sale.isFirstSale {

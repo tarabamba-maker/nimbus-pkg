@@ -15,6 +15,7 @@
       "../../app_globals.py",
       "../../collectors",
       "../../routes",
+      "../../assets",
       "../../pyembed"
     ]
   }

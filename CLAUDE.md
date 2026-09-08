@@ -195,6 +195,35 @@ Flask backend (`Backend.swift` spawns `main.py` with `STOCK_DATA_DIR` =
   it to `/api/groups` (backend: `_query_earnings_batch(ids, cutoff=)` + period→cutoff
   in `api_groups_get`). Downloads uses `/api/feed`.
 
+### Analytics tab (`Views/AnalyticsView.swift`, 2026-06-15) — Swift Charts
+- 5th tab in `RootView` (order: Downloads 0, Best Sellers 1, Groups 2, **Analytics 3**,
+  Browser 4 — `content` switch + `tabs` array updated together; `AppModel.activeStock`
+  still maps 1→best, 2→groups, default→downloads, so Analytics top stat cards follow
+  `downloadsStock`, which is intentional — the tab has its OWN stock filter).
+- Backend: `GET /api/analytics` (`routes/feed.py`). Params `period|stock|start|end`.
+  Custom `start+end` wins over `period`. Granularity auto-derived from the span:
+  `≤2d→hour, ≤92d→day, ≤731d→month, else year`. Buckets are **zero-filled** for a
+  continuous line. Returns `{granularity, start, end, total, count, timeline[], by_stock[]}`
+  where each `timeline` point carries a per-stock `by_stock` breakdown (for the stacked
+  bars). All-time resolves `start` from `MIN(date)`.
+- Charts: (1) **stacked bars + dashed total line** over time — bars coloured by stock via
+  `chartForegroundStyleScale(domain:range:)` keyed to `model.color(for:)` so they match
+  the donut/legend; (2) **donut** (`SectorMark`, innerRadius .58) with `XX%` overlay
+  annotations (shown for sectors ≥4%); (3) **horizontal per-stock bars**.
+- Controls mirror the rest of the app: Earnings/Sales `SortSegmented`, stock `SlidingPills`,
+  and a range-mode `SlidingPills` (`Period | Months | Years`). Months/Years = a 12-unit
+  window with ◀/▶ paging (`offset`, stepped by 12, forward capped at 0); they compute
+  start/end and let the endpoint pick granularity. `Period` mode keeps the global
+  period-block reaction + a Custom date-range toggle (two `DatePicker`s).
+- Hover tooltips via `.chartOverlay` + `onContinuousHover` + `proxy.value(atX:/atY:)`:
+  timeline shows bucket total **and** the specific stacked segment under the cursor
+  (segment found by cumulative stacking in colour-domain order — keep `stackSeries`
+  ordered by `stockDomain` or the y-hit math breaks); donut maps the hover position to a
+  sector geometrically (angle clockwise from 12 o'clock within the ring) and shows
+  stock + value + %. The donut sector math ASSUMES Swift Charts draws sectors clockwise
+  from top — correct in practice; if a hover is off by one sector, that assumption is the
+  place to look.
+
 ### Pills (`Pills.swift`) — single source of truth
 - `SegmentedGroup` (filters/tabs) + `SortSegmented` (Earnings/Sales/Name sort, with ↑/↓
   arrow, double-click flips direction). Standalone buttons use `PillButtonStyle`.
@@ -290,6 +319,10 @@ Flask backend (`Backend.swift` spawns `main.py` with `STOCK_DATA_DIR` =
 - **Clean thumbnails** = `/xhr/resource/published?limit=100&page=N` → `{id, imgPreview
   (img.magnific.com, watermark-free), downloads (all-time), date}`. `load_img` 400×400 →
   `asset_meta` dHash → groups via the layered display fold (no Pass E/F).
+  **Portfolio paging early-stops (2026-07-13):** endpoint is newest-first; once a whole
+  page has only ids already in `_freepik_portfolio.json`, stop (was: ~153 requests every
+  sync just to rebuild a cached map; now 1 page typical). `_fetch_portfolio` returns the
+  MERGED cache, not just the fresh walk. Freepik also monthly-gated (day 11).
 - **pre-2025 estimate** (`_collect_pre_history`): Freepik has no per-asset data before
   2025 — anchor to REAL aggregate monthly revenue `/xhr/stats?format=monthly` (back to
   2021), split per-asset by all-time download weight, one record per (asset, year)
@@ -304,18 +337,25 @@ Flask backend (`Backend.swift` spawns `main.py` with `STOCK_DATA_DIR` =
 
 ## ⏭️ NEXT SESSION — detailed tasks
 
-### 1. Remove Playwright-based COLLECTION → direct-API + on-demand login window (HIGH)
-User: "плейрайт механіки ВЗАГАЛІ не потрібно" / "Адоб після того як треба було б
-залогінитись фолбекає на плейрайт — плейрайт механіки ВЗАГАЛІ не потрібно".
-- The browser window must open **ONLY** for a manual login (session expired), exactly
-  like the Windows version. After login, ALL collection is direct API using the captured
-  decrypted cookies (`recipes/_pw_cookies.json` on Mac), never a Playwright page.
-- Target flow per stock: `_stock_has_valid_session()` → if OK, run direct-API collect;
-  if 401/needs-login → open the login window for THAT stock only → user logs in →
-  `_capture_pw_cookies` → retry direct API once.
-- Refactor lands in `orchestrator.py` (`_run_collector_global`, `_sync_all_global`) +
-  the collectors (drop the `pw_page` collect path; keep only `*_collect_direct`).
-- Verify on the INSTALLED app, log `~/Library/Application Support/StockAutomation/app.log`.
+### 1. ✅ DONE (2026-07-13) — Playwright collection removed → direct-API + native-login window
+ALL stocks (incl. the four legacy ones: Adobe, Shutterstock, Getty, MS+) now live in
+`orchestrator._DIRECT_COLLECTORS`. Uniform flow per stock: monthly gate → `*_collect_direct()`
+→ on `False` (= session invalid) open a NATIVE Chrome login window (`_native_chrome_login`)
+→ retry direct once. **NO Playwright fallback exists anymore** — the only Playwright user
+is Alamy (its primary transport, ASP.NET UpdatePanel).
+- **Return contract (all `*_collect_direct`):** `True` = success OR transient failure
+  (network/5xx/API-shape change — skip this sync, no popup); `False` = ONLY auth/session
+  invalid (401/403/302/no cookies/datadome expired) → login window. Don't blur this line:
+  a network hiccup must never pop a login window.
+- Getty login opens TWO tabs (`_DIRECT_LOGIN_URLS`): accountmanagement.* (TSV export
+  session) + esp.* (`ccw` thumb token). One SSO login; user must refresh the second tab.
+- **Monthly gates (`orchestrator._MONTHLY_GATES`)**: month-granularity stocks sync once
+  per cycle — Getty day 21 (statements publish ~21st), Freepik + Envato day 11 (invoice
+  validated / prev month settled by ~10th). State keys `<stock>_last_sync` in
+  `_processed_dates.json`; cold start (no rows for the stock) never gates. To force
+  a re-sync mid-cycle: delete the stock's `*_last_sync` key.
+- The old Playwright collectors (`*_collect(pw_page)`) remain in the modules as dead
+  code/reference but are unreachable (`_dispatch_collector` only handles Alamy).
 
 ### 2. DB re-sync recovery (USER ACTION, already understood)
 The dedup data-loss is fixed (see Architecture Invariants). User re-syncs from scratch:
@@ -484,6 +524,15 @@ touching any of these areas.
   it, re-syncs would balloon `_session_new_keys` with already-known sales.
 - Date normalization: 5 input formats supported. Stored as 19-char
   `"YYYY-MM-DD HH:MM:SS"`. `/api/feed` slices to 10-char for display.
+- **Feed ordering = sync batches (2026-07-16).** `sales.sync_batch` stamps every row
+  with the sync run that inserted it (`_begin_sync_batch()` bumps it ONCE per run —
+  in `_sync_all_global` and single-stock `api_sync_start`; `_save_record` +
+  Getty's raw TSV INSERT stamp it). `/api/feed` orders
+  `sync_batch DESC, date DESC, id DESC`: newest sync's rows on top (even back-dated
+  Getty statement rows), but WITHIN a batch sorted by sale date — parallel collectors
+  no longer interleave dates/stocks. Pre-feature rows are batch 0 = one date-sorted
+  history block. This REPLACED the old "Envato pinned → CASE hack" in api_feed.
+  Index `idx_sales_batch_date` covers the sort. Don't go back to plain `id DESC`.
 
 ### Dedup — `is_already_saved` (db.py) — REWORKED 2026-06-09 (was destroying data)
 - **TIMESTAMPED incoming sale (Adobe, has HH:MM:SS): EXACT 19-char match ONLY.**
@@ -515,7 +564,67 @@ See `### ✅ Adobe Stock` section above. Key invariants:
 - Pass 2 chunks: **360 days** (Adobe max is 364, 4-day safety margin).
 - **Don't mark empty chunks as done.** This is what lost us $8,400 of history in 2024-2025. See Adobe section.
 
-### macOS cookies — Playwright cache, NOT profile decryption (2026-06-08, `cookies.py`)
+### ⭐ GLOBAL collection mechanism — native login + direct HTTPS (2026-06-13, `collectors/session.py`)
+**This is THE correct scheme (same as Windows) and beats Playwright. Migrate every stock to it.**
+
+The pipeline, identical for every stock:
+1. **LOGIN** — `cookies._native_chrome_login(profile, url, name)` launches the user's
+   REAL Chrome as a PLAIN process (`--user-data-dir=<app-owned profile>`, NO Playwright,
+   NO CDP). The session is indistinguishable from a human → passes PerimeterX
+   "Press & Hold" (Dreamstime) and DataDome. Waits (pgrep on the profile) until the
+   user closes the window, then polls the cookie DB until the auth/session cookie lands.
+2. **IMPORT** — plain Chrome encrypts cookies with the REAL `Chrome Safe Storage`
+   Keychain key (the app owns the profile → can decrypt). `_decrypt_chrome_cookie_db_mac`
+   reads them → `_save_pw_cookie_cache` → `recipes/_pw_cookies.json`.
+3. **COLLECT** — `collectors/session.py:stock_session(domains)` returns a `requests.Session`
+   preloaded with those cookies + browser headers. The collector's `*_collect_direct()`
+   runs its normal parse loop over direct HTTPS. **No browser at collection time.**
+
+**Why it beats Playwright:** anti-bots detect CDP automation; and on macOS Playwright's
+`--use-mock-keychain` made the profile cookies undecryptable, which forced the whole
+`_pw_cookies.json`-from-context detour. Native login sidesteps both. PerimeterX even
+allows the direct `requests` call once the `_px3` clearance cookie is imported (verified:
+Dreamstime direct GET → 200 + 38 rows, $267 collected; 123RF/Pixta/Freepik direct → 200).
+
+**Root cause of the old macOS divergence (so we never repeat it):** the Windows scheme
+always read the app's Chrome profile cookie DB directly (DPAPI). The macOS port used
+Playwright for the LOGIN instead of a plain Chrome process — Playwright's
+`--use-mock-keychain` broke profile decryption, and someone patched it with the
+context-snapshot cache instead of fixing the cause. That cemented Playwright (→ CDP →
+PerimeterX block) into login. The fix is a plain Chrome login, nothing more.
+
+**Collector pattern (transport-agnostic):** factor the parse loop into `_xxx_run(get)`
+where `get(path)->text|json|None`; `_xxx_collect_direct()` builds it from `stock_session`,
+`_xxx_collect(pw_page)` (kept as fallback) builds it from in-page fetch. Register in
+`orchestrator._DIRECT_COLLECTORS = {"Stock": "module:_xxx_collect_direct"}` — one line;
+`_collect_one_stock_global` then does direct → (on no session) native login → retry,
+and NEVER opens Playwright for that stock.
+
+**Migrated (direct, no Playwright): ALL stocks (11/11 mechanism-wise, 2026-07-13)** —
+Adobe, Shutterstock, Getty, MS+, Dreamstime, 123RF, PIXTA, Freepik, Depositphotos, Envato
+are all in `_DIRECT_COLLECTORS` with the uniform needs-login→native-login→retry flow and
+NO Playwright fallback. **Only Alamy stays Playwright** — its
+ASP.NET WebForms reports paginate via AJAX UpdatePanel `__doPostBack` deltas; replicating
+them via `requests` is fragile (verified: the `lnkbtnNext` POST returns a partial-delta that
+doesn't parse cleanly → silent data loss to ~36%). Alamy has NO bot detection, so driving the
+rendered page with Playwright is reliable and correct. `collectors/alamy.py` keeps a
+`_walk_report_direct` stub for a future attempt but it is NOT registered in `_DIRECT_COLLECTORS`.
+- Alamy `_alamy_run` walks the LEDGER (Rep_1) first and the thumbs report (Rep_0) ONLY
+  when some ledger ref lacks a cached thumb in `img_cache/` (2026-07-13) — typical sync
+  skips the whole Rep_0 pagination.
+- Envato gotcha: the csrf `<meta>` is on `/reports/earnings` (NOT `/reports/performance`,
+  which is a client-side SPA route → direct GET 404s). And fetch it with `Accept: text/html`
+  — the session's default `Accept: application/json` makes that HTML page 404 (content negotiation).
+
+### Matched-card thumbnail = cleanest sibling (2026-06-14, `routes/feed.py`)
+Matched cards often have a watermarked/low-res PRIMARY thumb (PIXTA/Dreamstime). `api_sales`
+and `api_feed` now return `thumb_aid` per card = the asset_id of the cleanest sibling stock
+(`_THUMB_QUALITY` order: Adobe→SS→iStock→Getty→MS+→Envato→Freepik→123RF→Deposit→Alamy→
+Dreamstime→PIXTA) that actually has a cached thumb (`asset_meta`). Cards render
+`/img/cache/<thumb_aid>` (Svelte: `item.thumb_aid || item.asset_id`; Swift: `thumb_aid ??
+asset_id`). Earnings/aggregation still key off the primary — only the IMAGE changes.
+
+### macOS cookies — Playwright cache, NOT profile decryption (2026-06-08, `cookies.py`) — SUPERSEDED by the native-login mechanism above; kept for history
 - macOS app Chrome/Chromium profiles are written with `--use-mock-keychain` /
   `--password-store=basic`, so their **v10 cookies are NOT decryptable** by either the
   `Chrome Safe Storage` or `Chromium Safe Storage` Keychain key. `_load_appprofile_cookies_mac`
@@ -565,6 +674,24 @@ See `### ✅ Adobe Stock` section above. Key invariants:
 - API returns at most 50 assets per request. Paginate by `TotalAssetCount / 50`.
 - Skip if last sync was THIS calendar month and we're before the 21st (statements arrive ~21st).
 - Prices come from TSV statements only (API returns counts, no prices). Import via `import_getty.py`.
+- **A statement PERIOD ≠ a sales month (measured 2026-06-23 — don't "fix" this gap again).**
+  The monthly statement export labeled "M" contains rows whose `Sales Date` spans M AND the
+  prior 1-2 months: ~73% of a period's rows are dated in M, ~27% in M-1, a small 2-month tail,
+  plus rare old refunds (e.g. a −$74.85 row dated 2025-04 surfaced in the 2025-11 statement).
+  Rows are stored by their REAL Sales Date, so a sales-month fills up from MULTIPLE statement
+  periods over the following ~2 months. Verified: DB by-Sales-Date == sum of freshly re-pulled
+  statements to the cent for every settled month — **the app analytics is correct by sale date.**
+- **Why the app never matches the 25th-of-month PAYOUT:** the payout is a statement/payment-period
+  total (current month's sales + back-dated prior-month sales, on iStock's own balance/threshold
+  accounting), a DIFFERENT AXIS from the app's by-sale-date analytics. They will not match
+  month-for-month and that is not a bug. Recent months (current + ~2 back) keep growing as future
+  statements publish their back-dated rows — inherent latency, not loss.
+- **Re-import window = last `REFETCH_RECENT` (3) statement periods, ALWAYS, ADDITIVELY.** A period
+  is NOT frozen on first import (it can still settle in its first days; later periods add
+  back-dated rows for earlier months). Dedup is `asset+price+day`. **NEVER delete-and-replace by
+  month** — a period labeled M holds M-1/M-2 sales too, so a month-scoped delete would wipe
+  accumulated back-dated rows. Only ONE real contract (`8368474:True`); "All contracts" is an
+  empty-Value dropdown entry, not a second income stream.
 
 ### Depositphotos (main.py:_depositphotos_collect_direct)
 - HTML scraping via BeautifulSoup (no JSON API).
@@ -588,6 +715,10 @@ Pass ordering and incremental contracts (v0.9.37):
 - **Full early-exit** at start: if asset_meta + ms_meta + ms_library fingerprint all unchanged → return cached counts immediately (no work).
 - **First-run path** for Pass D (empty snapshot): does CLASSIC full purge + reassign, NOT diff. Otherwise photos end up in two groups. Don't change this.
 - Manual overrides (`_apply_manual_overrides`, Pass H) always wins. Stored in `recipes/_match_overrides.json` via `/api/match-override`.
+- **Pass I (pHash + MS+ basepath fallback for UNGROUPED sales)** — `matching_engine._basepath_group_fallback`, called in `routes/matching.py` after Pass F, before Pass H. For each SALE that still has NO group (not a photo_groups member, not folded onto a grouped primary via `_cross_stock_matches`), it pHash-matches against `ms_meta` (strict: hamming ≤4, RGB ≤30, aspect ≤0.05) and reads the shoot **straight from the MS+ reference's basepath** (`ms_meta.fname = "year__group__file"` → middle component → alias-resolved), appending the sale to `photo_groups[group]`.
+  - **Why it exists:** a sale whose MS+ reference carries no stockids (recolors, orphan `ms_meta` with no `ms_library` entry) never got a group via the stockid-anchored Pass D/Pass F. **stockids are NOT authoritative** (the camera repeats basenames every ~10k frames → fake dup names; stockids often don't match real MS+ ids — same reason Pass B was removed). The 99%-tuned pHash + the MS+ basepath are the truth; the stockid was a dead anchor that blocked these sales from reaching their group.
+  - **Invariants:** MS+ stays the source of truth (the group IS the MS+ basepath). ONLY ungrouped sales are touched — anything already grouped (incl. manual) is excluded, never overridden. Ambiguous matches (2+ distinct shoots after alias) are SKIPPED, never guessed (dry-run: 11485 confident vs 143 ambiguous, and the 143 were the same shoot under two alias-able names). Recomputed every rebuild → a force rebuild re-derives it; manual edits + Pass H always win on top. `test_autogroup.py` is the read-only dry-run.
+  - **Per-stock hamming to the MS+ root (`_STOCK_MSPLUS_HAM`, e.g. `{"PIXTA": 6}`):** matching is hub-and-spoke — every stock matches to its MS+ reference, never stock-to-stock. Some stocks generate their thumbnail with a DIFFERENT crop/processing than the MS+ reference (verified: PIXTA re-crops + letterboxes; its dHash floors at hamming ~5 vs the MS+ root, and NO crop/clean-thumbnail fixes it — the clean `en.pimg.jp/<id-split>/0/<id>.jpg` is actually *worse* at ~11-15). So those stocks get their own (looser) hamming budget; the default stays strict 4. Verified safe per stock: PIXTA ungrouped sweep → 0 ambiguous up to hamming 7. Do NOT raise the DEFAULT — widen only a specific stock that demonstrably floors above 4.
 - To force full rebuild: delete `recipes/_matches_state.json` and `_ms_group_snapshot.json`.
 
 ### SQLite (main.py:init_db)
@@ -1045,6 +1176,26 @@ For each new stock, follow "How to add a new stock" above.
 **Grouping** — clean thumbs → clean `asset_meta` dHash → existing `_ms_visual_matches` (rebuild Pass F) auto-groups into MS+ groups by pHash. ~88% (7421/8443), hamming ~0, verified. Hash-named filenames irrelevant (match by image). No Gemini/overrides.
 
 **Historical per-photo attribution — intentionally NOT done.** Distributing the $17k aggregate by per-item weight = `weight × 6.15` for every photo → Best Sellers order unchanged, no new signal, +130-256k synthetic rows. Aggregates kept.
+
+**⚠️ Lagging-month churn fix (2026-07-13).** A per-item month whose aggregate still ==0
+used to be DELETE+reinserted on EVERY sync (no settled-check on that branch) → ~150 rows
+re-entered `_session_new_keys` → false blue "new sale" highlights each sync. Now the
+per-item branch fetches ALL pages into memory FIRST, and when the aggregate lags it
+compares the per-item sum against `_envato_months.json`: unchanged → month skipped
+entirely (no delete, no reinserts, no highlights). Also means no partial-delete window
+if a page errors mid-walk. Envato is monthly-gated (day 11) on top.
+
+**⚠️ Aggregate-lag gate (2026-06-23 fix).** The monthly aggregate endpoint
+(`earnings/detail?view=monthly`) LAGS ~1-2 months behind `item_performance`: a just-
+settled month shows `total_earnings: 0` in detail while item_performance already has the
+real per-item rows (verified: 2026-05 detail=$0 but item_performance total_count=2600 /
+$300+). The collector used the aggregate total as the per-item gate (`if total<=0:
+continue`) → silently skipped that month. Fix (`_envato_run`): for per-item months
+(`ym >= boundary`) where aggregate==0, PROBE `item_performance` page 1; collect if it has
+nonzero earnings (skip if all 0 = current unsettled month, e.g. 2026-06). When collecting
+under a lagging aggregate, store the real per-item SUM in `_envato_months.json` so the
+month settles instead of re-collecting every sync; once the aggregate finalizes it resumes
+as the gate. Pre-boundary months still gate on the aggregate only.
 
 **Abandoned (don't revive):** (1) `elements.envato.com/item-uuid-redirect` og:image — watermarked+cropped, broke pHash. (2) GDrive "Family stock" filename matching + Gemini disambiguation — 41% of filenames are hash-names (`<24hex>_withmeta.jpg`), watermark+crop broke pHash (median 32). Superseded by the portfolio clean-thumb API. `_gemini_key.json` kept only for optional cleanup of the ~12% ungrouped.
 

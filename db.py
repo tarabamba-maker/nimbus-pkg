@@ -40,10 +40,18 @@ def init_db():
             filename TEXT)''')
         try: c.execute("ALTER TABLE sales ADD COLUMN filename TEXT")
         except Exception: pass
+        # Sync-batch number: all rows inserted by ONE sync run (Sync All or a
+        # single-stock button) share a batch. Feed orders by batch DESC first
+        # (newest sync's rows on top, insertion-order semantics), then by sale
+        # date DESC WITHIN the batch. Pre-existing rows stay batch 0 = one big
+        # date-sorted history block.
+        try: c.execute("ALTER TABLE sales ADD COLUMN sync_batch INTEGER DEFAULT 0")
+        except Exception: pass
         # Covers is_already_saved() (stock+asset_id+date prefix) and feed/stats
         # range scans by date. Without this each dedup check is a full table scan.
         c.execute("CREATE INDEX IF NOT EXISTS idx_sales_dedup ON sales(stock, asset_id, date)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_sales_date  ON sales(date)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sales_batch_date ON sales(sync_batch DESC, date DESC)")
 
         # Per-asset perceptual hash + dominant RGB + aspect_ratio for visual matching.
         c.execute('''CREATE TABLE IF NOT EXISTS asset_meta (
@@ -148,10 +156,11 @@ def save_to_db(d):
         price = float(d.get('price') or 0)
         with sqlite3.connect(DB_NAME, timeout=15) as c:
             c.execute(
-                'INSERT INTO sales (asset_id,photo_name,stock,price,thumb_url,date,filename) '
-                'VALUES (?,?,?,?,?,?,?)',
+                'INSERT INTO sales (asset_id,photo_name,stock,price,thumb_url,date,filename,sync_batch) '
+                'VALUES (?,?,?,?,?,?,?,?)',
                 (aid, d.get('photo_name'), stock, price,
-                 d.get('thumb_url'), d.get('date'), d.get('filename')))
+                 d.get('thumb_url'), d.get('date'), d.get('filename'),
+                 int(d.get('sync_batch') or 0)))
             c.commit()
     except Exception as e:
         print(f"[DB] {e}")
